@@ -1,0 +1,94 @@
+From 55fb6be30c37a494112709ad5e624bd653a3c12a Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:46 +0500
+Subject: [PATCH 22/32] platform-intel: export read_efi_variable() and
+ EFI_GUID()
+
+Platforms other than Intel's also tell the OS about their RAID firmware in
+EFI variables: AMD RAIDXpert2 (later in this series) reads AMD_RAID
+(fe26a894-d199-47d4-8afa-070e3d54ba86), which says which controllers the
+AMD RAID UEFI driver takes.
+
+Export read_efi_variable(), with its fallback to the old sysfs-efivars
+interface, and move EFI_GUID() next to struct efi_guid in
+platform-intel.h, instead of another reader of efivarfs.  No change in
+behaviour.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ platform-intel.c | 24 +++++++++++++++---------
+ platform-intel.h |  9 +++++++++
+ 2 files changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/platform-intel.c b/platform-intel.c
+index e2a4cc52..bceb43f7 100644
+--- a/platform-intel.c
++++ b/platform-intel.c
+@@ -653,13 +653,6 @@ static const struct imsm_orom *find_imsm_hba_orom(struct sys_dev *hba)
+ 	return get_orom_by_device_id(hba->dev_id);
+ }
+ 
+-#define EFI_GUID(a, b, c, d0, d1, d2, d3, d4, d5, d6, d7) \
+-((struct efi_guid) \
+-{{ (a) & 0xff, ((a) >> 8) & 0xff, ((a) >> 16) & 0xff, ((a) >> 24) & 0xff, \
+-  (b) & 0xff, ((b) >> 8) & 0xff, \
+-  (c) & 0xff, ((c) >> 8) & 0xff, \
+-  (d0), (d1), (d2), (d3), (d4), (d5), (d6), (d7) }})
+-
+ #define SYS_EFI_VAR_PATH "/sys/firmware/efi/vars"
+ #define SYS_EFIVARS_PATH "/sys/firmware/efi/efivars"
+ #define ACPI_TABLES_PATH "/sys/firmware/acpi/tables/"
+@@ -774,8 +767,21 @@ static int read_efi_var(void *buffer, ssize_t buf_size,
+ 	return 0;
+ }
+ 
+-static int read_efi_variable(void *buffer, ssize_t buf_size,
+-			     const char *variable_name, struct efi_guid guid)
++/**
++ * read_efi_variable() - read the data of an EFI variable.
++ * @buffer: buffer to fill out.
++ * @buf_size: size of the data to read.
++ * @variable_name: name of the variable.
++ * @guid: vendor GUID of the variable.
++ *
++ * Read from efivarfs, or from the old sysfs-efivars interface if that
++ * fails.  The variable must hold at least @buf_size bytes, exactly that
++ * many with sysfs-efivars.
++ *
++ * Return: 0 on success, 1 otherwise.
++ */
++int read_efi_variable(void *buffer, ssize_t buf_size,
++		      const char *variable_name, struct efi_guid guid)
+ {
+ 	char path[PATH_MAX];
+ 	char buf[GUID_STR_MAX];
+diff --git a/platform-intel.h b/platform-intel.h
+index f92a9a11..af1a26b8 100644
+--- a/platform-intel.h
++++ b/platform-intel.h
+@@ -226,6 +226,13 @@ struct efi_guid {
+ 	__u8 b[16];
+ };
+ 
++#define EFI_GUID(a, b, c, d0, d1, d2, d3, d4, d5, d6, d7) \
++((struct efi_guid) \
++{{ (a) & 0xff, ((a) >> 8) & 0xff, ((a) >> 16) & 0xff, ((a) >> 24) & 0xff, \
++  (b) & 0xff, ((b) >> 8) & 0xff, \
++  (c) & 0xff, ((c) >> 8) & 0xff, \
++  (d0), (d1), (d2), (d3), (d4), (d5), (d6), (d7) }})
++
+ struct devid_list {
+ 	__u16 devid;
+ 	struct devid_list *next;
+@@ -250,6 +257,8 @@ static inline char *guid_str(char *buf, struct efi_guid guid)
+ 	return buf;
+ }
+ 
++int read_efi_variable(void *buffer, ssize_t buf_size,
++		      const char *variable_name, struct efi_guid guid);
+ char *get_nvme_multipath_dev_hw_path(const char *dev_path);
+ char *diskfd_to_devpath(int fd, int dev_level, char *buf);
+ int devpath_to_char(const char *dev_path, const char *entry, char *buf,
+-- 
+2.47.3
+

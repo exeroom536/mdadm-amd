@@ -1,0 +1,154 @@
+From 59f2613d597d13272217f68abaec628b9ee3c3d1 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:51:17 +0500
+Subject: [PATCH 2/2] super0: still match the homehost of 0.90 arrays from
+ big-endian hosts
+
+With the previous patch sha1_buffer() computes SHA-1 on big-endian hosts
+too, but the 0.90 arrays created there with a homehost - the hostname,
+unless one is given - hold the old hash in set_uuid2..3.  match_home0()
+would call them foreign: unless mdadm.conf lists them, Incremental and
+Assemble would give them the next free minor (/dev/md127, /dev/md/0_0)
+instead of their preferred one, "AUTO +homehost -all" would leave them
+alone, and --examine and --detail would drop "(local to host ...)".
+
+On big-endian hosts accept the old hash as well.  It is SHA-1 with the
+message words loaded and the digest words stored as little-endian ones;
+sha1_process_block() computes it from a block padded by hand.  The three
+copies of the check (examine, detail, match_home) become one helper.
+Little-endian hosts check only the SHA-1, as before.
+
+Tested on s390x and powerpc under qemu-user 10.0:
+- the helper's digest, against sha1_buffer() built without the previous
+  patch, for "", "abc", the 448-bit FIPS 180 message and homehosts of 6,
+  9 and 60 bytes (two blocks): all the same;
+- mdadm --examine --homehost=bigend of a 0.90 superblock as big-endian
+  mdadm writes it (a little-endian one with every word byte-swapped, the
+  events words exchanged, set_uuid2..3 and the checksum rewritten): with
+  the old hash, "(local to host bigend)" before the previous patch,
+  missing with it, back with this one; with the new hash, local with
+  both patches.
+
+Found and written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ super0.c | 80 +++++++++++++++++++++++++++++++++++++++-----------------
+ 1 file changed, 56 insertions(+), 24 deletions(-)
+
+diff --git a/super0.c b/super0.c
+index 36588347..7f40d848 100644
+--- a/super0.c
++++ b/super0.c
+@@ -78,6 +78,57 @@ static void super0_swap_endian(struct mdp_superblock_s *sb)
+ 
+ }
+ 
++#if __BYTE_ORDER == __BIG_ENDIAN
++/*
++ * Until sha1.c got WORDS_BIGENDIAN, sha1_buffer() on big-endian hosts loaded
++ * the message words and stored the digest words as little-endian ones.  The
++ * 0.90 arrays created there carry that hash of the homehost in set_uuid2..3:
++ * compute it the same way, so that they still match their homehost.
++ */
++static bool legacy_be_hash_matches(mdp_super_t *sb, char *homehost)
++{
++	size_t len = strlen(homehost);
++	size_t words = ROUND_UP(len + 9, 64) / 4;
++	__u32 *block = xcalloc(words, sizeof(*block));
++	__u32 hash[5];
++	struct sha1_ctx ctx;
++	size_t i;
++
++	/* the usual padding, but the message words read as little-endian */
++	memcpy(block, homehost, len);
++	((char *)block)[len] = 0x80;
++	for (i = 0; i < words - 2; i++)
++		block[i] = __le32_to_cpu(block[i]);
++	block[words - 2] = len >> 29;
++	block[words - 1] = len << 3;
++
++	sha1_init_ctx(&ctx);
++	sha1_process_block(block, words * sizeof(*block), &ctx);
++	sha1_read_ctx(&ctx, hash);
++	free(block);
++	hash[0] = __cpu_to_le32(hash[0]);
++	hash[1] = __cpu_to_le32(hash[1]);
++
++	return memcmp(&sb->set_uuid2, hash, 8) == 0;
++}
++#else
++static bool legacy_be_hash_matches(mdp_super_t *sb, char *homehost)
++{
++	return false;
++}
++#endif
++
++/* set_uuid2..3 of an array created with a homehost are its SHA-1 */
++static bool homehost_matches0(mdp_super_t *sb, char *homehost)
++{
++	char buf[20];
++
++	if (memcmp(&sb->set_uuid2, sha1_buffer(homehost, strlen(homehost), buf),
++		   8) == 0)
++		return true;
++	return legacy_be_hash_matches(sb, homehost);
++}
++
+ static void examine_super0(struct supertype *st, char *homehost)
+ {
+ 	mdp_super_t *sb = st->sb;
+@@ -95,14 +146,8 @@ static void examine_super0(struct supertype *st, char *homehost)
+ 	if (sb->minor_version >= 90) {
+ 		printf("           UUID : %08x:%08x:%08x:%08x", sb->set_uuid0,
+ 		       sb->set_uuid1, sb->set_uuid2, sb->set_uuid3);
+-		if (homehost) {
+-			char buf[20];
+-			void *hash;
+-
+-			hash = sha1_buffer(homehost, strlen(homehost), buf);
+-			if (memcmp(&sb->set_uuid2, hash, 8) == 0)
+-				printf(" (local to host %s)", homehost);
+-		}
++		if (homehost && homehost_matches0(sb, homehost))
++			printf(" (local to host %s)", homehost);
+ 		printf("\n");
+ 	} else
+ 		printf("           UUID : %08x\n", sb->set_uuid0);
+@@ -366,14 +411,8 @@ static void detail_super0(struct supertype *st, char *homehost, char *subarray)
+ 		       sb->set_uuid2, sb->set_uuid3);
+ 	else
+ 		printf("%08x", sb->set_uuid0);
+-	if (homehost) {
+-		char buf[20];
+-		void *hash = sha1_buffer(homehost,
+-					 strlen(homehost),
+-					 buf);
+-		if (memcmp(&sb->set_uuid2, hash, 8)==0)
+-			printf(" (local to host %s)", homehost);
+-	}
++	if (homehost && homehost_matches0(sb, homehost))
++		printf(" (local to host %s)", homehost);
+ 	printf("\n            Events : %d.%d\n\n", sb->events_hi, sb->events_lo);
+ }
+ 
+@@ -390,17 +429,10 @@ static void brief_detail_super0(struct supertype *st, char *subarray)
+ 
+ static int match_home0(struct supertype *st, char *homehost)
+ {
+-	mdp_super_t *sb = st->sb;
+-	char buf[20];
+-	char *hash;
+-
+ 	if (!homehost)
+ 		return 0;
+-	hash = sha1_buffer(homehost,
+-			   strlen(homehost),
+-			   buf);
+ 
+-	return (memcmp(&sb->set_uuid2, hash, 8)==0);
++	return homehost_matches0(st->sb, homehost);
+ }
+ 
+ static void uuid_from_super0(struct supertype *st, int uuid[4])
+-- 
+2.47.3
+

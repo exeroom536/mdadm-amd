@@ -1,0 +1,18 @@
+#!/bin/bash
+# mkinitcpio hook amdraid-shutdown: in the shutdown ramfs (sd-shutdown), stop md arrays with external
+# metadata through mdadm and mdmon before the power goes (amdraid.shutdown): an mdmon of the ramfs takes
+# them over, so that the old root can be unmounted and its array stopped.  Added to the shutdown
+# ramfs by /usr/lib/tmpfiles.d/60-amdraid-shutdown.conf.
+
+build() {
+    map add_binary bash mdadm mdmon grep tr sleep mount umount
+    add_file /usr/lib/initcpio/amdraid.shutdown /usr/lib/systemd/system-shutdown/amdraid.shutdown 755
+}
+
+help() {
+    cat <<HELPEOF
+Stops md arrays with external metadata (AMD RAIDXpert2, Intel IMSM) with mdadm in the shutdown ramfs,
+so that mdmon records them clean: the root file system's array included (mdmon of the ramfs takes
+the containers over, the old root is unmounted).  For the shutdown ramfs only.
+HELPEOF
+}

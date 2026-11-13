@@ -1,0 +1,187 @@
+From 28020ce6046a30ce54d5583a6f9f6525d46ae7b3 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:55:58 +0500
+Subject: [PATCH 06/32] Manage, Assemble: do not hand a member array to an
+ mdmon that is leaving
+
+mdadm --stop of a container returns while its mdmon may still be alive:
+mdmon leaves on its own, on a later pass of its monitor (wait_and_act()),
+and removes its pid file only then.  If the container is assembled again
+in that window, assemble_container_content() finds the old mdmon with
+mdmon_running(), starts no new one and only pings the old one.  Either
+the old mdmon leaves and the member array stays readonly with no mdmon
+(writes fail, or hang in write-pending), or it takes the new member over
+with the state of the stopped container and writes stale metadata (seen
+with IMSM: a member disk rewritten as a single-disk spare, the container
+no longer assembles).
+
+- Manage_stop(): after a container is stopped, wait (up to 5 s) for its
+  mdmon to leave;
+- assemble_container_content(): hold O_EXCL on the container over the
+  mdmon_running() check, start_mdmon() and the ping, as Create() does, so
+  that a running mdmon cannot leave before it has picked the array up
+  (if the container stays busy and open_dev_excl() gives up, it goes on
+  without that, as before), and drop O_EXCL on the member array, just
+  started, before that wait, as Incremental() does for an array it has
+  started: fsck and mount of a file system on it may come at once; and,
+  when start_mdmon() has started one (not with MDADM_NO_MDMON), wait for
+  the control socket of the new mdmon, as Create() does: started through
+  systemd it comes up after systemctl returns, and the next member array
+  of the same "mdadm -I", not seeing it run, would start it again -
+  "systemctl restart" stops the one just started first (some 4 s at
+  boot);
+- Incremental(): drop O_EXCL on the container before
+  Incremental_container().  A container the first "mdadm -I" has just
+  made is still open O_EXCL (create_mddev()): a member array that can
+  start from that one disk (degraded, or its other member being rebuilt)
+  would wait for it in open_dev_excl() for some 4 s.
+
+The member's O_EXCL over the wait for mdmon is older than this change
+(some 40 ms with mdmon started directly).  With the 4 s wait for the
+container added to it, a root file system on such an array failed fsck
+("is in use") and mount ("Can't open blockdev") in the initrd: a RAID1
+whose rebuild a reboot had interrupted.
+
+With a reproducer that widens the window, IMSM on loop devices: without
+the change 30 of 30 cycles leave the member without mdmon, or with its
+metadata corrupted; with it 0 of 140.  The upstream test suite gives the
+same results as without it.
+
+Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
+---
+ Assemble.c    | 43 ++++++++++++++++++++++++++++++++++++-------
+ Incremental.c |  7 +++++++
+ Manage.c      | 16 ++++++++++++++++
+ 3 files changed, 59 insertions(+), 7 deletions(-)
+
+diff --git a/Assemble.c b/Assemble.c
+index 03dc5f3f..30c3accc 100644
+--- a/Assemble.c
++++ b/Assemble.c
+@@ -1969,6 +1969,34 @@ free_st:
+ 	return rv;
+ }
+ 
++/*
++ * Make sure that an mdmon handles the member array just started in the
++ * container.  mdmon leaves when it has no member arrays and can open the
++ * container with O_EXCL (monitor.c: wait_and_act()), and removes its pid
++ * file only then.  So mdmon_running() may see an mdmon that is already
++ * leaving: no new mdmon is started and the array is left without one.
++ * Hold O_EXCL on the container over the check and the ping, as Create()
++ * does: the running mdmon cannot leave before the ping has made it pick up
++ * the new array.  If the container stays busy (open_dev_excl() gives up
++ * after a few seconds), it goes on without that guard, as before.
++ * An mdmon started through systemd comes up after systemctl returns: wait
++ * for its control socket (made after its pid file), as Create() does, or
++ * the ping misses it and the next member array of the same mdadm -I, not
++ * seeing it run, starts it again - "systemctl restart", which stops the
++ * one just started first.
++ */
++static void mdmon_take_array(char *container_devnm)
++{
++	int fd = open_dev_excl(container_devnm);
++
++	if (!mdmon_running(container_devnm) &&
++	    start_mdmon(container_devnm) == 0 &&
++	    !check_env("MDADM_NO_MDMON"))
++		wait_for_mdmon_control_socket(container_devnm);
++	ping_monitor(container_devnm);
++	close_fd(&fd);
++}
++
+ int assemble_container_content(struct supertype *st, int mdfd,
+ 			       struct mdinfo *content, struct context *c,
+ 			       char *chosen_name, int *result)
+@@ -2181,9 +2209,7 @@ int assemble_container_content(struct supertype *st, int mdfd,
+ 			return 1;
+ 
+ 		if (st->ss->external) {
+-			if (!mdmon_running(st->container_devnm))
+-				start_mdmon(st->container_devnm);
+-			ping_monitor(st->container_devnm);
++			mdmon_take_array(st->container_devnm);
+ 			if (wait_for_mdmon(st->container_devnm) == MDADM_STATUS_SUCCESS &&
+ 			    !st->update_tail)
+ 				st->update_tail = &st->updates;
+@@ -2200,11 +2226,14 @@ int assemble_container_content(struct supertype *st, int mdfd,
+ 		default:
+ 			err = sysfs_set_str(content, NULL, "array_state",
+ 					    "readonly");
+-			/* start mdmon if needed. */
++			/*
++			 * Running: fsck and mount may come at once.  Drop
++			 * O_EXCL, as Incremental() does for an array it has
++			 * started, before waiting for mdmon.
++			 */
+ 			if (!err) {
+-				if (!mdmon_running(st->container_devnm))
+-					start_mdmon(st->container_devnm);
+-				ping_monitor(st->container_devnm);
++				reopen_mddev(mdfd);
++				mdmon_take_array(st->container_devnm);
+ 			}
+ 			break;
+ 		}
+diff --git a/Incremental.c b/Incremental.c
+index dbcc1b8f..40c5cd09 100644
+--- a/Incremental.c
++++ b/Incremental.c
+@@ -486,6 +486,13 @@ int Incremental(struct mddev_dev *devlist, struct context *c,
+ 		udev_ready(sra);
+ 		sysfs_free(sra);
+ 		sra = NULL;
++		/*
++		 * A container this mdadm has just made is still open O_EXCL
++		 * (create_mddev()), and mdmon_take_array() wants O_EXCL on it
++		 * too: a member array started below would wait for that for
++		 * seconds, its own O_EXCL keeping fsck and mount out.
++		 */
++		reopen_mddev(mdfd);
+ 		if (!rv)
+ 			rv = Incremental_container(st, chosen_name, c, NULL);
+ 		map_unlock(&map);
+diff --git a/Manage.c b/Manage.c
+index 83ce1e1d..55a1ecc2 100644
+--- a/Manage.c
++++ b/Manage.c
+@@ -177,6 +177,7 @@ int Manage_stop(char *devname, int fd, int verbose, int will_retry)
+ 	 * 'will_retry' means that error messages are not wanted.
+ 	 */
+ 	int rv = 0;
++	bool container_stopped = false;
+ 	struct map_ent *map = NULL;
+ 	struct mdinfo *mdi;
+ 	char devnm[32];
+@@ -290,6 +291,7 @@ int Manage_stop(char *devname, int fd, int verbose, int will_retry)
+ 				goto out;
+ 			}
+ 		free_mdstat(mds);
++		container_stopped = true;
+ 	}
+ 
+ 	/* If the array is undergoing a reshape which changes the number
+@@ -472,6 +474,20 @@ out:
+ 	sysfs_free(mdi);
+ 	close_fd(&fd);
+ 
++	/*
++	 * The container is stopped, but its mdmon leaves only on its next
++	 * pass (monitor.c: wait_and_act()).  Wait for it: if the container is
++	 * assembled again meanwhile, mdmon_running() would find the old mdmon,
++	 * which then either leaves the new member arrays without an mdmon or
++	 * takes them over with the metadata of the stopped container.
++	 */
++	if (rv == 0 && container_stopped) {
++		for (count = 0; count < 250 && mdmon_running(devnm); count++)
++			sleep_for(0, MSEC_TO_NSEC(20), true);
++		if (mdmon_running(devnm) && verbose >= 0)
++			pr_err("mdmon for %s is still running\n", devname);
++	}
++
+ 	return rv;
+ }
+ 
+-- 
+2.47.3
+

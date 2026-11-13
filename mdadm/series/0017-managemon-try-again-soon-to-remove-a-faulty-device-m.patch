@@ -1,0 +1,132 @@
+From ac914798855fbcbf1a39d92e47b1f8acb4372e62 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:29 +0500
+Subject: [PATCH 17/32] managemon: try again soon to remove a faulty device md
+ refused
+
+A faulty member of an external-metadata array is removed by managemon
+(managemon_disk_remove(), since commit 07ad253044f5 ("mdmon: delegate
+removal to managemon")).  When md refuses - the device is still busy
+with requests, EBUSY - or the monitor still has it open,
+manage_member() returns and tries again on the manager's next wakeup.
+That comes with the next mdstat event or signal, and an idle degraded
+array may give none: the device stays in the array, faulty, and no
+spare is taken, until something else happens.
+
+Remember that a removal is pending and wait at most 100 ms for an event
+then; mdstat_wait_fd() takes a timeout for that.
+
+Reproducer, loop devices, 40 cycles of: RAID1 of 2 disks and a spare,
+"mdadm --fail" of a member while writing to the array, then waiting
+30 s for the recovery onto the spare.  IMSM: 1 of 40 left without
+recovery before, 0 of 40 with the change; AMD RAIDXpert2 (later in this
+series): 6 of 90 before, 0 of 40 with it (the recovery starts within
+0.4 s).  In every stuck case "remove" was refused once with EBUSY and
+not tried again; writing it by hand then succeeds.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ managemon.c | 21 ++++++++++++++++++---
+ mdstat.c    |  5 +++--
+ mdstat.h    |  3 ++-
+ 3 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/managemon.c b/managemon.c
+index fc7214e5..9a70001e 100644
+--- a/managemon.c
++++ b/managemon.c
+@@ -477,6 +477,14 @@ static mdadm_status_t managemon_disk_remove(struct mdinfo *disk, char *array_dev
+ 	return MDADM_STATUS_SUCCESS;
+ }
+ 
++/*
++ * A faulty device that could not be removed yet: md refused (it is still
++ * busy with requests to it) or the monitor still had it open.  Nothing may
++ * wake the manager again for it - an idle array sends no more events - so
++ * it tries again soon, or the device stays and no spare is taken.
++ */
++static bool remove_retry;
++
+ static void manage_member(struct mdstat_ent *mdstat,
+ 			  struct active_array *a)
+ {
+@@ -567,11 +575,13 @@ static void manage_member(struct mdstat_ent *mdstat,
+ 			if (disk->mon_descriptors_not_used == false) {
+ 				/* To early, repeat later */
+ 				all_removed = false;
++				remove_retry = true;
+ 				continue;
+ 			}
+ 
+ 			if (managemon_disk_remove(disk, a->info.sys_name)) {
+ 				all_removed = false;
++				remove_retry = true;
+ 				continue;
+ 			}
+ 
+@@ -998,6 +1008,7 @@ void do_manager(struct supertype *container)
+ 		 * update_queue
+ 		 */
+ 		if (update_queue == NULL) {
++			remove_retry = false;
+ 			mdstat = mdstat_read(1, 0);
+ 
+ 			manage(mdstat, container);
+@@ -1015,10 +1026,14 @@ void do_manager(struct supertype *container)
+ 		if (sigterm)
+ 			wakeup_monitor();
+ 
+-		if (update_queue == NULL)
+-			mdstat_wait_fd(container->sock, &set);
+-		else
++		if (update_queue == NULL) {
++			struct timespec retry = { 0, MSEC_TO_NSEC(100) };
++
++			mdstat_wait_fd(container->sock, &set,
++				       remove_retry ? &retry : NULL);
++		} else {
+ 			/* If an update is happening, just wait for signal */
+ 			pselect(0, NULL, NULL, NULL, NULL, &set);
++		}
+ 	} while(1);
+ }
+diff --git a/mdstat.c b/mdstat.c
+index f7f89ea8..31c69ec8 100644
+--- a/mdstat.c
++++ b/mdstat.c
+@@ -410,7 +410,8 @@ int mdstat_wait(int seconds)
+ 	return select(maxfd + 1, NULL, NULL, &fds, &tm);
+ }
+ 
+-void mdstat_wait_fd(int fd, const sigset_t *sigmask)
++void mdstat_wait_fd(int fd, const sigset_t *sigmask,
++		    const struct timespec *timeout)
+ {
+ 	fd_set fds, rfds;
+ 	int maxfd = 0;
+@@ -441,7 +442,7 @@ void mdstat_wait_fd(int fd, const sigset_t *sigmask)
+ 		maxfd = mdstat_fd;
+ 
+ 	pselect(maxfd + 1, &rfds, NULL, &fds,
+-		NULL, sigmask);
++		timeout, sigmask);
+ }
+ 
+ int mddev_busy(char *devnm)
+diff --git a/mdstat.h b/mdstat.h
+index 227a68b2..26a93275 100644
+--- a/mdstat.h
++++ b/mdstat.h
+@@ -36,7 +36,8 @@ struct mdstat_ent *mdstat_read(int hold, int start);
+ void free_mdstat(struct mdstat_ent *ms);
+ void mdstat_close(void);
+ 
+-void mdstat_wait_fd(int fd, const sigset_t *sigmask);
++void mdstat_wait_fd(int fd, const sigset_t *sigmask,
++		    const struct timespec *timeout);
+ int mdstat_wait(int seconds);
+ int mddev_busy(char *devnm);
+ 
+-- 
+2.47.3
+

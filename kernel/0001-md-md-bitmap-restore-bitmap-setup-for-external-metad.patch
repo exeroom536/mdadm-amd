@@ -1,0 +1,180 @@
+From 2f34307d47dace8a0df9f4a1e8a55381f2c92424 Mon Sep 17 00:00:00 2001
+From: OWNER NAME <owner@example.org>
+Date: Sun, 8 Nov 2026 17:39:24 +0500
+Subject: [PATCH 1/2] md/md-bitmap: restore bitmap setup for external metadata
+ arrays
+To: Song Liu <song@kernel.org>,
+    Yu Kuai <yukuai@fygo.io>
+Cc: Li Nan <magiclinan@didiglobal.com>,
+    Xiao Ni <xiao@kernel.org>,
+    Su Yue <glass.su@suse.com>,
+    Mariusz Tkaczyk <mtkaczyk@kernel.org>,
+    linux-raid@vger.kernel.org,
+    linux-kernel@vger.kernel.org
+
+Arrays with external metadata (e.g. IMSM) have no bitmap superblock;
+userspace sets up their write-intent bitmap through sysfs before the
+array is started. mdadm (set_bitmap_sysfs() in super-intel.c) writes
+bitmap/metadata=external, bitmap/chunksize, bitmap/space,
+bitmap/time_base and bitmap/location, and only then array_state.
+
+Since commit fb8cc3b0d9db ("md/md-bitmap: delay registration of
+bitmap_ops until creating bitmap") the bitmap/ directory is created
+together with the bitmap, so an inactive array has none of these files.
+Commit aba3d6d6cb55 ("md/md-bitmap: split bitmap sysfs groups") and
+commit f2926a533d03 ("md/md-bitmap: add a none backend for bitmap grow")
+brought bitmap/location back, but only once an array without a bitmap is
+running; the other files stay in the group that appears only with the
+bitmap. As a result, on v6.18 and later:
+
+  - "mdadm --create --bitmap=internal" of an IMSM volume fails with
+    "set_bitmap_sysfs: failed to set bitmap/metadata" and leaves the
+    volume inactive;
+  - an existing IMSM volume with a write-intent bitmap is assembled
+    without it, so every unclean shutdown costs a full resync;
+  - on a running IMSM volume bitmap/location cannot be set either:
+    without bitmap/metadata=external the offset is checked as an
+    internal 0.90 bitmap offset and rejected with -EINVAL.
+
+Register the none backend as soon as userspace marks the array as
+external through metadata_version, so that bitmap/ exists before the
+array is started, and move the files that set up a bitmap before it is
+created (space, time_base, chunksize, metadata) to the group shared with
+the none backend. Their store handlers already refuse changes that are
+not allowed while a bitmap exists.
+
+llbitmap does not support external metadata, so selecting the none
+backend early for these arrays does not take a choice away from
+bitmap_type. Arrays with native metadata keep selecting their bitmap
+backend when the bitmap is created.
+
+Reproducer (IMSM on loop devices, mdadm without platform checks):
+
+  export IMSM_NO_PLATFORM=1 IMSM_DEVNAME_AS_SERIAL=1
+  truncate -s 400M d0 d1
+  losetup /dev/loop0 d0; losetup /dev/loop1 d1
+  mdadm -C /dev/md/imsm0 -e imsm -n2 /dev/loop0 /dev/loop1 -R
+  mdadm -C /dev/md/vol -l1 -n2 --bitmap=internal /dev/md/imsm0 -R
+  cat /sys/block/md126/md/array_state     # inactive, expected active
+  ls /sys/block/md126/md/bitmap           # missing
+
+Found while adding write-intent bitmap support for another external
+metadata format to mdadm; the analysis, this patch and the tests were
+made by Claude Opus 5.5, an AI model by Anthropic. Tested on
+v7.3.3 (md modules rebuilt with this patch) with IMSM volumes: create
+with --bitmap=internal, assemble after a hard reset during writes (only
+the dirty 64 MiB chunk was resynced, a mismatch planted in a clean chunk
+was left alone and found by "check"), enabling the bitmap on a running
+volume through sysfs; and for regressions native 1.2 RAID1/RAID5/RAID10
+with internal bitmap (including --grow --bitmap=none/internal), RAID1
+with llbitmap and without bitmap, IMSM without bitmap.
+
+Fixes: fb8cc3b0d9db ("md/md-bitmap: delay registration of bitmap_ops until creating bitmap")
+Cc: stable@vger.kernel.org # v6.18+
+---
+ Documentation/admin-guide/md.rst |  5 +++++
+ drivers/md/md-bitmap.c           | 12 ++++++++----
+ drivers/md/md.c                  | 27 +++++++++++++++++----------
+ 3 files changed, 30 insertions(+), 14 deletions(-)
+
+diff --git a/Documentation/admin-guide/md.rst b/Documentation/admin-guide/md.rst
+index 003fd34..df198ab 100644
+--- a/Documentation/admin-guide/md.rst
++++ b/Documentation/admin-guide/md.rst
+@@ -403,6 +403,11 @@ All md devices contain:
+ If bitmap_type is not none, then additional bitmap attributes bitmap/xxx or
+ llbitmap/xxx will be created after md device KOBJ_CHANGE event.
+ 
++For arrays with externally managed metadata, bitmap/location,
++bitmap/chunksize, bitmap/time_base, bitmap/space and bitmap/metadata are
++created as soon as ``metadata_version`` is set to ``external:...``, so that
++userspace can set up the bitmap before the array is started.
++
+ If bitmap_type is bitmap, then the md device will also contain:
+ 
+   bitmap/location
+diff --git a/drivers/md/md-bitmap.c b/drivers/md/md-bitmap.c
+index 8adf6dd..2d82c71 100644
+--- a/drivers/md/md-bitmap.c
++++ b/drivers/md/md-bitmap.c
+@@ -3018,17 +3018,21 @@ static struct md_sysfs_entry max_backlog_used =
+ __ATTR(max_backlog_used, S_IRUGO | S_IWUSR,
+        behind_writes_used_show, behind_writes_used_reset);
+ 
++/*
++ * Shared with the none backend: these set up a bitmap before it is created,
++ * which is how userspace configures a bitmap for external metadata.
++ */
+ static struct attribute *md_bitmap_common_attrs[] = {
+ 	&bitmap_location.attr,
++	&bitmap_space.attr,
++	&bitmap_timeout.attr,
++	&bitmap_chunksize.attr,
++	&bitmap_metadata.attr,
+ 	NULL
+ };
+ 
+ static struct attribute *md_bitmap_internal_attrs[] = {
+-	&bitmap_space.attr,
+-	&bitmap_timeout.attr,
+ 	&bitmap_backlog.attr,
+-	&bitmap_chunksize.attr,
+-	&bitmap_metadata.attr,
+ 	&bitmap_can_clear.attr,
+ 	&max_backlog_used.attr,
+ 	NULL
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 03e3538..4c31ce6 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -751,6 +751,16 @@ err:
+ 	return false;
+ }
+ 
++static void md_bitmap_set_none(struct mddev *mddev)
++{
++	mddev->bitmap_id = ID_BITMAP_NONE;
++	if (!mddev_set_bitmap_ops_nosysfs(mddev))
++		return;
++
++	if (!mddev_is_dm(mddev) && mddev->bitmap_ops->groups)
++		md_bitmap_sysfs_add(mddev);
++}
++
+ int mddev_init(struct mddev *mddev)
+ {
+ 	int err = 0;
+@@ -5043,6 +5053,13 @@ metadata_store(struct mddev *mddev, const char *buf, size_t len)
+ 		mddev->external = 1;
+ 		mddev->major_version = 0;
+ 		mddev->minor_version = 90;
++		/*
++		 * There is no bitmap superblock with external metadata:
++		 * userspace sets up the bitmap through bitmap/ before it
++		 * starts the array, so the attributes must exist by then.
++		 */
++		if (IS_ENABLED(CONFIG_MD_BITMAP) && !mddev->bitmap_ops)
++			md_bitmap_set_none(mddev);
+ 		goto out_unlock;
+ 	}
+ 	major = simple_strtoul(buf, &e, 10);
+@@ -6666,16 +6683,6 @@ static void md_bitmap_destroy(struct mddev *mddev)
+ 	md_bitmap_destroy_nosysfs(mddev);
+ }
+ 
+-static void md_bitmap_set_none(struct mddev *mddev)
+-{
+-	mddev->bitmap_id = ID_BITMAP_NONE;
+-	if (!mddev_set_bitmap_ops_nosysfs(mddev))
+-		return;
+-
+-	if (!mddev_is_dm(mddev) && mddev->bitmap_ops->groups)
+-		md_bitmap_sysfs_add(mddev);
+-}
+-
+ int md_run(struct mddev *mddev)
+ {
+ 	int err;
+-- 
+2.47.3
+

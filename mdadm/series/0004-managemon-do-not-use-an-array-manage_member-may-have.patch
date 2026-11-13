@@ -1,0 +1,81 @@
+From eb2caa9161afcbb1ffeecb30c24fcec6bd2b6634 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:55:55 +0500
+Subject: [PATCH 04/32] managemon: do not use an array manage_member() may have
+ freed
+
+After manage_member(), manage() reads a->container to decide whether
+the array needs manage_new().  manage_member() may have freed it by
+then.  It changes an array by putting a copy in its place with
+replace_array(), and each replace_array() first frees the array that
+the previous one took out, once the monitor has let go of it.  So when
+one pass replaces the array twice, the second replace_array() frees
+the array that manage() holds.
+
+Since commit 07ad253044f5 ("mdmon: delegate removal to managemon")
+that happens whenever a member fails while the container has a spare:
+once the monitor has stopped using the faulty device, one pass removes
+it (replace_array(), then a = newa) and goes on to add the spare
+(replace_array() again).  A level change, which replaces the array in
+the same way since commit 57f8c76946f0 ("Detect level change"), can do
+it too when a spare or new devices follow in the same pass.
+
+With glibc the freed array is normally left as it was until manage()
+reads it, so the stale a->container is not NULL and nothing visible
+happens.  With an allocator that clears freed memory, a NULL there
+would pass the freed array to manage_new() as the one to replace, and
+replace_array() would hand it to the monitor and free it again.
+
+Seen with AddressSanitizer: IMSM RAID1 with a spare in the container
+on loop devices (IMSM_NO_PLATFORM=1), mdmon built with
+-fsanitize=address, "mdadm --fail" of a member: heap-use-after-free in
+manage() of the array freed by free_aa() from replace_array() in
+manage_member(), and mdmon aborts after the spare has been added.  With
+the change there is no report, and the spare is added the same way.
+
+Decide whether the array is new before manage_member() is called, and
+do not look at it afterwards.  An array the monitor deactivates while
+manage_member() runs is now given to manage_new() on the next pass,
+not in this one.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+
+Fixes: 07ad253044f5 ("mdmon: delegate removal to managemon")
+---
+ managemon.c | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/managemon.c b/managemon.c
+index 8e74154c..fc7214e5 100644
+--- a/managemon.c
++++ b/managemon.c
+@@ -870,14 +870,20 @@ void manage(struct mdstat_ent *mdstat, struct supertype *container)
+ 			/* Not for this array */
+ 			continue;
+ 		/* Looks like a member of this container */
+-		for (a = container->arrays; a; a = a->next) {
+-			if (strcmp(mdstat->devnm, a->info.sys_name) == 0) {
+-				if (a->container && a->to_remove == 0)
+-					manage_member(mdstat, a);
++		for (a = container->arrays; a; a = a->next)
++			if (strcmp(mdstat->devnm, a->info.sys_name) == 0)
+ 				break;
+-			}
++		if (a && a->container) {
++			/*
++			 * manage_member() may replace the array twice (a
++			 * device removed, then a spare added), and the second
++			 * replace_array() frees it: do not look at a after it.
++			 */
++			if (a->to_remove == 0)
++				manage_member(mdstat, a);
++			continue;
+ 		}
+-		if ((a == NULL || !a->container) && !sigterm)
++		if (!sigterm)
+ 			manage_new(mdstat, container, a);
+ 	}
+ }
+-- 
+2.47.3
+

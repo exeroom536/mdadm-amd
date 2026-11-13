@@ -1,0 +1,135 @@
+# mdadm with AMD RAIDXpert2 (RAIDCore, metadata=amd) support - a replacement for the mdadm package of
+# Arch Linux / CachyOS.  Based on the PKGBUILD of mdadm 4.6-2 in Arch
+# (gitlab.archlinux.org/archlinux/packaging/packages/mdadm); upstream mdadm is pinned to the commit
+# mdadm-amd.patch applies to.  Two packages from one build:
+#   mdadm-amd          - mdadm, mkinitcpio hooks, udev rule; replaces mdadm;
+#   md-bitmap-ext-dkms - optional: md_mod with the md fix for the write-intent bitmap of external
+#                        metadata (kernel/), for Linux 7.3.1-7.3.3, until it is upstream.
+# Build: cp ../../mdadm/mdadm-amd.patch ../dkms/* . && makepkg -s   (see docs/install.md)
+# (after changing a file here: updpkgsums)
+
+pkgbase=mdadm-amd
+pkgname=('mdadm-amd' 'md-bitmap-ext-dkms')
+_commit=cd27b828deb70abb3edb862ba8ddc8b905866a2e   # mdadm-4.6-96-gcd27b828, 2026-11-04 (GitHub main)
+pkgver=4.6.r96.gcd27b828
+pkgrel=29
+arch=('x86_64')
+license=('GPL-2.0-or-later')
+url='https://github.com/md-raid-utilities/mdadm'
+makedepends=('git' 'man-db')
+
+# md-bitmap-ext-dkms: drivers/md of this stable tag, and the kernels whose drivers/md is identical to it
+_mdver=7.3.1
+_mdkvers_re='^7\.3\.[123]-'
+_md="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/md"
+_mdfiles=(md.c md.h md-bitmap.c md-bitmap.h md-llbitmap.c md-cluster.h)
+
+source=("mdadm::git+https://github.com/md-raid-utilities/mdadm.git#commit=${_commit}"
+        'mdadm-amd.patch'
+        '64-amd-raid-assembly.rules'
+        'initcpio-install-amdraid'
+        'initcpio-install-amdraid-shutdown'
+        'amdraid.shutdown'
+        '60-amdraid-shutdown.conf'
+        'mdadm.conf'
+        'dkms.conf'
+        'Kbuild'
+        'dkms-pre-build.sh'
+        'dkms-post-install.sh'
+        'md-bitmap-ext.patch')
+for _f in "${_mdfiles[@]}"; do
+	source+=("${_f}::${_md}/${_f}?h=v${_mdver}")
+done
+sha256sums=('2004c3ba071d0daf850fdce5c65e8efded6c34625c8e30f64bec896be4c6cf3f'
+            'c9131a0f6d85930e547917a0e8f403924a9791bf6ce8c49f71edc40c747078bc'
+            '52b7a3e7f6d4785234c79fd394f2009a9aa389230fa742250058bd1f310330d1'
+            'c3bceb429eebe148f2ad37c29cc1f1edb4dacc6495b251df558db5f2618e3671'
+            '1dfff7905e6db439a38f19deede2535e405387bda6d6d7e8ef5e71661ada019f'
+            '8ec8981de87c277e5010f11c34ded14a2d38e1fc8e8c2e65e4c970ed31c70177'
+            '86b24552bc2cc2436e91698f20798129c3c60bfb406445e0ae76314377147d1d'
+            '77d2cee69f9008318ddea60e253cd9416a3850e9e36d5bc55f51d9df4810544d'
+            '3324715df5bdce0de6cdd13c7b6e2f860722ce9b1af415d7ac49d46df2245f0d'
+            'db4ca682da822c23eb06220035b02e2247d16a95eb1d359930535157260c5197'
+            '84863a9628e41d9ca43a582ec02143794e50a11e9d176810d1601f79c6328311'
+            'c491893084e4f1f288319b99ffb273ae1db2ea7a9e29fef7b728ad5d66d67ceb'
+            '64be305f29103acedc7df3798b0bed1497dc0e92a30a2d75b2c771cf871ee626'
+            '5e9439bd8b4c42a721c992956b7c58cfbf13abf3414e5ac4cceb0c76a32f021a'
+            'be037a9c3f0b063c731436507993680a5c77153c6bfb327a31f6a2e08d7e501e'
+            'c732141180be5336afecd60e36290db60d2f4f1baf2395c7c4d9bcbb45ae0a23'
+            'c18843c92a4973c45d608985fb793b62dba2c1621125e35043c01fca288d73ec'
+            '023674e6282abaa6fde3b56738186f0e3c07f5ad09b531f0ec47ab12724bb3ad'
+            '1120a275736ab1d91931323e8a170380172bb71a98de48b998b36380edb1426a')
+
+prepare() {
+	cd mdadm
+	git apply "$srcdir"/mdadm-amd.patch
+
+	# md-bitmap-ext-dkms: drivers/md with the fix
+	cd "$srcdir"
+	rm -rf md-tree
+	mkdir -p md-tree/drivers/md
+	cp -L "${_mdfiles[@]}" md-tree/drivers/md/
+	patch -d md-tree -p1 --no-backup-if-mismatch -i "$srcdir/md-bitmap-ext.patch"
+}
+
+build() {
+	cd mdadm
+	# CachyOS builds with -O3 and LTO: GCC then reports false positives in upstream code
+	# (super-intel.c: format-truncation, maybe-uninitialized; super-ddf.c: maybe-uninitialized),
+	# and the Makefile has -Werror. super-amd.c builds clean with these flags.
+	CFLAGS+=' -Wno-error'
+	make CXFLAGS="$CFLAGS" BINDIR=/usr/bin UDEVDIR=/usr/lib/udev everything
+}
+
+package_mdadm-amd() {
+	pkgdesc='mdadm with AMD RAIDXpert2 (RAIDCore) metadata support (mdadm-amd 1.0), plus the amdraid mkinitcpio hook'
+	depends=('glibc' 'systemd')
+	optdepends=('bash: mdcheck'
+	            'md-bitmap-ext-dkms: md write-intent bitmap of AMD volumes on Linux 7.3 (resync after a crash only where md was writing)')
+	provides=("mdadm=${pkgver}")
+	# mkinitcpio 40: HOOKS of the shutdown ramfs come from /run/initramfs/mkinitcpio-shutdown.conf
+	# (tmpfiles 20-mkinitcpio.conf), which 60-amdraid-shutdown.conf appends to
+	conflicts=('mdadm' 'mkinitcpio<40')
+	replaces=('raidtools')
+	backup=('etc/mdadm.conf')
+	install=mdadm-amd.install
+
+	cd mdadm
+	make INSTALL=/usr/bin/install BINDIR=/usr/bin DESTDIR="$pkgdir" UDEVDIR=/usr/lib/udev install
+	make SYSTEMD_DIR=/usr/lib/systemd/system BINDIR=/usr/bin DESTDIR="$pkgdir" install-systemd
+	install -D -m644 ../mdadm.conf "$pkgdir"/etc/mdadm.conf
+
+	install -Dm 644 raid6check.8 "$pkgdir"/usr/share/man/man8/raid6check.8
+	install -Dm 755 raid6check "$pkgdir"/usr/bin/raid6check
+
+	# AMD: libblkid does not know the RAIDCore label — udev offers whole disks to mdadm -I;
+	# the amdraid hook (after block, needs the systemd hook) carries mdadm/mdmon into the initramfs.
+	install -Dm 644 ../64-amd-raid-assembly.rules "$pkgdir"/usr/lib/udev/rules.d/64-amd-raid-assembly.rules
+	install -Dm 644 ../initcpio-install-amdraid "$pkgdir"/usr/lib/initcpio/install/amdraid
+	# shutdown: external-metadata arrays left clean, as recorded by mdmon, right before the power goes
+	# (the root file system's array cannot be stopped): the amdraid-shutdown hook in the shutdown ramfs.
+	install -Dm 644 ../initcpio-install-amdraid-shutdown "$pkgdir"/usr/lib/initcpio/install/amdraid-shutdown
+	install -Dm 755 ../amdraid.shutdown "$pkgdir"/usr/lib/initcpio/amdraid.shutdown
+	install -Dm 644 ../60-amdraid-shutdown.conf "$pkgdir"/usr/lib/tmpfiles.d/60-amdraid-shutdown.conf
+}
+
+package_md-bitmap-ext-dkms() {
+	pkgdesc='md_mod with the write-intent bitmap fix for external metadata (DKMS, Linux 7.3.1-7.3.3), until it is upstream'
+	arch=('any')
+	license=('GPL-2.0-only')
+	depends=('dkms')
+	url="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/md?h=v${_mdver}"
+
+	# DKMS names the module by the kernel it comes from, not by this package's version
+	local dest="$pkgdir/usr/src/md-bitmap-ext-${_mdver}"
+
+	install -Dm644 -t "$dest" md-tree/drivers/md/* Kbuild
+	install -Dm755 -t "$dest" dkms-pre-build.sh dkms-post-install.sh
+	# in bash, not sed: the backslashes of the regex would need escaping twice over
+	local conf
+	conf=$(<dkms.conf)
+	conf=${conf//@PKGVER@/$_mdver}
+	conf=${conf//@KVER_RE@/$_mdkvers_re}
+	printf '%s\n' "$conf" > "$dest/dkms.conf"
+	chmod 644 "$dest/dkms.conf"
+}

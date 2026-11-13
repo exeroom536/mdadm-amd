@@ -1,0 +1,77 @@
+From d02f734839343caeb082275a888913cdb52a98c9 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:00 +0500
+Subject: [PATCH 07/32] mdmon: do not wait for a zombie in try_kill_monitor()
+
+mdmon --takeover has the old mdmon exit, then pings it with SIGUSR1
+until kill() fails, for up to 5 s, before it starts its own manager.  In
+the shutdown ramfs of systemd (exitrd) pid 1 is systemd-shutdown, which
+does not reap: the old mdmon exits but stays a zombie, kill() keeps
+finding it, and the new mdmon waits the full 5 s - so do mdadm
+--wait-clean and --stop, which need it to answer.  A zombie has let go
+of everything (its files, its O_EXCL on the container): it is as gone as
+the loop wants it.
+
+Stop waiting when the pid is a zombie (/proc/<pid>/stat).
+
+With the root file system on a RAID1 of AMD RAIDXpert2 metadata (later in
+this series; CachyOS, systemd-shutdown), taken over in exitrd: exitrd
+took 8.3 s, with the change 3.4 s.
+
+Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
+---
+ mdmon.c | 31 ++++++++++++++++++++++++++++++-
+ 1 file changed, 30 insertions(+), 1 deletion(-)
+
+diff --git a/mdmon.c b/mdmon.c
+index 037602ab..aa047591 100644
+--- a/mdmon.c
++++ b/mdmon.c
+@@ -166,6 +166,35 @@ static int make_pidfile(char *devname)
+ 	return 0;
+ }
+ 
++/*
++ * An mdmon that has exited but that nobody has reaped is a zombie: kill()
++ * still finds it.  In the shutdown ramfs (systemd's exitrd, dracut's
++ * shutdown) its parent is the shutdown program as pid 1, which does not
++ * reap.
++ */
++static bool is_zombie(pid_t pid)
++{
++	char buf[64];
++	char *p;
++	int fd;
++	int n;
++
++	sprintf(buf, "/proc/%lu/stat", (unsigned long) pid);
++	fd = open(buf, O_RDONLY);
++	if (fd < 0)
++		return false;
++
++	n = read(fd, buf, sizeof(buf)-1);
++	close(fd);
++	if (n <= 0)
++		return false;
++	buf[n] = 0;
++
++	/* "pid (comm) state ...": the last ')' ends comm */
++	p = strrchr(buf, ')');
++	return p && p[1] == ' ' && p[2] == 'Z';
++}
++
+ static void try_kill_monitor(pid_t pid, char *devname, int sock)
+ {
+ 	char buf[100];
+@@ -213,7 +242,7 @@ static void try_kill_monitor(pid_t pid, char *devname, int sock)
+ 	 * Ping it with SIGUSR1 in case that it is sleeping  */
+ 	for (n = 0; n < 25; n++) {
+ 		rv = kill(pid, SIGUSR1);
+-		if (rv < 0)
++		if (rv < 0 || is_zombie(pid))
+ 			break;
+ 		sleep_for(0, MSEC_TO_NSEC(200), true);
+ 	}
+-- 
+2.47.3
+

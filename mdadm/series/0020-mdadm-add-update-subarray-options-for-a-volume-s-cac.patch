@@ -1,0 +1,75 @@
+From 05cc00680ef4d3aaab0327efe1678f450a3532f9 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:38 +0500
+Subject: [PATCH 20/32] mdadm: add --update-subarray options for a volume's
+ cache policy
+
+AMD RAIDXpert2 keeps a cache policy in each volume's metadata: read
+ahead, write back.  md has no such cache, but the AMD driver for Windows
+caches by it, and the AMD BIOS menu and RAIDXpert2 set it.  So that it can
+be set from Linux too, add the --update-subarray values read-cache,
+no-read-cache, write-back and no-write-back for a metadata handler to
+record.
+
+Like ppl and no-ppl they change only the metadata, nothing md runs, and
+are allowed on an active member array.  A handler that does not know them
+refuses them as any other value it does not support (IMSM: "Failed to
+update"); the amd handler later in this series takes them.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Manage.c | 6 +++++-
+ maps.c   | 4 ++++
+ mdadm.h  | 4 ++++
+ 3 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/Manage.c b/Manage.c
+index c073742d..ae1c72c6 100644
+--- a/Manage.c
++++ b/Manage.c
+@@ -1797,7 +1797,11 @@ int Update_subarray(char *dev, char *subarray, enum update_opt update,
+ 	int fd, rv = 2;
+ 	struct mdinfo *info = NULL;
+ 	char *update_verb = map_num(update_options, update);
+-	bool allow_active = update == UOPT_PPL || update == UOPT_NO_PPL;
++	bool allow_active = update == UOPT_PPL || update == UOPT_NO_PPL ||
++			    update == UOPT_READ_CACHE ||
++			    update == UOPT_NO_READ_CACHE ||
++			    update == UOPT_WRITE_BACK ||
++			    update == UOPT_NO_WRITE_BACK;
+ 
+ 	memset(st, 0, sizeof(*st));
+ 
+diff --git a/maps.c b/maps.c
+index 2181b4ac..2db5a8e0 100644
+--- a/maps.c
++++ b/maps.c
+@@ -174,6 +174,10 @@ mapping_t update_options[] = {
+ 	{ "no-ppl", UOPT_NO_PPL },
+ 	{ "bitmap", UOPT_BITMAP },
+ 	{ "no-bitmap", UOPT_NO_BITMAP },
++	{ "read-cache", UOPT_READ_CACHE },
++	{ "no-read-cache", UOPT_NO_READ_CACHE },
++	{ "write-back", UOPT_WRITE_BACK },
++	{ "no-write-back", UOPT_NO_WRITE_BACK },
+ 	{ "sparc2.2", UOPT_SPARC22 },
+ 	{ "super-minor", UOPT_SUPER_MINOR },
+ 	{ "summaries", UOPT_SUMMARIES },
+diff --git a/mdadm.h b/mdadm.h
+index 4cdc6a3a..a8a7f2a1 100644
+--- a/mdadm.h
++++ b/mdadm.h
+@@ -496,6 +496,10 @@ enum update_opt {
+ 	UOPT_NO_PPL,
+ 	UOPT_BITMAP,
+ 	UOPT_NO_BITMAP,
++	UOPT_READ_CACHE,	/* AMD: the AMD driver's cache policy */
++	UOPT_NO_READ_CACHE,
++	UOPT_WRITE_BACK,
++	UOPT_NO_WRITE_BACK,
+ 	UOPT_SUBARRAY_ONLY,
+ 	UOPT_SPARC22,
+ 	UOPT_SUPER_MINOR,
+-- 
+2.47.3
+

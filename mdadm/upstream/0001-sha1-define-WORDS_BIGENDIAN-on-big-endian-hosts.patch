@@ -1,0 +1,73 @@
+From 6044974d59a35de502e2645855975f0ce8609cd1 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 12:42:17 +0500
+Subject: [PATCH 1/2] sha1: define WORDS_BIGENDIAN on big-endian hosts
+
+sha1.c, taken from libiberty, relies on config.h (autoconf's
+AC_C_BIGENDIAN) to define WORDS_BIGENDIAN on big-endian hosts.  mdadm
+has no config.h and nothing else defines it, so SWAP() byte-swaps there
+as well: the message words are loaded and the digest words stored as
+little-endian ones, and sha1_buffer() does not compute SHA-1.  On s390x
+and powerpc "abc" gives 3c15c2d6..., not a9993e36....  It has been so
+since mdadm 2.5.1: commit 8268ed740379 ("Remove libssl dependancy and
+always use sha1.c code") replaced OpenSSL's SHA1() with this code.
+
+Define WORDS_BIGENDIAN from <endian.h>, as the rest of mdadm tests the
+byte order.  Little-endian builds do not change: sha1.o for x86-64 has
+the same code before and after.
+
+On big-endian hosts the values mdadm derives with SHA-1 change:
+- 0.90 arrays created with a homehost (the hostname by default) hold 8
+  bytes of its hash in set_uuid2..3.  Those created on big-endian hosts
+  so far hold the old value and would no longer match their homehost;
+  the next patch keeps them matching.
+- The UUIDs of DDF and IMSM containers and volumes change: ARRAY lines
+  written for them on such hosts no longer match.  For DDF the digest
+  is now the same as on little-endian hosts; the text form still
+  differs in byte order within each 32-bit word, as these UUIDs are kept
+  as host-order words.  IMSM metadata does not load on big-endian hosts
+  at all (__gen_imsm_checksum() uses mpb_size without __le32_to_cpu()).
+
+Tested with gcc 14 for x86-64 and cross for s390x and powerpc, the
+big-endian ones under qemu-user 10.0:
+- the FIPS 180 vectors ("", "abc", the 448-bit message, a million 'a')
+  through sha1_buffer(): wrong on s390x and powerpc before, right on all
+  three after;
+- mdadm -E, -Eb and --examine --export of DDF and IMSM containers with
+  RAID1 volumes on loop files: x86-64 output is unchanged; DDF UUIDs on
+  s390x and powerpc change, from 32e70dc0:9154b7ba:824405cd:98e1e14c to
+  d98fa9ef:95fd6067:67a4512c:27222cfd, against
+  efa98fd9:6760fd95:2c51a467:fd2c2227 on x86-64.
+
+Found and written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ sha1.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/sha1.c b/sha1.c
+index 1e4ad5d9..9ffba6c4 100644
+--- a/sha1.c
++++ b/sha1.c
+@@ -27,9 +27,19 @@
+ 
+ #include "sha1.h"
+ 
++#include <endian.h>
+ #include <stddef.h>
+ #include <string.h>
+ 
++/*
++ * There is no config.h (autoconf AC_C_BIGENDIAN) to define WORDS_BIGENDIAN:
++ * without it SWAP() byte-swaps on big-endian hosts too and the digest is not
++ * SHA-1 there.
++ */
++#if __BYTE_ORDER == __BIG_ENDIAN
++# define WORDS_BIGENDIAN 1
++#endif
++
+ #if USE_UNLOCKED_IO
+ # include "unlocked-io.h"
+ #endif
+-- 
+2.47.3
+

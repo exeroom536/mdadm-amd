@@ -1,0 +1,77 @@
+From b6336fca63f76f8681c9b8d198a9884c69a5d860 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:01 +0500
+Subject: [PATCH 08/32] Incremental: do not add the members of a running array
+ again
+
+Incremental_container() is run again for each disk that joins a container.
+A member array that is running already has its devices: assembling it
+again only fails (and prints errors).  A device new to the container is
+for the monitor, which mdadm pings after adding it.
+
+Skip member arrays that are active; report them as already started.
+
+Devices of a member array that is not running yet are skipped too when
+they were added by an earlier run: writing them to new_dev again fails
+with EEXIST, which mdadm prints as an error since commit d95edceb362a
+("sysfs: add function for writing to sysfs fd") - "failed to write ...
+to new_dev (File exists)" - once per disk and member on every
+incremental boot.  They are counted as present, as the EEXIST case
+counted them.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Assemble.c    | 12 ++++++++++++
+ Incremental.c | 13 +++++++++++++
+ 2 files changed, 25 insertions(+)
+
+diff --git a/Assemble.c b/Assemble.c
+index 30c3accc..2deffbb5 100644
+--- a/Assemble.c
++++ b/Assemble.c
+@@ -2064,6 +2064,18 @@ int assemble_container_content(struct supertype *st, int mdfd,
+ 	for (dev = content->devs; dev; dev = dev->next) {
+ 		if (dev->disk.raid_disk >= 0)
+ 			avail[dev->disk.raid_disk] = 1;
++		/*
++		 * Incremental assembly comes here again for each new device
++		 * of the container; the ones added before are members already.
++		 */
++		for (dev2 = sra->devs; dev2; dev2 = dev2->next)
++			if (dev2->disk.major == dev->disk.major &&
++			    dev2->disk.minor == dev->disk.minor)
++				break;
++		if (dev2) {
++			array.preexist_cnt++;
++			continue;
++		}
+ 		if (sysfs_add_disk(content, dev, 1) == 0) {
+ 			if (dev->disk.raid_disk >= old_raid_disks &&
+ 			    content->reshape_active)
+diff --git a/Incremental.c b/Incremental.c
+index 40c5cd09..7a85cb90 100644
+--- a/Incremental.c
++++ b/Incremental.c
+@@ -1638,6 +1638,19 @@ static int Incremental_container(struct supertype *st, char *devname,
+ 			close_fd(&mdfd);
+ 			continue;
+ 		}
++		if (mp && md_array_active(mdfd)) {
++			/*
++			 * Already running: a device new to the container is for
++			 * the monitor (ping_monitor() after adding it), adding
++			 * the members again only fails.
++			 */
++			if (c->export)
++				result |= INCR_ALREADY;
++			else if (c->verbose > 0)
++				pr_err("%s is already active.\n", chosen_name);
++			close_fd(&mdfd);
++			continue;
++		}
+ 
+ 		assemble_container_content(st, mdfd, ra, c,
+ 					   chosen_name, &result);
+-- 
+2.47.3
+

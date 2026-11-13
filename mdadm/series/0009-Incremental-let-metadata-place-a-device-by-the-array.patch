@@ -1,0 +1,76 @@
+From ba6efe679a21a00201d1ffae7f1d663f6d6bf0d8 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:03 +0500
+Subject: [PATCH 09/32] Incremental: let metadata place a device by the arrays
+ assembled
+
+Incremental() picks the container for a device by the UUID that
+getinfo_super() gave before the map was locked.  Metadata that records
+no ID of its disk set - AMD RAIDXpert2, later in this series - can only
+tell which container a device belongs to from the containers and devices
+present, and its container UUID changes with the configuration (it comes
+from the disks the newest configuration lists):
+
+- two "mdadm -I" run together by udev both see no container of the set
+  and create one each;
+- a device that brings the container a newer configuration changes the
+  container's UUID, and the map keeps the old one, so the next device of
+  the set does not find the container.
+
+Ask getinfo_super() again once the map is locked, so that devices
+coming in together agree, and update the map entry of a container whose
+UUID after load_container() differs.  It is getinfo_super() both times,
+not uuid_from_super(): for an IMSM spare the two differ (uuid_zero,
+which gathers the spares into one container, against the UUID of the
+spare's own family).  The other formats give the same UUID from the
+same superblock both times, and a container UUID that does not change
+with the devices added, so nothing changes for them.
+
+Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
+---
+ Incremental.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/Incremental.c b/Incremental.c
+index 7a85cb90..b500b0bc 100644
+--- a/Incremental.c
++++ b/Incremental.c
+@@ -281,6 +281,14 @@ int Incremental(struct mddev_dev *devlist, struct context *c,
+ 	close(dfd);
+ 	dfd = -1;
+ 
++	/*
++	 * Metadata that records no ID of its array (AMD) finds the container
++	 * of a device by the containers and devices present: ask again now
++	 * that we hold the map lock and no other "mdadm -I" can add to them.
++	 * Ask getinfo_super(), as above: for an IMSM spare it gives
++	 * uuid_zero, uuid_from_super() the UUID of the spare's own family.
++	 */
++	st->ss->getinfo_super(st, &info, NULL);
+ 	mp = map_by_uuid(&map, info.uuid);
+ 	if (mp)
+ 		mdfd = open_dev(mp->devnm);
+@@ -483,6 +491,20 @@ int Incremental(struct mddev_dev *devlist, struct context *c,
+ 			strcpy(devnm, fd2devnm(mdfd));
+ 		if (st->ss->load_container)
+ 			rv = st->ss->load_container(st, mdfd, NULL);
++		/*
++		 * The device may have brought the container newer metadata,
++		 * with another UUID (AMD derives it from the disks the newest
++		 * configuration lists): keep the map in step.
++		 */
++		if (!rv) {
++			struct mdinfo cinfo;
++
++			st->ss->getinfo_super(st, &cinfo, NULL);
++			if (memcmp(cinfo.uuid, info.uuid, sizeof(info.uuid)) != 0)
++				map_update(&map, fd2devnm(mdfd),
++					   info.text_version, cinfo.uuid,
++					   chosen_name);
++		}
+ 		udev_ready(sra);
+ 		sysfs_free(sra);
+ 		sra = NULL;
+-- 
+2.47.3
+

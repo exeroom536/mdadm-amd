@@ -1,0 +1,43 @@
+From 4a961527b851844254f8fbc52565194415f5f4b6 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:55:47 +0500
+Subject: [PATCH 01/32] Manage: pass force and verbose to Manage_remove() in
+ their order
+
+Manage_remove() takes force before verbose, but Manage_subdevs() has
+passed them the other way round since force was added to it.  So
+hot_remove_disk() and sys_hot_remove_disk() get the verbose level as
+force, and Manage_remove() gets --force as the verbose level:
+
+- --remove --force waits only 50 ms for a busy device to be released,
+  not the 5 s it should;
+- --remove with --quiet or --verbose waits up to 5 s for it;
+- "hot removed ..." is printed with --quiet too.
+
+Pass them in the order of the prototype.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+
+Fixes: 1ab9ed2afb7c ("Add 'force' flag to *hot_remove_disk().")
+---
+ Manage.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Manage.c b/Manage.c
+index 53eb1239..83ce1e1d 100644
+--- a/Manage.c
++++ b/Manage.c
+@@ -1656,7 +1656,7 @@ int Manage_subdevs(char *devname, int fd,
+ 				pr_err("Cannot remove disks from a \'member\' array, perform this operation on the parent container\n");
+ 				rv = -1;
+ 			} else
+-				rv = Manage_remove(tst, fd, dv, sysfd, rdev, verbose, force,
++				rv = Manage_remove(tst, fd, dv, sysfd, rdev, force, verbose,
+ 						   devname);
+ 			close_fd(&sysfd);
+ 
+
+base-commit: cd27b828deb70abb3edb862ba8ddc8b905866a2e
+-- 
+2.47.3
+

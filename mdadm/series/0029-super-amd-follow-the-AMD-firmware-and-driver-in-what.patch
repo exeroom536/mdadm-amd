@@ -1,0 +1,877 @@
+From 3ac8c1cd4bba85f8adf47f8b99ab0b7f56287ee0 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:57:08 +0500
+Subject: [PATCH 29/32] super-amd: follow the AMD firmware and driver in what
+ they check
+
+What mdadm writes is only of use if the AMD BIOS and the Windows driver
+take it the same way:
+
+- disks only behind controllers the AMD firmware uses for RAID (EFI
+  variable AMD_RAID): a disk it does not see is missing from the volume
+  there and in Windows.  --force takes it anyway (another machine, the
+  disks on another controller to get at the data);
+- no more arrays than the BIOS menu allows (12, a Legacy disk counted),
+  and no volume of more disks than the menu and rcadm create (8), unless
+  --force: the BIOS and Windows took volumes of up to 12 disks;
+- Legacy (pass-through) records the BIOS menu broke - the disk is no
+  longer offered for boot - are repaired, each Legacy disk its own;
+- a disk whose LBA 0 changed under AMD's partition (boot code, a disk
+  signature) gets the new checksum in its label: without it the BIOS
+  and the Windows driver take it for a non-RAID disk;
+- TRIM is off where the AMD driver does not allow it: on parity volumes,
+  and on mirrors whose members do not read zeroes after TRIM.
+
+Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
+---
+ super-amd.c | 687 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 684 insertions(+), 3 deletions(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index c11abad2..a17dac8f 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -14,7 +14,9 @@
+  * --create of a container (the disks "initialized" as the BIOS menu does)
+  * and of Volume/RAID0/1/10/5 volumes in it; --add, --remove,
+  * --kill-subarray, --update-subarray (name, the AMD driver's cache
+- * policy).
++ * policy); Legacy (pass-through) records the BIOS menu broke are repaired.
++ * Disks are taken only behind controllers the AMD firmware uses for RAID
++ * (EFI variable AMD_RAID), unless --force.
+  *
+  * On-disk layout, little-endian, 512-byte sectors:
+  *   LBA 0x5000         RC_MetaData: per-disk label, "RAIDCore", DeviceId
+@@ -463,6 +465,7 @@ struct amd_vol_mon {
+ 	unsigned long long md_writes;	/* sectors md had written at open_new */
+ 	unsigned long long init_ckpt;	/* volume sectors md has initialized */
+ 	int init_tlog;		/* 1: write init_ckpt to the log, 2: clear it */
++	unsigned int trim_gran;	/* TRIM capped (amd_limit_trim): discard_granularity before */
+ };
+ 
+ /* A logical device exposed as an md array */
+@@ -497,6 +500,7 @@ struct amd_super {
+ 	int nvol;
+ 	int current_vol;
+ 	int config_dirty;	/* the packet changed, write it out */
++	int legacy_checked;	/* mdmon: start-up writes decided (amd_sync_metadata) */
+ 	int foreign;		/* the live packet is from a disk last online elsewhere */
+ 	int from_md;		/* the disks of a running container (amd_load_md) */
+ 	int attached;		/* add_to_super took a disk in, nothing to init */
+@@ -1484,6 +1488,123 @@ static void amd_repair_pds(int fd, void *packet, unsigned int len)
+ 	}
+ }
+ 
++/*
++ * Creating a volume in the RAIDXpert2 menu over all the RAID disks (MSI
++ * X870E 1.A93, RAIDCoreDxe 9.3.3: RAID10 and RAID5 on 4 HDDs) breaks the
++ * Legacy LD of a disk without metadata: State OFFLINE, its element
++ * DeviceID all ones and Handle 0; the firmware then adds another Legacy LD
++ * with a new ID that breaks the same way.  It no longer ties the disk to an
++ * LD and does not offer it for boot.  A good record differs only in these
++ * three fields.
++ */
++static int amd_legacy_broken(const struct amd_ld *ld)
++{
++	const struct amd_element *el = (const struct amd_element *)(ld + 1);
++
++	return __le32_to_cpu(ld->state) != AMD_LD_STATE_NORMAL ||
++	       el->id.id == AMD_ID_NONE;
++}
++
++/* the Legacy PD with DeviceID @id (little-endian, as in the packet), or -1 */
++static int amd_legacy_pd(const struct amd_super *super, __u64 id)
++{
++	int i;
++
++	for (i = 0; i < super->npd; i++)
++		if (super->pd[i]->id.id == id &&
++		    __le32_to_cpu(super->pd[i]->device_type) == AMD_DEV_LEGACY)
++			return i;
++	return -1;
++}
++
++/*
++ * For each Legacy PD without a good Legacy LD: bring back the LD with the
++ * ID of the PD (or the first broken one of its capacity) - State NORMAL,
++ * the element the PD itself - and drop the other broken Legacy LDs of
++ * that capacity: then the BIOS offers the disk for boot again (MSI X870E).
++ * The Legacy LD of a disk has the ID of its PD, the extra ones the firmware
++ * adds have random IDs (every packet of the dumps): a broken record with
++ * the ID of another Legacy PD - a second Legacy disk of that capacity - is
++ * that disk's, to repair or to keep.  With @fix 0 only count.  Returns the
++ * number of LD records changed or dropped.
++ *
++ * mdmon repairs them once all RAID disks are here; mdadm with every
++ * configuration it writes itself (-C, --kill-subarray, --update-subarray
++ * without mdmon): mdmon runs only for a redundant volume, and a RAID0 or
++ * Volume made in the menu over all the RAID disks breaks the record too.
++ */
++static int amd_repair_legacy(struct amd_super *super, int fix)
++{
++	struct amd_packet_header *h = super->packet;
++	int i, changes = 0;
++
++	if (!h)
++		return 0;
++	for (i = 0; i < super->npd; i++) {
++		struct amd_pd *pd = super->pd[i];
++		__u64 pid = pd->id.id;	/* both sides little-endian */
++		__u16 handle = pd->id.handle;
++		__u64 cap = pd->capacity;
++		unsigned int broken[16], nb = 0, keep = 0, off, k;
++		char *p = super->packet;
++		struct amd_element *el;
++		struct amd_ld *ld;
++		int good = 0;
++
++		if (__le32_to_cpu(pd->device_type) != AMD_DEV_LEGACY)
++			continue;
++		off = __le32_to_cpu(h->ld_offset);
++		while ((ld = amd_next_ld(super, &off))) {
++			el = (struct amd_element *)(ld + 1);
++			if (__le32_to_cpu(ld->device_type) == AMD_LDT_LEGACY &&
++			    __le32_to_cpu(ld->first_count) == 1 &&
++			    __le32_to_cpu(ld->second_count) == 1) {
++				if (!amd_legacy_broken(ld) && el->id.id == pid)
++					good = 1;
++				else if (amd_legacy_broken(ld) && ld->capacity == cap &&
++					 (el->id.id == pid || el->id.id == AMD_ID_NONE) &&
++					 (ld->id.id == pid ||
++					  amd_legacy_pd(super, ld->id.id) < 0) &&
++					 nb < ARRAY_SIZE(broken))
++					broken[nb++] = (char *)ld - p;
++			}
++		}
++		if (nb == 0)
++			continue;
++		changes += nb;
++		if (!fix)
++			continue;
++		if (!good) {
++			for (k = 0; k < nb; k++)
++				if (((struct amd_ld *)(p + broken[k]))->id.id == pid) {
++					keep = k;
++					break;
++				}
++			ld = (struct amd_ld *)(p + broken[keep]);
++			el = (struct amd_element *)(ld + 1);
++			ld->state = __cpu_to_le32(AMD_LD_STATE_NORMAL);
++			el->id.id = pid;
++			el->id.handle = handle;
++			amd_kmsg("Legacy record of disk %016llx (handle %u) repaired",
++				 (unsigned long long)__le64_to_cpu(pid),
++				 __le16_to_cpu(handle));
++		}
++		/* from the end, so that the offsets before stay valid */
++		for (k = nb; k-- > 0;) {
++			ld = (struct amd_ld *)(p + broken[k]);
++			if (!good && k == keep)
++				continue;
++			amd_kmsg("broken extra Legacy record %012llx of disk %016llx dropped",
++				 (unsigned long long)__le64_to_cpu(ld->id.id),
++				 (unsigned long long)__le64_to_cpu(pid));
++			amd_cut_ld(super, broken[k], amd_ld_size(ld));
++		}
++		amd_trim_packet(super);
++		amd_reparse(super);
++	}
++	return changes;
++}
++
+ static struct amd_disk *amd_find_disk(struct amd_super *super, __u64 id)
+ {
+ 	struct amd_disk *d;
+@@ -3915,7 +4036,10 @@ static void examine_super_amd(struct supertype *st, char *homehost)
+ 	printf("      Device ID : %016llx\n",
+ 	       (unsigned long long)disk->device_id);
+ 	printf(" Container UUID : %s\n", amd_uuid_text(uuid, nbuf));
+-	if (disk->mbr == AMD_MBR_OTHER)
++	if (disk->mbr == AMD_MBR_SUM)
++		printf("    MBR (LBA 0) : AMD's partition, but not the checksum in the label;"
++		       " mdmon updates the label\n");
++	else if (disk->mbr == AMD_MBR_OTHER)
+ 		amd_mbr_advice(disk, 1);
+ 	if (!disk->commit_valid) {
+ 		printf("  Configuration : none (no valid commit block)\n");
+@@ -3949,6 +4073,10 @@ static void examine_super_amd(struct supertype *st, char *homehost)
+ 		       __le64_to_cpu(pd->id.id) == disk->device_id ?
+ 		       "  <- this disk" : "");
+ 	}
++	i = amd_repair_legacy(super, 0);
++	if (i)
++		printf("\n  Legacy records : %d broken by the BIOS (the disk is not bootable);"
++		       " repaired with the next configuration mdmon or mdadm writes\n", i);
+ 	for (i = 0; i < super->nvol; i++)
+ 		amd_print_volume(super, i);
+ }
+@@ -4220,6 +4348,136 @@ static __u64 amd_disk_id(struct amd_super *super, int fd)
+ 	return amd_random_id(super);
+ }
+ 
++/*
++ * The PCI function (DDDD:BB:DD.F) a sysfs device path ends up at: the last
++ * one on it, the one the device is attached to.  1 if found, 0 if none.
++ */
++static int amd_pci_in_path(const char *path, char *pci, size_t len)
++{
++	const char *c;
++	int found = 0;
++
++	for (c = strchr(path, '/'); c; c = strchr(c + 1, '/')) {
++		unsigned int d, b, s, f;
++		int n = 0;
++
++		if (sscanf(c, "/%4x:%2x:%2x.%1x%n", &d, &b, &s, &f, &n) == 4 &&
++		    n == 13 && (c[n] == '/' || c[n] == 0)) {
++			snprintf(pci, len, "%.12s", c + 1);
++			found = 1;
++		}
++	}
++	return found;
++}
++
++/*
++ * The PCI function a disk is attached to (into @pci, 16 bytes); a multipath
++ * NVMe namespace through its first controller (devt_to_devpath() level 1).
++ * 1 if found, 0 if the disk is behind none (a loop device), -1 if unknown.
++ */
++static int amd_pci_of(int major, int minor, char *pci)
++{
++	dev_t dev = makedev(major, minor);
++	char path[PATH_MAX];
++
++	if (!devt_to_devpath(dev, 0, path))
++		return -1;
++	if (strstr(path, "/nvme-subsystem/") &&
++	    (!devt_to_devpath(dev, 1, path) ||
++	     strstr(path, "/nvme-subsystem/")))
++		return -1;		/* no controller (path) now */
++	return amd_pci_in_path(path, pci, 16);
++}
++
++static unsigned int amd_pci_attr(const char *pci, const char *attr)
++{
++	char path[64], buf[32];
++
++	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/%s", pci, attr);
++	if (load_sys(path, buf, sizeof(buf)) != 0)
++		return 0;
++	return strtoul(buf, NULL, 16);
++}
++
++/*
++ * The EFI variable AMD_RAID (u64) the platform sets for the AMD firmware
++ * (MSI X870E in RAID mode: 0x0d), 0 if it is not there (*present 0 then).
++ */
++#define AMD_RAID_GUID EFI_GUID(0xfe26a894, 0xd199, 0x47d4, 0x8a, 0xfa, \
++			       0x07, 0x0e, 0x3d, 0x54, 0xba, 0x86)
++static unsigned int amd_raid_var(int *present)
++{
++	__u64 var;
++
++	*present = read_efi_variable(&var, sizeof(var), "AMD_RAID",
++				     AMD_RAID_GUID) == 0;
++	return *present ? (unsigned int)__le64_to_cpu(var) : 0;
++}
++
++/*
++ * Does the AMD firmware (AMD_RAID @raid) take the disks behind PCI function
++ * @pci?  RAIDCoreDxe's Supported (D:0xd00) takes AHCI 1022:43bd if
++ * AMD_RAID & 1, 1022:7905/7916/7917 if AMD_RAID & 2, and NVMe if
++ * AMD_RAID & 4 - only 1022:b000 if AMD_RAID & 8, any otherwise.
++ */
++static int amd_raid_takes(const char *pci, unsigned int raid,
++			  unsigned int *vendor, unsigned int *device)
++{
++	unsigned int class = amd_pci_attr(pci, "class") >> 8;
++
++	*vendor = amd_pci_attr(pci, "vendor");
++	*device = amd_pci_attr(pci, "device");
++	if (*vendor == 0x1022 && *device == 0x43bd)
++		return (raid & 1) != 0;
++	if (*vendor == 0x1022 &&
++	    (*device == 0x7905 || *device == 0x7916 || *device == 0x7917))
++		return (raid & 2) != 0;
++	if (class == 0x0108)
++		return (raid & 4) && (!(raid & 8) ||
++				      (*vendor == 0x1022 && *device == 0xb000));
++	return 0;
++}
++
++/*
++ * Will RAIDCoreDxe see disk @subdev?  A disk the firmware does not see is
++ * missing from the volume there and in Windows, and RAIDCoreDxe writes
++ * that into the configuration.  Not behind a controller (a loop device: an
++ * image) - fine.  --force: taken anyway (another machine, the disks on
++ * another controller to get at the data).
++ */
++static int amd_controller_ok(struct supertype *st, const char *subdev,
++			     int verbose)
++{
++	unsigned int vendor = 0, device = 0, raid;
++	char pci[16] = "?";
++	struct stat stb;
++	int present, r;
++
++	if (stat(subdev, &stb) != 0 || !S_ISBLK(stb.st_mode))
++		return 1;		/* validate_geometry says what it is */
++	r = amd_pci_of(major(stb.st_rdev), minor(stb.st_rdev), pci);
++	if (r == 0)
++		return 1;
++	raid = amd_raid_var(&present);
++	if (r > 0 && amd_raid_takes(pci, raid, &vendor, &device))
++		return 1;
++	if (verbose || !st->force) {
++		if (!raid)
++			pr_err("%s: AMD RAID is off in the firmware (EFI variable AMD_RAID %s)\n",
++			       subdev, present ? "0" : "absent");
++		else if (r < 0)
++			pr_err("%s: cannot tell which controller it is on (no path to it in sysfs)\n",
++			       subdev);
++		else
++			pr_err("%s: its controller %s (%04x:%04x) is not one AMD RAID takes (AMD_RAID 0x%x)\n",
++			       subdev, pci, vendor, device, raid);
++		pr_err("the firmware and Windows would not see %s in the volume%s\n",
++		       subdev, st->force ? ": taken anyway (--force)" :
++		       "; --force takes it anyway");
++	}
++	return st->force;
++}
++
+ static int amd_is_nvme(int major, int minor)
+ {
+ 	char real[PATH_MAX];
+@@ -5076,6 +5334,156 @@ static struct amd_vol *amd_vol_by_id(struct amd_super *super, __u64 id)
+ 	return NULL;
+ }
+ 
++/*
++ * The disks on a controller AMD RAID takes that are neither RAIDCore disks
++ * nor in the configuration: each gets a Legacy LD.  None counted for a
++ * container of images (a disk behind no controller).
++ */
++static int amd_unlisted_disks(struct amd_super *super)
++{
++	struct amd_metadata *md = amd_alloc(AMD_SECTOR);
++	int real = 1, present, n = 0;
++	struct amd_disk *d;
++	unsigned int raid;
++	struct dirent *de;
++	char pci[16];
++	DIR *dir;
++
++	for (d = super->disks; d; d = d->next)
++		if (amd_pci_of(d->major, d->minor, pci) != 1)
++			real = 0;
++	raid = amd_raid_var(&present);
++	dir = real && raid && md ? opendir("/sys/block") : NULL;
++	while (dir && (de = readdir(dir)) != NULL) {
++		unsigned int vendor, device;
++		unsigned char sn[20];
++		int maj, min, fd, skip = 0;
++		dev_t devid;
++
++		if (de->d_name[0] == '.')
++			continue;
++		devid = devnm2devid(de->d_name);
++		maj = major(devid);
++		min = minor(devid);
++		if (!devid || amd_pci_of(maj, min, pci) != 1 ||
++		    !amd_raid_takes(pci, raid, &vendor, &device))
++			continue;
++		for (d = super->disks; d; d = d->next)
++			skip |= d->major == maj && d->minor == min;
++		fd = skip ? -1 : amd_dev_open(maj, min, O_RDONLY);
++		if (!is_fd_valid(fd))
++			continue;
++		if (amd_read(fd, AMD_METADATA_LBA, md, AMD_SECTOR) == 0 &&
++		    __le64_to_cpu(md->ident) == AMD_RC_IDENT)
++			skip = 1;	/* a RAID disk, of this configuration or not */
++		else if (amd_disk_serial(fd, sn) == 0 &&
++			 amd_pd_index(super, amd_serial_hash(sn)) >= 0)
++			skip = 1;	/* in the configuration: a PD of its own */
++		close(fd);
++		n += !skip;
++	}
++	if (dir)
++		closedir(dir);
++	free(md);
++	return n;
++}
++
++/*
++ * The AMD RAID BIOS menu and rcadm create no array past 12 on a system,
++ * Legacy LDs counted, second LD copies not (RAIDCoreDxe FUN_0000f140; the
++ * menu of an MSI X870E greys out "Create Array" at 12, a Legacy disk
++ * counted).  The cores go past it: the BIOS and the Windows driver
++ * give every non-RAID disk they find a Legacy LD of its own (FUN_0002c130;
++ * rcraid.sys 9.3.3.218 RC_AddLegacyLogicalDevice @140019344, a blank disk
++ * too).  The arrays there are and will be: the LDs of the packet, a Legacy
++ * LD to come for each non-RAID PD without one and - with a container of
++ * real disks - for each other disk on a controller AMD RAID takes that is
++ * neither a RAIDCore disk nor in the configuration (amd_unlisted_disks).
++ * *legacy: how many of them are Legacy.
++ */
++#define AMD_MENU_ARRAYS		12
++static int amd_array_count(struct amd_super *super, int *legacy)
++{
++	struct amd_packet_header *h = super->packet;
++	unsigned int off = __le32_to_cpu(h->ld_offset);
++	int n = 0, copy = 0, unlisted, i;
++	struct amd_ld *ld;
++
++	*legacy = 0;
++	while ((ld = amd_next_ld(super, &off))) {
++		__u32 type = __le32_to_cpu(ld->device_type);
++
++		if (!copy && type != AMD_LDT_RAW) {
++			n++;
++			*legacy += type == AMD_LDT_LEGACY;
++		}
++		copy = !copy && __le32_to_cpu(ld->transform_link) == 1;
++	}
++	for (i = 0; i < super->npd; i++) {
++		__u32 type = __le32_to_cpu(super->pd[i]->device_type);
++
++		if (type != AMD_DEV_RAIDCORE_DISK && type != AMD_DEV_RAIDCORE_CORE &&
++		    !amd_ld_by_id(super, __le64_to_cpu(super->pd[i]->id.id))) {
++			n++;
++			(*legacy)++;
++		}
++	}
++	unlisted = amd_unlisted_disks(super);
++	*legacy += unlisted;
++	return n + unlisted;
++}
++
++/*
++ * mdadm -C of a volume: within the limit of the BIOS menu, or --force.
++ * Not for a RAIDABLE: its --force is the one mdadm.c asks for -n1.
++ */
++static int amd_array_limit(struct supertype *st, int verbose)
++{
++	struct amd_super *super = st->sb;
++	int legacy, n = amd_array_count(super, &legacy);
++	int force = st->force && !super->whole;
++
++	if (n < AMD_MENU_ARRAYS)
++		return 1;
++	if (verbose || !force) {
++		pr_err("AMD RAID allows %d arrays in a system (the BIOS menu and rcadm stop there), and the BIOS and Windows count each Legacy (non-RAID) disk as one: there are %d (%d Legacy)\n",
++		       AMD_MENU_ARRAYS, n, legacy);
++		if (force)
++			cont_err("creating one more anyway (--force): the BIOS menu will create no array then\n");
++		else if (super->whole)
++			cont_err("delete one first: a RAIDABLE volume is not created past the limit\n");
++		else
++			cont_err("delete one first, or give --force to go past the limit (the BIOS menu then creates none)\n");
++	}
++	return force;
++}
++
++/*
++ * The BIOS menu and rcadm create a volume of 8 disks at most, at every
++ * level ("An invalid number of disks were selected for the chosen RAID
++ * level", "VOLUME is limited to 8 drives"; RAIDCoreDxe 1.A93, rcadm
++ * 9.3.3).  Both took volumes of up to 12 disks made otherwise as Normal
++ * (RAID0, RAID10, Volume on two controllers; dumps/2026-11-12-q3j-w3), so
++ * --force goes past the limit.
++ */
++#define AMD_MENU_DISKS		8
++
++static int amd_disk_limit(struct supertype *st, int raiddisks, int verbose)
++{
++	if (raiddisks <= AMD_MENU_DISKS)
++		return 1;
++	if (verbose || !st->force) {
++		pr_err("the AMD BIOS menu and rcadm create volumes of at most %d disks\n",
++		       AMD_MENU_DISKS);
++		if (st->force)
++			cont_err("creating one of %d anyway (--force): the BIOS and the Windows driver take it, but cannot create it again\n",
++				 raiddisks);
++		else
++			cont_err("give --force to go past the limit: the BIOS and the Windows driver take such a volume, but cannot create it again\n");
++	}
++	return st->force;
++}
++
+ /* @subdev can be a disk of the container: a whole disk, not in use */
+ static int amd_validate_disk(struct supertype *st, char *subdev,
+ 			     unsigned long long *freesize, int verbose)
+@@ -5089,6 +5497,8 @@ static int amd_validate_disk(struct supertype *st, char *subdev,
+ 	if (super && super->packet && !super->creating &&
+ 	    !amd_check_add(st, subdev))
+ 		return 0;
++	if (!amd_controller_ok(st, subdev, verbose))
++		return 0;
+ 	fd = open(subdev, O_RDONLY | O_EXCL);
+ 	if (!is_fd_valid(fd)) {
+ 		if (verbose)
+@@ -5200,6 +5610,10 @@ static int validate_geometry_amd(struct supertype *st, int level, int layout,
+ 				pr_err("the container has the maximum number of volumes\n");
+ 			return 0;
+ 		}
++		/* once, with the first disk */
++		if (super->npick == 1 && (!amd_array_limit(st, verbose) ||
++					  !amd_disk_limit(st, raiddisks, verbose)))
++			return 0;
+ 		return 1;
+ 	}
+ 	/* -e amd and disks: the first of them loads the container */
+@@ -5218,6 +5632,9 @@ static int validate_geometry_amd(struct supertype *st, int level, int layout,
+ 	/* no disks given: the container's own (Create asks with size 0 first) */
+ 	if (!super->npick && !amd_new_size(super, whole, size, verbose))
+ 		return 0;
++	if (!super->npick && (!amd_array_limit(st, verbose) ||
++			      !amd_disk_limit(st, raiddisks, verbose)))
++		return 0;
+ 	if (!amd_autolayout(super, raiddisks, size, freesize)) {
+ 		if (verbose && super->npick && super->npick != raiddisks)
+ 			pr_err("give all %d disks of the new volume (%d given)\n",
+@@ -6403,6 +6820,8 @@ static int write_init_super_amd(struct supertype *st)
+ 			pr_err("cannot clear the service area of the new volume\n");
+ 			rv = 1;
+ 		} else {
++			/* a Legacy record the BIOS broke goes out fixed */
++			amd_repair_legacy(super, 1);
+ 			if (amd_write_config(super) != 0) {
+ 				pr_err("cannot write the AMD RAID configuration\n");
+ 				rv = 1;
+@@ -6533,6 +6952,195 @@ static void amd_kmsg(const char *fmt, ...)
+ 	close(fd);
+ }
+ 
++/*
++ * Does the disk read zeroes where it was trimmed?  SATA: ATA IDENTIFY
++ * word 169 bit 0 (TRIM), word 69 bits 14 and 5 (deterministic, zeroes);
++ * NVMe: DLFEAT 001b of its namespace.  Anything else, or no answer: no.
++ */
++static int amd_trim_zeroes(int fd)
++{
++	__u16 id[256];
++	unsigned char ns[4096];
++	int nsid;
++
++	nsid = ioctl(fd, NVME_IOCTL_ID);
++	if (nsid > 0) {
++		if (nvme_identify_ioctl(fd, nsid, NVME_IDENTIFY_NAMESPACE_DATA,
++					ns, sizeof(ns), 0) !=
++		    MDADM_STATUS_SUCCESS)
++			return 0;
++		return (ns[33] & 7) == 1;
++	}
++	if (amd_ata_identify(fd, id) != 0)
++		return 0;
++	return (__le16_to_cpu(id[169]) & 1) &&
++	       (__le16_to_cpu(id[69]) & 0x4020) == 0x4020;
++}
++
++/*
++ * Does the disk of @dev read zeroes where it was trimmed?  Opened anew:
++ * managemon asks it without the lock, while the monitor may close the
++ * container's descriptors.  Gone meanwhile: not a member to ask.
++ */
++static int amd_dev_trim_zeroes(const struct mdinfo *dev)
++{
++	int fd = amd_dev_open(dev->disk.major, dev->disk.minor, O_RDONLY);
++	int rv;
++
++	if (!is_fd_valid(fd))
++		return 1;
++	rv = amd_trim_zeroes(fd);
++	close(fd);
++	return rv;
++}
++
++/*
++ * Why the AMD driver would not TRIM redundant volume @a with the members
++ * md runs and @spare it is to take (or NULL) - or NULL: it would.  The
++ * disks are asked anew (amd_dev_trim_zeroes), a failed member is not.
++ */
++static const char *amd_trim_veto(struct active_array *a,
++				 const struct mdinfo *spare)
++{
++	struct mdinfo *dev;
++
++	if (a->info.array.level == 5)
++		return "a parity volume";
++	if (spare && !amd_dev_trim_zeroes(spare))
++		return "the new member does not read zeroes after TRIM";
++	for (dev = a->info.devs; dev; dev = dev->next)
++		if (is_fd_valid(dev->state_fd) &&
++		    !(dev->curr_state & DS_FAULTY) && !amd_dev_trim_zeroes(dev))
++			return "a member does not read zeroes after TRIM";
++	return NULL;
++}
++
++/* queue/@attr of volume @a: a limit in bytes, 0 if it cannot be read */
++static unsigned long long amd_queue_limit(struct active_array *a,
++					  const char *attr)
++{
++	char path[PATH_MAX], buf[32];
++
++	snprintf(path, sizeof(path), "/sys/block/%s/queue/%s",
++		 a->info.sys_name, attr);
++	if (load_sys(path, buf, sizeof(buf)) != 0)
++		return 0;
++	return strtoull(buf, NULL, 10);
++}
++
++static int amd_set_trim(struct active_array *a, unsigned long long bytes)
++{
++	char path[PATH_MAX], buf[32];
++	int fd, rv;
++
++	snprintf(path, sizeof(path), "/sys/block/%s/queue/discard_max_bytes",
++		 a->info.sys_name);
++	fd = open(path, O_WRONLY);
++	if (fd < 0)
++		return -1;
++	snprintf(buf, sizeof(buf), "%llu", bytes);
++	rv = write_attr(buf, fd) == MDADM_STATUS_SUCCESS ? 0 : -1;
++	close(fd);
++	return rv;
++}
++
++/*
++ * The discard_granularity of @a's volume as mdmon capped TRIM, 0 if it did
++ * not (amd_limit_trim): set it to @gran, the old one back.
++ */
++static unsigned int amd_swap_trim_gran(struct active_array *a,
++				       unsigned int gran)
++{
++	struct amd_super *super = a->container->sb;
++	unsigned int old = 0;
++	struct amd_vol *v;
++
++	amd_lock(super);
++	v = amd_active_vol(a);
++	if (v) {
++		old = v->mon.trim_gran;
++		v->mon.trim_gran = gran;
++	}
++	amd_unlock(super);
++	return old;
++}
++
++/*
++ * TRIM the way the AMD driver allows it (rcblob RC_IsTrimAllowed,
++ * RC_CheckLogicalDeviceTrimable): never on RAID5/6 - stale parity over a
++ * trimmed block would rebuild garbage into live data - and on mirrors
++ * only if every member reads zeroes after it, or the mirrors differ where
++ * they were trimmed and the AMD driver's check finds that.  md would pass
++ * it down: cap the volume's discard_max_bytes at 0 instead, and lift the
++ * cap once the members allow TRIM again - the AMD driver asks for every
++ * request.
++ *
++ * Decided at open_new with the members md runs, and again whenever
++ * managemon looks for a spare (amd_mm_activate_spare): with each disk it
++ * takes to rebuild or grow onto, before md adds it - a RAIDABLE grown
++ * into a mirror keeps TRIM only if its own disk reads zeroes too - and
++ * after a failure, the failed member no longer asked.  A degraded mirror
++ * keeps TRIM if the members it has read zeroes: a disk rebuilt from them
++ * gets zeroes there too, and one going on from a checkpoint starts over if
++ * md trimmed meanwhile (amd_md_writes).  The AMD driver trims no degraded
++ * mirror - it counts the disks it has (RC_DeterministicTrimZeroCount) -
++ * but a cap may stay for good: with discard_max_bytes 0 the kernel makes
++ * discard_granularity 0 too and then takes no other value (6.17 on,
++ * 6.12.42 on: blk_validate_limits, queue_max_discard_sectors_store) until
++ * md starts the volume anew.  The cap is lifted to what the kernel takes
++ * back: a multiple of the granularity as it was (read before the cap: it
++ * says 0 while TRIM is off), at most UINT_MAX (queue_var_store) - not
++ * discard_max_hw_bytes itself, 0xfffffe00 with a granularity of 4 KiB.
++ * Only a cap of this mdmon's, not one set by hand.
++ *
++ * The disks are asked with ATA IDENTIFY or NVMe Identify, seconds each
++ * when a disk is slow to answer, and writing the limit freezes the
++ * volume's queue, which waits for its writes - they may wait for the
++ * monitor (blk-sysfs queue_attr_store): managemon, with the lock released.
++ */
++static void amd_limit_trim(struct active_array *a, const struct mdinfo *spare)
++{
++	int level = a->info.array.level;
++	unsigned long long hw, gran;
++	const char *why;
++
++	if ((level != 1 && level != 10 && level != 5) ||
++	    a->info.array.raid_disks < 2)
++		return;		/* one copy: a RAIDABLE */
++	hw = amd_queue_limit(a, "discard_max_hw_bytes");
++	if (!hw)
++		return;		/* no TRIM down there anyway */
++	if (amd_queue_limit(a, "discard_max_bytes")) {
++		why = amd_trim_veto(a, spare);
++		if (!why)
++			return;
++		gran = amd_queue_limit(a, "discard_granularity");
++		if (amd_set_trim(a, 0) != 0) {
++			amd_kmsg("cannot turn TRIM off on %s (%s)",
++				 a->info.sys_name, why);
++			return;
++		}
++		amd_swap_trim_gran(a, gran);
++		amd_kmsg("TRIM off on %s as the AMD driver does: %s",
++			 a->info.sys_name, why);
++		return;
++	}
++	gran = amd_swap_trim_gran(a, 0);
++	if (!gran)
++		return;		/* not capped by us */
++	if (amd_trim_veto(a, spare)) {
++		amd_swap_trim_gran(a, gran);
++		return;
++	}
++	hw = min(hw, (unsigned long long)UINT_MAX);
++	if (amd_set_trim(a, hw - hw % gran) == 0)
++		amd_kmsg("TRIM on again on %s: every member reads zeroes after it",
++			 a->info.sys_name);
++	else
++		amd_kmsg("TRIM stays off on %s until it is started again: the kernel does not take it back",
++			 a->info.sys_name);
++}
++
+ /*
+  * Sectors written or trimmed on the array, from its block device's stat
+  * (fields 7 and 14, the discards since 4.18), or 0: what changes on the
+@@ -6602,6 +7210,7 @@ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
+ 	 */
+ 	v->mon.target_away = amd_target_away(a, v);
+ 	v->mon.members_checked = 0;
++	v->mon.trim_gran = 0;	/* md starts it with the kernel's limits */
+ 	v->mon.md_writes = amd_md_writes(a);
+ 	a->info.container_member = inst;
+ 
+@@ -7151,7 +7760,9 @@ static int kill_subarray_amd(struct supertype *st, char *subarray_id)
+ 		return rv != 0;
+ 	}
+ 	/* no mdmon: this process writes it */
++	super->legacy_checked = 1;
+ 	amd_remove_volume(super, vol);
++	amd_repair_legacy(super, 1);	/* as -C does: see amd_repair_legacy */
+ 	return amd_write_changed(super);
+ }
+ 
+@@ -7335,8 +7946,10 @@ static int update_subarray_amd(struct supertype *st, char *subarray,
+ 		return rv != 0 ? 2 : 0;
+ 	}
+ 	/* no mdmon: this process writes it */
++	super->legacy_checked = 1;
+ 	if (amd_apply_subarray(super, &u))
+ 		return 2;
++	amd_repair_legacy(super, 1);	/* as -C does: see amd_repair_legacy */
+ 	return amd_write_changed(super);
+ }
+ 
+@@ -7637,6 +8250,54 @@ static void amd_catch_up(struct amd_super *super)
+ 	}
+ }
+ 
++/*
++ * mdmon: a disk of the container whose LBA 0 holds AMD's own partition
++ * (one, type 0x82 from 0x3F) but not the checksum its label has - boot
++ * code or a disk signature written over it - gets that sector's checksum
++ * in its label, as the AMD driver writes the label at Initialize
++ * (rcraid.sys 9.3.3.218 RC_WriteRAIDCoreBootRecord @140024270).  LBA 0
++ * stays as it is; without it the BIOS and the Windows driver would take
++ * the disk for a non-RAID one (RC_ReadMBR).  Nothing else is repaired:
++ * any other content of LBA 0 may belong to someone else (amd_mbr_advice).
++ * Each disk is tried once.
++ */
++static void amd_repair_mbr(struct amd_super *super)
++{
++	struct amd_metadata label;
++	struct amd_disk *d;
++	__u8 *buf = super->iobuf;
++
++	for (d = super->disks; d && buf; d = d->next) {
++		__u64 sum;
++
++		if (d->mbr != AMD_MBR_SUM || d->fd < 0 || d->removed ||
++		    d->write_failed || d->spare_failed)
++			continue;
++		d->mbr = AMD_MBR_OK;
++		if (amd_read(d->fd, AMD_METADATA_LBA, buf, AMD_SECTOR) != 0)
++			continue;
++		memcpy(&label, buf, sizeof(label));
++		if (!amd_label_valid(&label) ||
++		    __le64_to_cpu(label.device_id) != d->device_id ||
++		    amd_read(d->fd, 0, buf, AMD_SECTOR) != 0 ||
++		    amd_mbr_state(buf, &label) != AMD_MBR_SUM)
++			continue;
++		sum = amd_checksum(buf, AMD_SECTOR);
++		label.mbr_checksum = __cpu_to_le64(sum);
++		label.checksum = __cpu_to_le64(amd_sector_sum(&label));
++		memcpy(buf, &label, sizeof(label));
++		if (pwrite(d->fd, buf, AMD_SECTOR,
++			   (off_t)AMD_METADATA_LBA * AMD_SECTOR) != AMD_SECTOR ||
++		    fsync(d->fd) != 0) {
++			amd_kmsg("disk %016llx: cannot write its label",
++				 (unsigned long long)d->device_id);
++			continue;
++		}
++		amd_kmsg("disk %016llx: LBA 0 changed under AMD's partition, the label has its checksum now",
++			 (unsigned long long)d->device_id);
++	}
++}
++
+ /*
+  * A recorded rebuild of a volume this mdmon found running (amd_open_new)
+  * that md has finished already - as the other mdmon left, or with none
+@@ -7821,6 +8482,20 @@ static void amd_sync_metadata(struct supertype *st)
+ 		return;
+ 	amd_sync_progress(st);
+ 	amd_sync_transforms(super);
++	amd_repair_mbr(super);
++	/* once, with the configuration going to every RAID disk */
++	if (!super->legacy_checked && amd_all_disks_here(super)) {
++		super->legacy_checked = 1;
++		if (amd_repair_legacy(super, 1))
++			super->config_dirty = 1;
++		/*
++		 * The AMD driver writes the configuration as it starts
++		 * (rcraid.sys 9.3.3.218 RC_ConfigInit @140039e2c): one of
++		 * another controller is its own from then on (amd_take_over).
++		 */
++		if (super->foreign)
++			super->config_dirty = 1;
++	}
+ 	amd_flush_config(st);
+ 	amd_sync_ended_logs(super);
+ 	amd_sync_rebuilds(super);
+@@ -8707,6 +9382,7 @@ static int amd_drop_roles_here(struct supertype *st)
+ 	if (is_fd_valid(fd) && tst->ss->load_container(tst, fd, NULL) == 0) {
+ 		for (mu = st->updates; mu; mu = mu->next)
+ 			amd_apply_role(tst->sb, (const void *)mu->buf);
++		amd_repair_legacy(tst->sb, 1);	/* as -C does */
+ 		rv = amd_write_changed(tst->sb) ? -1 : 0;
+ 		tst->ss->free_super(tst);
+ 	}
+@@ -9152,6 +9828,8 @@ static int amd_mm_open_new(struct supertype *c, struct active_array *a,
+ 	if (found)
+ 		len = amd_ld_size(super->vol[inst].ld) + sizeof(struct amd_element);
+ 	amd_unlock(super);
++	if (rv == 0)
++		amd_limit_trim(a, NULL);
+ 	/* managemon queues the update (manage_new), as imsm_open_new's */
+ 	if (!found || !c->update_tail) {
+ 		free(u);
+@@ -9183,11 +9861,14 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
+ 	amd_lock(super);
+ 	found = amd_activate_spare(a, di, u);
+ 	amd_unlock(super);
+-	if (!found)
++	if (!found) {
++		amd_limit_trim(a, NULL);
+ 		goto none;
++	}
+ 	fd = amd_dev_open(di->disk.major, di->disk.minor, O_RDONLY);
+ 	u->features = amd_pd_features(fd, di->disk.major, di->disk.minor);
+ 	close_fd(&fd);
++	amd_limit_trim(a, di);
+ 	/* the LD the rebuild goes into: at most @v's own and an element */
+ 	amd_lock(super);
+ 	v = amd_active_vol(a);
+-- 
+2.47.3
+

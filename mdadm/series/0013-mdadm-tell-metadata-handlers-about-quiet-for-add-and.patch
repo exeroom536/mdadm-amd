@@ -1,0 +1,52 @@
+From 0386471a0cb8f9d15e1b15a50801b89b499b8cad Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:13 +0500
+Subject: [PATCH 13/32] mdadm: tell metadata handlers about --quiet for --add
+ and --remove
+
+A metadata handler may print notices of its own when a disk is added or
+removed: AMD RAIDXpert2 (later in this series) says which role a disk
+takes in the container (add_to_super()) and which spare roles it loses
+(subarray_spare()).  The verbose level is not passed to these methods, so
+the handler cannot keep quiet with --quiet.
+
+Add supertype.verbose next to supertype.force, set by Manage_subdevs()
+once it has the supertype, and let a handler print its notices unless it
+is < 0.  It is 0 where it is not set - the normal level - so nothing
+else changes.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Manage.c | 1 +
+ mdadm.h  | 3 +++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/Manage.c b/Manage.c
+index f5df90b1..5e208cf7 100644
+--- a/Manage.c
++++ b/Manage.c
+@@ -1459,6 +1459,7 @@ int Manage_subdevs(char *devname, int fd,
+ 			array.major_version, array.minor_version);
+ 		goto abort;
+ 	}
++	tst->verbose = verbose;
+ 
+ 	for (dv = devlist; dv; dv = dv->next) {
+ 		dev_t rdev = 0; /* device to add/remove etc */
+diff --git a/mdadm.h b/mdadm.h
+index ae162729..4b2a46d2 100644
+--- a/mdadm.h
++++ b/mdadm.h
+@@ -1306,6 +1306,9 @@ struct supertype {
+ 			 * handler may take a disk it would refuse, e.g. one
+ 			 * its platform's firmware does not see.
+ 			 */
++	int verbose;	/* of --add and --remove: a metadata handler
++			 * prints its notices unless it is < 0 (--quiet).
++			 */
+ 	struct metadata_update *updates;
+ 	struct metadata_update **update_tail;
+ 
+-- 
+2.47.3
+

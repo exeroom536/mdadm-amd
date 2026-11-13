@@ -1,0 +1,83 @@
+From 4c4fa4d97a0b1a2585b121bea75102362627ffd5 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:19 +0500
+Subject: [PATCH 14/32] Create: do not warn about a partition table the
+ metadata keeps
+
+AMD RAIDXpert2 writes a partition of its own (type 0x82, over the whole
+disk) into the MBR of every disk it initializes; the AMD BIOS and driver
+take a disk without it for a non-RAID one.  Creating a member array from
+such disks made Create() warn that the metadata would over-write the last
+partition - it is the metadata's own.
+
+Skip the partition checks for a device that carries external metadata
+of the kind being created.  A device with a partition table of its own
+still gets the warnings.
+
+Such a device is reported as part of a raid array all the same
+(check_raid()), so --create still asks before it goes on: IMSM and DDF
+devices that carry metadata of the kind being created lose only the
+partition warning.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Create.c | 30 +++++++++++++++++++++++++-----
+ 1 file changed, 25 insertions(+), 5 deletions(-)
+
+diff --git a/Create.c b/Create.c
+index b20d1fe1..19e51774 100644
+--- a/Create.c
++++ b/Create.c
+@@ -49,6 +49,23 @@ static int round_size_and_verify(unsigned long long *size, int chunk)
+ 	return 0;
+ }
+ 
++/*
++ * Is a partition table on the device part of external metadata of the kind
++ * being created (AMD RAID writes a partition of its own over the disk)?
++ */
++static bool own_partition_table(struct supertype *st, int fd)
++{
++	struct supertype *found;
++	bool own;
++
++	if (!st->ss->external)
++		return false;
++	found = guess_super(fd);
++	own = found && found->ss == st->ss;
++	free(found);
++	return own;
++}
++
+ /**
+  * default_layout() - Get default layout for level.
+  * @st: metadata requested, could be NULL.
+@@ -887,17 +904,20 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
+ 			warn |= check_ext2(fd, dname);
+ 			warn |= check_reiser(fd, dname);
+ 			warn |= check_raid(fd, dname);
+-			if (strcmp(st->ss->name, "1.x") == 0 &&
+-			    st->minor_version >= 1)
++			if (own_partition_table(st, fd)) {
++				/* the metadata's own partition */
++			} else if (strcmp(st->ss->name, "1.x") == 0 &&
++			    st->minor_version >= 1) {
+ 				/* metadata at front */
+ 				warn |= check_partitions(fd, dname, 0, 0);
+-			else if (s->level == 1 || is_container(s->level) ||
+-				 (s->level == 0 && s->raiddisks == 1))
++			} else if (s->level == 1 || is_container(s->level) ||
++				 (s->level == 0 && s->raiddisks == 1)) {
+ 				/* partitions could be meaningful */
+ 				warn |= check_partitions(fd, dname, freesize*2, s->size*2);
+-			else
++			} else {
+ 				/* partitions cannot be meaningful */
+ 				warn |= check_partitions(fd, dname, 0, 0);
++			}
+ 			if (strcmp(st->ss->name, "1.x") == 0 &&
+ 			    st->minor_version >= 1 &&
+ 			    did_default &&
+-- 
+2.47.3
+

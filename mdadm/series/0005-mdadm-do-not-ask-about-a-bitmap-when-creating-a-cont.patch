@@ -1,0 +1,46 @@
+From e0646bd2a69f595e7aac145a1f6bb26788950086 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:55:56 +0500
+Subject: [PATCH 05/32] mdadm: do not ask about a bitmap when creating a
+ container
+
+mdadm --create of a container of external metadata gives no level, so
+s.level is UnSet (0xfffe), and the check for the question about a
+write-intent bitmap, s.level >= 1, lets it through.  Answering yes
+then fails the create: "bitmaps not meaningful with level container".
+
+Ask only when a level is given.  Without one, the array is a container,
+which has no bitmap, or Create() refuses it for the missing level.
+
+IMSM container of two loop devices, "y" on stdin: before, the create
+fails as above; with the change it is created and nothing is asked.  A
+RAID1 still gets the question.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+
+Fixes: e97c4e18c847 ("mdadm: ask user if bitmap is not set")
+---
+ mdadm.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/mdadm.c b/mdadm.c
+index 64fbc101..3332bbad 100644
+--- a/mdadm.c
++++ b/mdadm.c
+@@ -1582,8 +1582,12 @@ int main(int argc, char *argv[])
+ 			break;
+ 		}
+ 
++		/*
++		 * No level: a container of external metadata, which has no
++		 * bitmap (or an error further on), so no question about one.
++		 */
+ 		if (s.btype == BitmapUnknown) {
+-			if (c.runstop != 1 && s.level >= 1 &&
++			if (c.runstop != 1 && s.level >= 1 && s.level != UnSet &&
+ 			    ask("To optimize recovery speed, it is recommended to enable write-intent bitmap, do you want to enable it now?"))
+ 				s.btype = BitmapInternal;
+ 			else
+-- 
+2.47.3
+

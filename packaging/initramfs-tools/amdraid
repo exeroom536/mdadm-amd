@@ -1,0 +1,9 @@
+#!/bin/sh
+# initramfs-tools hook: AMD RAIDXpert2 (RAIDCore) volumes.  Puts the udev rule
+# into the initramfs, so that udev assembles a volume as soon as its disks
+# show up.  Without it only the local-block mdadm script finds them, and
+# Ubuntu runs that script after waiting 30 s for the root device.
+# Install into /etc/initramfs-tools/hooks/amdraid.
+[ "$1" = prereqs ] && exit 0
+mkdir -p "$DESTDIR/usr/lib/udev/rules.d"
+cp /usr/lib/udev/rules.d/64-amd-raid-assembly.rules "$DESTDIR/usr/lib/udev/rules.d/"

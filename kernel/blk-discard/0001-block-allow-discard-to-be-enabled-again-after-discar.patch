@@ -1,0 +1,137 @@
+From 7d61fd2b47590f09368a81ee4d607362581871be Mon Sep 17 00:00:00 2001
+From: OWNER NAME <owner@example.org>
+Date: Tue, 10 Nov 2026 12:00:00 +0500
+Subject: [PATCH] block: allow discard to be enabled again after
+ discard_max_bytes was set to 0
+
+Writing 0 to queue/discard_max_bytes cannot be undone any more.  Since
+commit fad6551fcf53 ("block: ensure discard_granularity is zero when
+discard is not supported") blk_validate_limits() clears
+discard_granularity whenever the resulting max_discard_sectors is 0,
+including when only max_user_discard_sectors is 0.  But
+queue_max_discard_sectors_store() checks the new value against the
+current granularity:
+
+	if (max_discard_bytes & (disk->queue->limits.discard_granularity - 1))
+		return -EINVAL;
+
+With a granularity of 0 the mask is all ones, so every non-zero value is
+rejected and discard stays disabled until the device goes away (for md,
+until the array is stopped and started again).  The granularity reported
+by the driver is lost as well: even if a value were accepted,
+blk_validate_limits() would only bring the granularity back as
+physical_block_size.
+
+  # cd /sys/block/loop1/queue      # loop on a file on btrfs
+  # cat discard_granularity discard_max_bytes
+  4096
+  4294966784
+  # echo 1048576 > discard_max_bytes; cat discard_granularity
+  4096
+  # echo 0 > discard_max_bytes; cat discard_granularity
+  0
+  # echo 1048576 > discard_max_bytes
+  -bash: echo: write error: Invalid argument
+  # echo 4294963200 > discard_max_bytes
+  -bash: echo: write error: Invalid argument
+
+The same happens with nvme, scsi and md devices.  This hurts e.g. a
+volume manager that disables discard on an md array while a member does
+not return zeroes after discard, and wants to enable it again once that
+member has been replaced.
+
+Only clear discard_granularity when the device does not support discard
+(max_hw_discard_sectors is 0), and keep it when discard is just disabled
+through sysfs, so that the alignment check works and discard comes back
+with the granularity it had.  Userspace keeps seeing a granularity of 0
+while discard is disabled, as Documentation/ABI/stable/sysfs-block
+requires: the discard_granularity attribute now reports 0 itself when
+max_discard_sectors is 0.  That also covers blk_queue_disable_discard(),
+which clears max_discard_sectors without going through
+blk_validate_limits().
+
+blk_stack_limits() treats a bottom device as discard capable if its
+discard_granularity is non-zero.  Since that commit a bottom device
+whose discard was disabled through sysfs is not stacked as discard
+capable; keep that by also checking max_user_discard_sectors there.
+Limits that were not validated, such as the dm target limits, keep
+max_user_discard_sectors at UINT_MAX from blk_set_stacking_limits(), so
+nothing changes for them.
+
+Found while working on mdadm; the analysis, this patch and the tests
+were made by Claude Opus 5.5, an AI model by Anthropic.
+
+Fixes: fad6551fcf53 ("block: ensure discard_granularity is zero when discard is not supported")
+Cc: stable@vger.kernel.org
+---
+ block/blk-settings.c | 15 ++++++++++-----
+ block/blk-sysfs.c    | 10 +++++++++-
+ 2 files changed, 19 insertions(+), 6 deletions(-)
+
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index 1f5ee24..e17c791 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -441,10 +441,12 @@ int blk_validate_limits(struct queue_limits *lim)
+ 		min(lim->max_hw_discard_sectors, lim->max_user_discard_sectors);
+ 
+ 	/*
+-	 * When discard is not supported, discard_granularity should be reported
+-	 * as 0 to userspace.
++	 * A discard_granularity of 0 means that the device does not support
++	 * discard.  If discard is only disabled through discard_max_bytes, keep
++	 * the granularity so that discard can be enabled again with it;
++	 * queue_discard_granularity_show() reports 0 in that case.
+ 	 */
+-	if (lim->max_discard_sectors)
++	if (lim->max_hw_discard_sectors)
+ 		lim->discard_granularity =
+ 			max(lim->discard_granularity, lim->physical_block_size);
+ 	else
+@@ -913,8 +915,11 @@ int blk_stack_limits(struct queue_limits *t, struct queue_limits *b,
+ 	t->max_hw_sectors = blk_round_down_sectors(t->max_hw_sectors, t->logical_block_size);
+ 	t->max_dev_sectors = blk_round_down_sectors(t->max_dev_sectors, t->logical_block_size);
+ 
+-	/* Discard alignment and granularity */
+-	if (b->discard_granularity) {
++	/*
++	 * Discard alignment and granularity.  A bottom device whose discard was
++	 * disabled through discard_max_bytes does not provide discard.
++	 */
++	if (b->discard_granularity && b->max_user_discard_sectors) {
+ 		alignment = queue_limit_discard_alignment(b, start);
+ 
+ 		t->max_discard_sectors = min_not_zero(t->max_discard_sectors,
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index 5209726..9ec9b14 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -227,7 +227,6 @@ QUEUE_SYSFS_LIMIT_SHOW(physical_block_size)
+ QUEUE_SYSFS_LIMIT_SHOW(chunk_sectors)
+ QUEUE_SYSFS_LIMIT_SHOW(io_min)
+ QUEUE_SYSFS_LIMIT_SHOW(io_opt)
+-QUEUE_SYSFS_LIMIT_SHOW(discard_granularity)
+ QUEUE_SYSFS_LIMIT_SHOW(zone_write_granularity)
+ QUEUE_SYSFS_LIMIT_SHOW(virt_boundary_mask)
+ QUEUE_SYSFS_LIMIT_SHOW(dma_alignment)
+@@ -273,6 +272,15 @@ QUEUE_SYSFS_SHOW_CONST(discard_zeroes_data, 0)
+ QUEUE_SYSFS_SHOW_CONST(write_same_max, 0)
+ QUEUE_SYSFS_SHOW_CONST(poll_delay, -1)
+ 
++static ssize_t queue_discard_granularity_show(struct gendisk *disk, char *page)
++{
++	struct queue_limits *lim = &disk->queue->limits;
++
++	/* As documented in sysfs-block, report 0 while discard is disabled. */
++	return queue_var_show(lim->max_discard_sectors ?
++			      lim->discard_granularity : 0, page);
++}
++
+ static int queue_max_discard_sectors_store(struct gendisk *disk,
+ 		const char *page, size_t count, struct queue_limits *lim)
+ {
+
+base-commit: 7475ea8b58616b33c04afb976cf0fbaad9dd63fb
+-- 
+2.47.3
+

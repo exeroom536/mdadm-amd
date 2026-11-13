@@ -1,0 +1,102 @@
+From 939d1eac3803a58ebd15364a1cce4245310a6ba2 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:21 +0500
+Subject: [PATCH 15/32] Manage: let metadata give a member array spares of its
+ own
+
+Spares of an external container are the container's, for any of its
+member arrays.  Some metadata also has spares of one member array only:
+AMD RAIDXpert2 dedicated hot spares (up to four per volume, taken before
+the global ones).  For those, --add-spare and --remove on a member array
+were refused ("perform this operation on the parent container").
+
+Add an optional superswitch method, subarray_spare(), and call it for
+--add-spare and --remove of a device on a member array.  It is also
+called after --remove took a device out of a container, whether named
+by its device file or by its kernel name, so that a spare that is still
+there loses its role (a device that has gone keeps it).  Formats
+without it behave as before.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Manage.c | 25 +++++++++++++++++++++++--
+ mdadm.h  | 16 ++++++++++++++++
+ 2 files changed, 39 insertions(+), 2 deletions(-)
+
+diff --git a/Manage.c b/Manage.c
+index 5e208cf7..c073742d 100644
+--- a/Manage.c
++++ b/Manage.c
+@@ -1618,6 +1618,15 @@ int Manage_subdevs(char *devname, int fd,
+ 		case 'F': /* --re-add faulty  */
+ 		case 'c': /* --cluster-confirm */
+ 			/* add the device */
++			if (subarray && dv->disposition == 'S' &&
++			    tst->ss->subarray_spare) {
++				/* a spare of this member array only */
++				if (tst->ss->subarray_spare(tst, subarray,
++							    dv->devname, 1))
++					goto abort;
++				count++;
++				break;
++			}
+ 			if (subarray) {
+ 				pr_err("Cannot add disks to a \'member\' array, perform this operation on the parent container\n");
+ 				goto abort;
+@@ -1670,12 +1679,24 @@ int Manage_subdevs(char *devname, int fd,
+ 
+ 		case 'r':
+ 			/* hot remove */
+-			if (subarray) {
++			if (subarray && tst->ss->subarray_spare && sysfd < 0) {
++				/* a spare of this member array only */
++				if (tst->ss->subarray_spare(tst, subarray,
++							    dv->devname, 0))
++					rv = -1;
++				else
++					rv = 1;
++			} else if (subarray) {
+ 				pr_err("Cannot remove disks from a \'member\' array, perform this operation on the parent container\n");
+ 				rv = -1;
+-			} else
++			} else {
+ 				rv = Manage_remove(tst, fd, dv, sysfd, rdev, force, verbose,
+ 						   devname);
++				/* advisory: the device is out already */
++				if (rv > 0 && tst->ss->subarray_spare)
++					tst->ss->subarray_spare(tst, NULL,
++								dv->devname, 0);
++			}
+ 			close_fd(&sysfd);
+ 
+ 			if (rv < 0)
+diff --git a/mdadm.h b/mdadm.h
+index 4b2a46d2..b3c68104 100644
+--- a/mdadm.h
++++ b/mdadm.h
+@@ -1168,6 +1168,22 @@ extern struct superswitch {
+ 	 */
+ 	int (*update_subarray)(struct supertype *st, char *subarray,
+ 			       enum update_opt update, struct mddev_ident *ident);
++	/**
++	 * subarray_spare() - Spares of one member array (optional).
++	 * @st: Supertype from super_by_fd(); the container is loaded here.
++	 * @subarray: Subarray name, or NULL for the container itself.
++	 * @devname: The device as named to mdadm: a path, major:minor or,
++	 *	      for --remove, the kernel name of a member ("sdb").
++	 * @add: 1: --add-spare to @subarray, 0: --remove from it.
++	 *
++	 * For metadata whose member arrays have spares of their own (AMD
++	 * dedicated hot spares).  With @subarray NULL it is called after
++	 * --remove took @devname out of the container, to drop its spare
++	 * roles; that call is advisory: the device is out already, whatever
++	 * it returns.  Returns 0 on success.
++	 */
++	int (*subarray_spare)(struct supertype *st, char *subarray,
++			      char *devname, int add);
+ 	/* Check if reshape is supported for this external format.
+ 	 * st is obtained from super_by_fd() where st->subarray[0] is
+ 	 * initialized to indicate if reshape is being performed at the
+-- 
+2.47.3
+

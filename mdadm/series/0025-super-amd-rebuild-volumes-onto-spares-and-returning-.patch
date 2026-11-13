@@ -1,0 +1,2038 @@
+From 79c8ab8fdc13e54ec549a8982f856043f5f52271 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:56 +0500
+Subject: [PATCH 25/32] super-amd: rebuild volumes onto spares and returning
+ members
+
+When a slot of a managed volume is out of service, mdmon gives md a disk
+to recover it onto, as the AMD driver would take one:
+
+- the member's own disk, when it is back (it was missing, or stale): it
+  is rebuilt in place, in its extent, as IMSM takes back a returning
+  member; a disk failed on errors waits for the user, as with the AMD
+  driver, and so does one whose extent another volume holds as well
+  (the AMD menu and driver give the extent of an offline member to a
+  new volume, clearing the old element; a mix of configurations of
+  different generations can still have both);
+- else an AMD global hot spare (SpareInfo 0x100), the first free extent
+  as large as theirs.  The AMD driver holds a global spare to the
+  members' controller only on a platform without arrays across
+  controllers, and no platform we have seen is one: any controller will
+  do.
+
+The rebuild is recorded the way the AMD driver records it: the transform
+log first, then RESTORE_SEGMENTS and the LD it rebuilds into; its
+progress goes to the log, and its end puts the spare in the slot.  A
+rebuild recorded so - by mdmon or by the AMD driver - goes on after a
+reboot from where its log says, exactly where md stopped, when its
+target is there as the volume starts.  A target that comes only after
+the volume has started is copied from the start, as md may have written
+without it (the AMD driver too copies from the start a target md wrote
+without).  A former member whose PD record the AMD driver dropped gets
+one again.  An mdmon that takes a volume over (--takeover, a restart)
+records a rebuild md runs that was not recorded yet, and the end of one
+md finished while no mdmon watched.
+
+Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
+---
+ super-amd.c | 1581 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 1570 insertions(+), 11 deletions(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index 97d5d5c0..9136a29f 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -8,8 +8,9 @@
+  * What is supported: --examine, --detail and assembly of every volume the
+  * AMD RAID BIOS or driver made; Volume (linear) and RAID0 read-write,
+  * RAID1/RAID10/RAID5 managed by mdmon (clean/dirty in the AMD bitmap,
+- * member failures and missing members, initialization - which goes on
+- * after a reboot from where md stopped).
++ * member failures and missing members, initialization, rebuilds onto AMD
++ * global spares and of a returning member into its slot - both go on after
++ * a reboot from where md stopped).
+  *
+  * On-disk layout, little-endian, 512-byte sectors:
+  *   LBA 0x5000         RC_MetaData: per-disk label, "RAIDCore", DeviceId
+@@ -27,6 +28,7 @@
+ #include "mdmon.h"
+ #include "mdstat.h"
+ #include "part.h"
++#include "platform-intel.h"
+ #include "sha1.h"
+ #include "xmalloc.h"
+ 
+@@ -34,7 +36,9 @@
+ #include <ctype.h>
+ #include <limits.h>
+ #include <dirent.h>
++#include <scsi/sg.h>
+ #include <linux/major.h>
++#include <linux/nvme_ioctl.h>
+ 
+ #define AMD_SECTOR		512
+ #define AMD_METADATA_LBA	0x5000
+@@ -111,9 +115,26 @@
+  */
+ #define AMD_ELEMENT_FAILED	0x10
+ #define AMD_ELEMENT_OFFLINE	0x30
++/*
++ * The failure is committed to the configuration (rcblob
++ * RC_UpdateCommitDriveErrors); the ring of an X399 RAID10 has a failed
++ * member of the LD being rebuilt into as 0x8010.
++ */
++#define AMD_ELEMENT_FAIL_COMMITTED	0x8000
+ #define AMD_TRANSFORM_CREATE_REDUNDANCY	0x5355	/* initialization of a new volume */
+ #define AMD_TRANSFORM_RESTORE_SEGMENTS	0x5358	/* rebuild onto a spare */
++#define AMD_TRANSFORM_FAILED	0xa1a4
+ #define AMD_TRANSFORM_COMPLETED	0xa1a6
++#define AMD_PERCENT_DONE	100000	/* TransformPercentDone: all of it */
++
++/*
++ * RC_LogicalDevice.Flags set while RESTORE_SEGMENTS runs (the ring of an
++ * X399 RAID10); the LD a migration starts from has the same SRC flags
++ * (rcraid 9.3.3 midway through RAIDABLE -> RAID1).
++ */
++#define AMD_LDF_RESTORE_SRC	0x20010
++#define AMD_LDF_RESTORE_DST	0x10020000
++#define AMD_LDF_TRANSFORM	0x10020094	/* cleared when it ends */
+ 
+ /* SpareInfo of a PD: a global hot spare */
+ #define AMD_SPARE_GLOBAL	0x100
+@@ -331,6 +352,7 @@ struct amd_disk {
+ 	/* md failed it (a member, or a rebuild onto it): not again until back */
+ 	int spare_failed;
+ 	int write_failed;	/* a configuration write to it failed: stale until back */
++	int rejoin;		/* a former member rebuilt in place: gets configs again */
+ 	int removed;		/* taken out of the container (mdmon): gone, as missing */
+ 	__u64 last_online;	/* LastOnlineSerialNumber of its commit block */
+ 	int foreign;		/* ... not AMD_SERIAL: last online on another controller */
+@@ -355,6 +377,15 @@ struct amd_disk {
+ /* the one partition AMD writes in LBA 0 (RAIDCoreDxe FUN_00016e28) */
+ #define AMD_MBR_TYPE	0x82
+ #define AMD_MBR_START	0x3f	/* its first sector */
++
++/*
++ * Updates about one disk, for mdmon (amd_process_update):
++ *  - REMOVE: it left the container (mdadm --remove, udev -If);
++ *  - ADD: mdadm --add initialized it - a new global spare, or a former
++ *    member given back (@known);
++ *  - ATTACH (struct amd_update_attach): it joined the container.
++ */
++#define AMD_UPDATE_SPARE	1	/* struct amd_update_spare */
+ #define AMD_UPDATE_REMOVE	3
+ #define AMD_UPDATE_ATTACH	5	/* amd_update_attach */
+ 
+@@ -399,6 +430,16 @@ struct amd_vol_mon {
+ 	unsigned long long ckpt_seen;	/* the monitor's checkpoint, last call */
+ 	int members_checked;	/* the members md runs without are recorded (amd_mark_missing) */
+ 	int init_done;		/* md finished the init: record that at sync_metadata */
++	int rebuilding;		/* md recovers onto a spare, element rebuild_el */
++	int rebuild_slot;
++	int rebuild_done;	/* md finished it: record that at sync_metadata */
++	struct amd_element rebuild_el;
++	int rebuild_recorded;	/* RESTORE_SEGMENTS and its log are on disk */
++	unsigned long long rebuild_ckpt; /* member sectors md has recovered */
++	int tlog_dirty;		/* write rebuild_ckpt to the transform log */
++	int tlog_restart;	/* md wrote without the recorded target: log it from 0 */
++	int target_away;	/* ... the target is not in md (amd_target_away) */
++	unsigned long long md_writes;	/* sectors md had written at open_new */
+ 	unsigned long long init_ckpt;	/* volume sectors md has initialized */
+ 	int init_tlog;		/* 1: write init_ckpt to the log, 2: clear it */
+ };
+@@ -424,6 +465,8 @@ struct amd_super {
+ 	struct amd_disk *disks;
+ 	void *packet;		/* live config packet */
+ 	unsigned int packet_len;
++	unsigned int packet_room;	/* bytes allocated for it */
++	void *next_packet;	/* mdmon: AMD_MAX_PACKET bytes it moves into (amd_mm_room) */
+ 	__u64 generation;
+ 	__u64 serial;		/* controller serial number */
+ 	__u64 container_id;	/* lowest DeviceId among RAIDCore disks */
+@@ -440,20 +483,29 @@ struct amd_super {
+ 	/* ... for reads and writes under amd_lock by managemon (and mdadm) */
+ 	void *mmbuf;
+ 	/* mdmon: the LD a rebuild goes into is made here (amd_rebuild_ld) */
++	void *ldbuf;
++	unsigned int ldbuf_room;
+ 	bool busy;		/* mdmon: a thread works on it (amd_lock) */
+ 	int whole;		/* it is a RAIDABLE: one whole disk free of volumes */
+ };
+ 
+ static int amd_open_new(struct supertype *c, struct active_array *a, int inst);
++static void amd_mm_room(struct amd_super *super);
+ static void amd_lock(struct amd_super *super);
+ static void amd_unlock(struct amd_super *super);
++static void amd_ld_clear_transform(struct amd_ld *ld);
+ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
+ 			      __u32 tstate);
+ static void amd_cut_ld(struct amd_super *super, unsigned int at,
+ 		       unsigned int size);
+ static void amd_trim_packet(struct amd_super *super);
++static int amd_extent_given_away(struct amd_super *super,
++				 const struct amd_vol *v, int slot);
+ static void amd_reparse(struct amd_super *super);
+ static void amd_reparse_without(struct amd_super *super, int gone);
++static struct amd_disk *amd_find_spare(struct amd_super *super,
++				       struct amd_vol *v, int slot,
++				       struct amd_element *el, int *recorded);
+ static int amd_pd_index(struct amd_super *super, __u64 id);
+ static int amd_disk_in_volumes(struct amd_super *super, __u64 id);
+ static void amd_kmsg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+@@ -543,6 +595,22 @@ static unsigned long long amd_align_capacity(unsigned long long sectors)
+ 	       AMD_DEFAULT_ALLOC_LBA;
+ }
+ 
++/*
++ * Where extents on the RAIDCore disk of @pd (@sectors big) may reach: its
++ * PD Capacity, but not past the aligned size - an older mdadm recorded the
++ * full size, and the AMD driver goes by the aligned one (it rewrites the
++ * PD so).  @pd may be NULL.
++ */
++static unsigned long long amd_pd_capacity(const struct amd_pd *pd,
++					  unsigned long long sectors)
++{
++	unsigned long long cap = amd_align_capacity(sectors);
++
++	if (pd && pd->capacity && __le64_to_cpu(pd->capacity) < cap)
++		cap = __le64_to_cpu(pd->capacity);
++	return cap;
++}
++
+ /*
+  * PacketSize of LD record @ld by its counts (RAIDCoreDxe FUN_00006a80,
+  * FUN_00025f74): the record, its elements, its parent references and its
+@@ -679,6 +747,22 @@ static struct amd_dev_id *amd_ld_spares(const struct amd_ld *ld)
+ 	return parents + __le32_to_cpu(ld->parent_count);
+ }
+ 
++/* the volume @id is a dedicated spare of, or -1 */
++static int amd_dedicated_owner(const struct amd_super *super, __u64 id)
++{
++	int vol, i;
++
++	for (vol = 0; vol < super->nvol; vol++) {
++		const struct amd_ld *ld = super->vol[vol].ld;
++		const struct amd_dev_id *sp = amd_ld_spares(ld);
++
++		for (i = 0; i < (int)__le32_to_cpu(ld->spare_count); i++)
++			if (__le64_to_cpu(sp[i].id) == id)
++				return vol;
++	}
++	return -1;
++}
++
+ /*
+  * Slot @i of @v is in service in the LD and, while a transform runs, in
+  * its second copy too: the AMD BIOS takes a stale member out of the second
+@@ -694,6 +778,46 @@ static int amd_slot_usable(const struct amd_vol *v, int i)
+ 	return 1;
+ }
+ 
++/*
++ * Element @i of @v was failed on errors (0x10 without the 0x20 of a
++ * member found offline) in the LD or its second copy.
++ */
++static int amd_slot_failed(const struct amd_vol *v, int i)
++{
++	__u32 flags = __le32_to_cpu(v->el[i].flags);
++
++	if (amd_link_same_shape(v))
++		flags |= __le32_to_cpu(amd_link_elements(v)[i].flags);
++	return (flags & AMD_ELEMENT_OFFLINE) == AMD_ELEMENT_FAILED;
++}
++
++/*
++ * The slot the transform recorded for @v copies onto, or -1: of a
++ * RESTORE_SEGMENTS, the one out of service in the LD and in service in the
++ * second copy (the ring of an X399 RAID10).
++ */
++static int amd_rebuild_slot(const struct amd_vol *v)
++{
++	int i;
++
++	if (!amd_link_same_shape(v) ||
++	    __le32_to_cpu(v->ld->transform_type) != AMD_TRANSFORM_RESTORE_SEGMENTS)
++		return -1;
++	for (i = 0; i < v->nel; i++)
++		if (!amd_element_usable(&v->el[i]) &&
++		    amd_element_usable(&amd_link_elements(v)[i]))
++			return i;
++	return -1;
++}
++
++/*
++ * md slot @slot of @v is one AMD has a place for: an element's.
++ */
++static int amd_md_slot(const struct amd_vol *v, int slot)
++{
++	return slot < v->nel;
++}
++
+ /*
+  * The md level, layout and members of @v from its device type and its First
+  * x Second elements; @data_disks: how many members' user data make up the
+@@ -888,6 +1012,7 @@ static void amd_classify_state(struct amd_vol *v)
+ 	 * any other the volume is not assembled.
+ 	 */
+ 	transform = ld->transform_type && !v->init_pending &&
++		__le32_to_cpu(ld->transform_type) != AMD_TRANSFORM_RESTORE_SEGMENTS &&
+ 		__le32_to_cpu(ld->transform_state) != AMD_TRANSFORM_COMPLETED &&
+ 		ld->transform_state;
+ 	if (v->single) {
+@@ -1585,6 +1710,7 @@ static void amd_take_packet(struct amd_super *super, void *packet,
+ 	free(super->packet);
+ 	super->packet = packet;
+ 	super->packet_len = len;
++	super->packet_room = len;
+ 	super->generation = generation;
+ 	amd_parse_packet(super);
+ }
+@@ -1728,8 +1854,10 @@ static void amd_free(struct amd_super *super)
+ 		amd_free_disk(d);
+ 	}
+ 	free(super->packet);
++	free(super->next_packet);
+ 	free(super->iobuf);
+ 	free(super->mmbuf);
++	free(super->ldbuf);
+ 	free(super);
+ }
+ 
+@@ -3046,6 +3174,29 @@ static unsigned long long amd_short_of_end(unsigned long long done,
+ 	return end > AMD_MIB ? (end - AMD_MIB) / AMD_MIB * AMD_MIB : 0;
+ }
+ 
++/*
++ * Member sector a recorded rebuild of @v resumes from: what its transform
++ * log says is done, but short of the end - md must still run a recovery
++ * for mdmon to see it finish.
++ */
++static unsigned long long amd_resume_point(struct amd_super *super,
++					   struct amd_vol *v)
++{
++	unsigned long long done = amd_volume_to_member(v,
++		amd_tlog_read(super, v, v->link,
++			      __le32_to_cpu(v->ld->transform_type)));
++
++	/*
++	 * The "100 %" packet - TransformState COMPLETED, 100000 per cent: all
++	 * is copied, the log may be cleared already.  The AMD driver then
++	 * ends the transform without I/O (rcblob RC_RestartTask).
++	 */
++	if (__le32_to_cpu(v->ld->transform_percent) == AMD_PERCENT_DONE &&
++	    __le32_to_cpu(v->ld->transform_state) == AMD_TRANSFORM_COMPLETED)
++		done = v->component_size;
++	return amd_short_of_end(done, v->component_size);
++}
++
+ /*
+  * Volume sector an initialization (CREATE_REDUNDANCY) of @v that was
+  * stopped resumes from: what its transform log says, short of the end so
+@@ -3080,6 +3231,18 @@ static int amd_disk_failed(struct amd_super *super, __u64 id)
+ 	return 0;
+ }
+ 
++/* md recovers onto disk @id for some volume (mdmon) */
++static int amd_rebuild_target(struct amd_super *super, __u64 id)
++{
++	int vol;
++
++	for (vol = 0; vol < super->nvol; vol++)
++		if (super->vol[vol].mon.rebuilding &&
++		    __le64_to_cpu(super->vol[vol].mon.rebuild_el.id.id) == id)
++			return 1;
++	return 0;
++}
++
+ /* a configuration write to @d failed: it gets no further ones (amd_write_config) */
+ static void amd_write_failed(struct amd_disk *d)
+ {
+@@ -3258,6 +3421,7 @@ static int amd_disk_idle(struct amd_super *super, const struct amd_disk *d)
+ 	       d->generation <= super->generation &&
+ 	       d->foreign == super->foreign &&
+ 	       amd_pd_index(super, d->device_id) >= 0 &&
++	       !amd_rebuild_target(super, d->device_id) &&
+ 	       !amd_disk_guarded(super, d, d->device_id);
+ }
+ 
+@@ -3336,12 +3500,19 @@ static int amd_write_config(struct amd_super *super)
+ 		return -1;
+ 	for (d = super->disks; d; d = d->next) {
+ 		/*
+-		 * A member md has failed may be dying: do not write to it.  One
+-		 * taken out of the container is gone, as a missing one.
++		 * A member md has failed while mdmon runs may be dying: do not
++		 * write to it (spare_failed).  One that failed before is an
++		 * idle disk (amd_disk_idle).  A former member being rebuilt in
++		 * its slot, stale or out of service in the LD, gets the
++		 * configuration again.
+ 		 */
++		int back = d->rejoin || amd_rebuild_target(super, d->device_id);
++
++		/* one taken out of the container is gone, as a missing one */
+ 		d->update = !d->removed && !d->write_failed &&
+-			    amd_disk_current(super, d) && !d->spare_failed &&
+-			    !amd_disk_failed(super, d->device_id);
++			    (amd_disk_current(super, d) || back) &&
++			    !d->spare_failed &&
++			    (back || !amd_disk_failed(super, d->device_id));
+ 		if (d->update && d->fd < 0)
+ 			return -1;	/* all of them, or none */
+ 		d->update |= amd_disk_idle(super, d);
+@@ -3373,6 +3544,22 @@ static int amd_write_config(struct amd_super *super)
+ 	return 0;
+ }
+ 
++/*
++ * The disk of the target recorded for @v is here but missed configurations:
++ * md wrote without it (amd_target_behind).  No member to wait for - mdmon
++ * copies it from 0 (amd_target_disk), as does the AMD driver.
++ */
++static int amd_target_stale(struct amd_super *super, const struct amd_vol *v)
++{
++	int slot = amd_rebuild_slot(v);
++	struct amd_disk *d;
++
++	if (slot < 0)
++		return 0;
++	d = amd_find_disk(super, __le64_to_cpu(amd_link_elements(v)[slot].id.id));
++	return d && (d->major || d->minor) && !amd_disk_current(super, d);
++}
++
+ /* the md device of element @el of a volume, in slot @slot, on disk @d */
+ static struct mdinfo *amd_member_info(struct amd_super *super,
+ 				      const struct amd_element *el,
+@@ -3444,12 +3631,13 @@ static void amd_resync_start(struct amd_super *super, struct amd_vol *v,
+ 	this->resync_start = amd_volume_to_sync(v, done);
+ }
+ 
+-/* The members of @v that are here, as this->devs. */
++/* The members of @v that are here, and its rebuild target, as this->devs. */
+ static void amd_volume_devs(struct amd_super *super, struct amd_vol *v,
+ 			    struct mdinfo *this)
+ {
+ 	struct mdinfo **dtail = &this->devs;
+-	int i;
++	char *insync = xcalloc(this->array.raid_disks + 1, 1);
++	int i, run;
+ 
+ 	for (i = 0; i < v->nel; i++) {
+ 		struct amd_element *el = &v->el[i];
+@@ -3462,12 +3650,46 @@ static void amd_volume_devs(struct amd_super *super, struct amd_vol *v,
+ 		d = amd_volume_disk(super, v, el);
+ 		if (!d || (d->major == 0 && d->minor == 0))
+ 			continue;
++		if (i < this->array.raid_disks)
++			insync[i] = 1;
+ 		dev = amd_member_info(super, el, d, i);
+ 		dev->disk.state = (1 << MD_DISK_SYNC) | (1 << MD_DISK_ACTIVE);
+ 		dev->recovery_start = MaxSector;
+ 		*dtail = dev;
+ 		dtail = &dev->next;
+ 	}
++	/*
++	 * -I waits for the disk of a recorded rebuild's target as for any
++	 * member, which then goes on from the log: a target missing at the
++	 * start would miss what is written until it comes - a configuration
++	 * already (the volume running on the first disk, stand 11.11): copied
++	 * from 0 then (amd_activate_spare).  A target that missed
++	 * configurations is copied from 0 anyway: not waited for.
++	 */
++	if (amd_rebuild_slot(v) >= 0 && v->managed &&
++	    !amd_target_stale(super, v))
++		this->array.working_disks++;
++	/*
++	 * A rebuild recorded as RESTORE_SEGMENTS (by mdmon or the AMD
++	 * driver) goes on where its transform log says it got to.
++	 * Its target only once the members in sync can run the volume:
++	 * it counts as present to mdadm, and md would be started on a
++	 * target with nothing to copy from (-I, the target came first).
++	 */
++	i = amd_rebuild_slot(v);
++	run = enough(this->array.level, this->array.raid_disks,
++		     this->array.layout, 1, insync);
++	free(insync);
++	if (i >= 0 && v->managed && run) {
++		struct amd_element *el = &amd_link_elements(v)[i];
++		struct amd_disk *d = amd_member_disk(super,
++					__le64_to_cpu(el->id.id));
++
++		if (!d || (d->major == 0 && d->minor == 0))
++			return;
++		*dtail = amd_member_info(super, el, d, i);
++		(*dtail)->recovery_start = amd_resume_point(super, v);
++	}
+ }
+ 
+ static struct mdinfo *container_content_amd(struct supertype *st,
+@@ -3737,8 +3959,114 @@ static int update_super_amd(struct supertype *st, struct mdinfo *info,
+ 	 */
+ 	return update == UOPT_SPEC_ASSEMBLE ? 0 : -1;
+ }
++
++static int amd_insert_ld(struct amd_super *super, unsigned int at,
++			 const void *rec, unsigned int size);
+ static int amd_in_volume(const struct amd_vol *v, __u64 id);
+ static int amd_vol_has_disk(const struct amd_vol *v, __u64 id);
++static int amd_extent_overlap(struct amd_super *super, __u64 id,
++			      unsigned long long start, unsigned long long len,
++			      unsigned long long *end);
++
++/*
++ * ATA IDENTIFY DEVICE through SG_IO (ATA PASS-THROUGH(16)); 0 on success.
++ * Not drive_encryption.c's ata_pass_through12_ioctl(): it sets CK_COND and
++ * takes the answer only with "ATA pass through information available" in
++ * the sense data, which Linux 6.12 with QEMU AHCI does not give for a good
++ * IDENTIFY - the disk would get a random DeviceID, not the one the BIOS
++ * knows it by (amd_serial_hash).
++ */
++static int amd_ata_identify(int fd, __u16 *id)
++{
++	/* ATA PASS-THROUGH(16): PIO data-in; T_DIR, BYT_BLOK, length in the count */
++	unsigned char cdb[16] = { 0x85, 4 << 1, 0x0e };
++	unsigned char sense[32];
++	struct sg_io_hdr sg;
++
++	cdb[6] = 1;		/* one sector */
++	cdb[14] = 0xec;		/* IDENTIFY DEVICE */
++	memset(&sg, 0, sizeof(sg));
++	sg.interface_id = 'S';
++	sg.cmd_len = sizeof(cdb);
++	sg.cmdp = cdb;
++	sg.dxfer_direction = SG_DXFER_FROM_DEV;
++	sg.dxferp = id;
++	sg.dxfer_len = 512;
++	sg.sbp = sense;
++	sg.mx_sb_len = sizeof(sense);
++	sg.timeout = 5000;
++	if (ioctl(fd, SG_IO, &sg) != 0 || sg.status || sg.host_status ||
++	    (sg.driver_status & ~0x08))		/* DRIVER_SENSE: ATA return */
++		return -1;
++	return 0;
++}
++
++static int amd_is_nvme(int major, int minor)
++{
++	char real[PATH_MAX];
++
++	return devt_to_devpath(makedev(major, minor), 0, real) &&
++	       strstr(real, "/nvme/") != NULL;
++}
++
++/*
++ * PD Features as RAIDCoreDxe sets them for a disk (FUN_0001bbf4 for SATA:
++ * IDENTIFY and the AHCI port; FUN_0000c950 for NVMe: 0x2100): 0x100 SMART
++ * supported (word 82 bit 0), 0x2000 SMART enabled (word 85 bit 0), the
++ * link speed 0x200 / 0x400 / 0x800 (PxSSTS.SPD: 1.5 / 3 / 6 Gb/s).  A
++ * SATA HDD at 6 Gb/s: 0x2900; QEMU AHCI (1.5 Gb/s): 0x2300 - also what a
++ * disk we cannot ask (a loop device) gets.
++ */
++static __u32 amd_pd_features(int fd, int major, int minor)
++{
++	char path[64], real[PATH_MAX], *p;
++	__u32 f = 0, speed = 0x200;
++	__u16 id[256];
++	unsigned int ata;
++
++	if ((fd >= 0 && ioctl(fd, NVME_IOCTL_ID) > 0) || amd_is_nvme(major, minor))
++		return 0x2100;
++	if (fd < 0 || amd_ata_identify(fd, id) != 0)
++		return 0x2300;
++	if (__le16_to_cpu(id[82]) & 1) {
++		f |= 0x100;
++		if (__le16_to_cpu(id[85]) & 1)
++			f |= 0x2000;
++	}
++	p = devt_to_devpath(makedev(major, minor), 0, real) ?
++	    strstr(real, "/ata") : NULL;
++	if (p && sscanf(p, "/ata%u/", &ata) == 1) {
++		char buf[32];
++
++		snprintf(path, sizeof(path), "/sys/class/ata_link/link%u/sata_spd", ata);
++		if (load_sys(path, buf, sizeof(buf)) == 0) {
++			if (strncmp(buf, "6.0", 3) == 0)
++				speed = 0x800;
++			else if (strncmp(buf, "3.0", 3) == 0)
++				speed = 0x400;
++		}
++	}
++	return f | speed;
++}
++
++/*
++ * The PD record of an ONLINE RAIDCore disk, as RAIDCoreDxe writes one: its
++ * Handle, RoutingPath 1, BusType 0x2000, the capacity AMD gives the disk.
++ */
++static void amd_fill_pd(struct amd_pd *pd, __u64 id, int handle,
++			unsigned long long sectors, __u32 features, __u32 spare)
++{
++	pd->type = __cpu_to_le32(AMD_DST_PD);
++	pd->id.id = __cpu_to_le64(id);
++	pd->id.handle = __cpu_to_le16(handle);
++	pd->id.routing = __cpu_to_le16(1);
++	pd->capacity = __cpu_to_le64(amd_align_capacity(sectors));
++	pd->device_type = __cpu_to_le32(AMD_DEV_RAIDCORE_DISK);
++	pd->bus_type = __cpu_to_le32(0x2000);
++	pd->device_state = __cpu_to_le32(AMD_DEV_STATE_ONLINE);
++	pd->spare_info = __cpu_to_le32(spare);
++	pd->features = __cpu_to_le32(features);
++}
+ 
+ static int validate_geometry_amd(struct supertype *st, int level, int layout,
+ 				 int raiddisks, int *chunk,
+@@ -3789,6 +4117,83 @@ static void amd_move_sections(struct amd_packet_header *h, unsigned int at,
+ 		h->sep_offset = __cpu_to_le32(__le32_to_cpu(h->sep_offset) + delta);
+ }
+ 
++/* the packet moves into buffer @p of @room bytes */
++static void amd_packet_move(struct amd_super *super, void *p,
++			    unsigned int room)
++{
++	memcpy(p, super->packet, super->packet_len);
++	free(super->packet);
++	super->packet = p;
++	super->packet_room = room;
++}
++
++/*
++ * Insert @size bytes of @rec (not in the packet) at offset @at, within the
++ * sections; the packet grows to the sections rounded up to sectors and the
++ * sections behind move.  The new header, or NULL with the packet as it
++ * was.  The caller sets the size of the section it grew, and reparses.
++ * The buffer has the room (amd_packet_reserve), or mdmon's monitor moves
++ * the packet into the one managemon put by for the largest (amd_mm_room).
++ */
++static struct amd_packet_header *amd_packet_insert(struct amd_super *super,
++						   unsigned int at,
++						   const void *rec,
++						   unsigned int size)
++{
++	struct amd_packet_header *h = super->packet;
++	unsigned int end = amd_sections_end(h), len;
++	char *p;
++
++	if (at > end || end > super->packet_len)
++		return NULL;
++	len = ROUND_UP(end + size, AMD_SECTOR);
++	if (len > AMD_MAX_PACKET)
++		return NULL;
++	if (len > super->packet_room) {
++		if (!super->next_packet)
++			return NULL;
++		amd_packet_move(super, super->next_packet, AMD_MAX_PACKET);
++		super->next_packet = NULL;
++	}
++	p = super->packet;
++	memmove(p + at + size, p + at, end - at);
++	memcpy(p + at, rec, size);
++	memset(p + end + size, 0, len - end - size);
++	h = (struct amd_packet_header *)p;
++	amd_move_sections(h, at, size);
++	h->packet_size = __cpu_to_le32(len);
++	super->packet_len = len;
++	return h;
++}
++
++/*
++ * Insert PD record @rec into the packet, in Handle order as the
++ * BIOS keeps them (a SATA disk initialized later sits between the other
++ * SATA disks and the NVMe ones).
++ */
++static int amd_insert_pd(struct amd_super *super, const struct amd_pd *rec)
++{
++	struct amd_packet_header *h = super->packet;
++	unsigned int size = sizeof(*rec), at, n, i;
++	struct amd_pd *pd;
++
++	n = __le32_to_cpu(h->pd_size) / sizeof(*rec);
++	pd = (struct amd_pd *)((char *)h + __le32_to_cpu(h->pd_offset));
++	for (i = 1; i < n; i++)
++		if (__le16_to_cpu(pd[i].id.handle) > __le16_to_cpu(rec->id.handle))
++			break;
++	at = __le32_to_cpu(h->pd_offset) + i * size;
++	if (__le32_to_cpu(h->ld_offset) < at)
++		return -1;
++	h = amd_packet_insert(super, at, rec, size);
++	if (!h)
++		return -1;
++	h->pd_size = __cpu_to_le32(__le32_to_cpu(h->pd_size) + size);
++	h->ld_offset = __cpu_to_le32(__le32_to_cpu(h->ld_offset) + size);
++	amd_reparse(super);
++	return 0;
++}
++
+ /* Is disk @id in an element of @v (or of its second LD copy)? */
+ static int amd_vol_has_disk(const struct amd_vol *v, __u64 id)
+ {
+@@ -3813,6 +4218,66 @@ static int amd_disk_in_volumes(struct amd_super *super, __u64 id)
+ 	return 0;
+ }
+ 
++/*
++ * A PD record for disk @id, an ONLINE RAIDCore disk with the first free
++ * Handle from 1 (as RAIDCoreDxe numbers them; the AMD driver for Windows
++ * numbers from 0 by discovery - both take either).  The Handle, or -1.
++ */
++static int amd_new_pd(struct amd_super *super, __u64 id,
++		      unsigned long long sectors, __u32 features, __u32 spare)
++{
++	struct amd_pd rec;
++	int handle, used, i;
++
++	for (handle = 1; ; handle++) {
++		for (i = 0, used = 0; i < super->npd; i++)
++			used |= __le16_to_cpu(super->pd[i]->id.handle) == handle;
++		if (!used)
++			break;
++	}
++	memset(&rec, 0, sizeof(rec));
++	amd_fill_pd(&rec, id, handle, sectors, features, spare);
++	if (amd_insert_pd(super, &rec) != 0)
++		return -1;
++	return handle;
++}
++
++/*
++ * The disk md rebuilds onto (@el) has a PD record, and @el its Handle.  The
++ * AMD driver drops the PD of a disk it ran without - the element stays,
++ * with an offline handle 0x8000 - n and flags 0x30 - and puts it back, with
++ * SpareInfo from the label, when the disk is there again (rcraid.sys
++ * 9.3.3.218).  A member rebuilt in its slot here gets the same, or
++ * RAIDCoreDxe (elements found by the PD's DeviceID) would not know the
++ * disk of the element.  @features:
++ * the PD Features of the disk, which managemon asked it for
++ * (amd_mm_activate_spare) - not the monitor, under the lock.
++ */
++static void amd_rebuild_pd(struct amd_super *super, struct amd_element *el,
++			   __u32 features)
++{
++	__u64 id = __le64_to_cpu(el->id.id);
++	struct amd_disk *d = amd_find_disk(super, id);
++	int i = amd_pd_index(super, id);
++
++	if (i < 0 && d && d->fd >= 0) {
++		int handle = amd_new_pd(super, id, d->sectors, features,
++				      d->label_spare & AMD_SPARE_GLOBAL);
++
++		if (handle < 0) {
++			amd_kmsg("cannot record returning disk %016llx",
++				 (unsigned long long)id);
++			return;
++		}
++		dprintf("disk %016llx is back: PD again, handle %d\n",
++			(unsigned long long)id, handle);
++		super->config_dirty = 1;
++		i = amd_pd_index(super, id);
++	}
++	if (i >= 0)
++		el->id.handle = super->pd[i]->id.handle;
++}
++
+ /*
+  * A disk joins the running container (udev adds disks one at a time, or
+  * mdadm --add): managemon calls add_to_super.  It only reads the disk's
+@@ -4040,6 +4505,9 @@ static int store_super_amd(struct supertype *st, int fd)
+  *  - the initialization (CREATE_REDUNDANCY) of a volume made in the BIOS:
+  *    md resyncs it, and when that is done a new config packet has the
+  *    transform completed (amd_finish_init);
++ *  - a rebuild onto an AMD global spare (SpareInfo 0x100) for a member out
++ *    of service: md recovers it, and when that is done a new config packet
++ *    has the spare in the slot (amd_activate_spare, amd_finish_rebuild).
+  * Other volumes are not taken.
+  */
+ static struct amd_vol *amd_active_vol(struct active_array *a)
+@@ -4076,11 +4544,54 @@ static void amd_kmsg(const char *fmt, ...)
+ 	close(fd);
+ }
+ 
++/*
++ * Sectors written or trimmed on the array, from its block device's stat
++ * (fields 7 and 14, the discards since 4.18), or 0: what changes on the
++ * volume, not md's own resync or recovery.  The monitor asks too
++ * (amd_target_missed): no stdio, which allocates.
++ */
++static unsigned long long amd_md_writes(struct active_array *a)
++{
++	unsigned long long n[14] = { 0 };
++	char path[64], buf[512], *p = buf;
++	int i;
++
++	snprintf(path, sizeof(path), "/sys/block/%s/stat", a->info.sys_name);
++	if (load_sys(path, buf, sizeof(buf)) != 0)
++		return 0;
++	for (i = 0; i < 14 && *p; i++)
++		n[i] = strtoull(p, &p, 10);
++	return n[6] + n[13];
++}
++
++/*
++ * The target of the transform recorded for @v (amd_rebuild_slot) is not in
++ * md: the volume was started without its disk (-I waits for it, -R and
++ * mdadm-last-resort do not).  The next assembly goes on from its log
++ * (amd_resume_point), as the AMD driver would, unless md writes meanwhile
++ * (amd_target_missed); should the disk come before that, it is copied
++ * from 0 (amd_activate_spare).
++ */
++static int amd_target_away(struct active_array *a, struct amd_vol *v)
++{
++	int slot = amd_rebuild_slot(v);
++	struct mdinfo *dev;
++
++	if (slot < 0)
++		return 0;
++	for (dev = a->info.devs; dev; dev = dev->next)
++		if (dev->disk.raid_disk == slot)
++			return 0;
++	return 1;
++}
++
+ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
+ {
+ 	struct amd_super *super = c->sb;
+ 	unsigned int first;
+ 	struct amd_vol *v;
++	struct mdinfo *d;
++	int slot;
+ 
+ 	if (inst < 0 || inst >= super->nvol)
+ 		return -ENODEV;
+@@ -4100,14 +4611,86 @@ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
+ 	 * Here already, not only as the array leaves readonly (amd_set_array_state):
+ 	 * an mdmon that takes a running array over never sees that.
+ 	 */
++	v->mon.target_away = amd_target_away(a, v);
+ 	v->mon.members_checked = 0;
++	v->mon.md_writes = amd_md_writes(a);
+ 	a->info.container_member = inst;
+ 
++	/* a recorded rebuild that container_content handed to md goes on */
++	v->mon.rebuilding = 0;
++	slot = amd_rebuild_slot(v);
++	for (d = a->info.devs; slot >= 0 && d; d = d->next) {
++		if (d->disk.raid_disk != slot)
++			continue;
++		v->mon.rebuilding = 1;
++		v->mon.rebuild_slot = slot;
++		v->mon.rebuild_done = 0;
++		v->mon.rebuild_el = amd_link_elements(v)[slot];
++		v->mon.rebuild_el.flags = 0;
++		v->mon.rebuild_recorded = 1;
++		/*
++		 * The log on disk has where md resumed from; it is rewritten
++		 * once md checkpoints further (amd_set_array_state).
++		 */
++		v->mon.rebuild_ckpt = 0;
++		v->mon.tlog_dirty = 0;
++		dprintf("array %d rebuilds member %d\n", inst, slot);
++	}
+ 	return 0;
+ }
+ 
+ static void amd_mark_missing(struct active_array *a, struct amd_vol *v);
+ 
++/*
++ * Back to the start packet of the transform recorded for @v: nothing of it
++ * done - undo what the "100 %" packet set (RESTORE_SEGMENTS, the ring of an
++ * X399 RAID10).
++ */
++static void amd_transform_rewind(struct amd_super *super, struct amd_vol *v)
++{
++	struct amd_ld *ld = v->ld, *t = v->link;
++
++	ld->transform_percent = 0;
++	t->transform_percent = 0;
++	ld->transform_protect_start = 0;
++	t->transform_protect_start = 0;
++	ld->transform_protect_size = __cpu_to_le32(amd_protect_size(v));
++	ld->flags = (ld->flags & ~__cpu_to_le32(AMD_LDF_TRANSFORM)) |
++		    __cpu_to_le32(AMD_LDF_RESTORE_SRC);
++	t->transform_protect_size = ld->transform_protect_size;
++	super->config_dirty = 1;
++}
++
++/* md has written to @v while the target was away: the target lacks those writes */
++static int amd_target_missed(struct active_array *a, struct amd_vol *v)
++{
++	return v->mon.target_away && amd_md_writes(a) > v->mon.md_writes;
++}
++
++/*
++ * The target of @v is copied from the start: it lacks writes md made
++ * meanwhile (amd_target_missed), or md copies it from 0 anyway
++ * (amd_activate_spare).  Its log goes back to 0, and a "100 %" packet back
++ * to the start one - either would have us and the AMD driver take the
++ * target for done (amd_resume_point, rcblob RC_RestartTask).  The log goes
++ * back to 0 on the disks here only, and the AMD driver reads it through
++ * the target LD, from its first element (RC_ReadLogicalDeviceTransformLog):
++ * the target's own old copy when it rebuilds slot 0 - it would go on from
++ * there, over what md wrote meanwhile (rcraid 9.3.3-00302).  So the
++ * configuration is written too: a target away misses it, its PD goes
++ * offline (amd_pd_states), and the AMD driver copies it from the start, as
++ * we do (amd_target_disk).
++ * amd_sync_metadata writes the log, then the packet.
++ */
++static void amd_target_behind(struct amd_super *super, struct amd_vol *v)
++{
++	v->mon.target_away = 0;
++	v->mon.tlog_restart = 1;
++	if (v->ld->transform_percent)
++		amd_transform_rewind(super, v);
++	super->config_dirty = 1;
++}
++
+ /*
+  * What md itself records as done, exact where a sync action was
+  * interrupted (frozen, md -S, the shutdown): resync_start for an
+@@ -4118,6 +4701,8 @@ static void amd_mark_missing(struct active_array *a, struct amd_vol *v);
+  */
+ static void amd_note_md_progress(struct active_array *a, struct amd_vol *v)
+ {
++	struct mdinfo *mdi;
++
+ 	if (v->init_pending && !v->mon.init_done &&
+ 	    a->info.resync_start != MaxSector) {
+ 		unsigned long long cap = __le64_to_cpu(v->ld->capacity);
+@@ -4129,6 +4714,16 @@ static void amd_note_md_progress(struct active_array *a, struct amd_vol *v)
+ 			v->mon.init_tlog = 1;	/* written by amd_sync_metadata */
+ 		}
+ 	}
++	if (!v->mon.rebuilding || v->mon.rebuild_done)
++		return;
++	for (mdi = a->info.devs; mdi; mdi = mdi->next)
++		if (mdi->disk.raid_disk == v->mon.rebuild_slot &&
++		    mdi->recovery_start != MaxSector &&
++		    mdi->recovery_start > v->mon.rebuild_ckpt &&
++		    mdi->recovery_start < v->component_size) {
++			v->mon.rebuild_ckpt = mdi->recovery_start;
++			v->mon.tlog_dirty = 1;	/* written by amd_sync_metadata */
++		}
+ }
+ 
+ /*
+@@ -4184,6 +4779,13 @@ static void amd_note_checkpoints(struct active_array *a, struct amd_vol *v)
+ 		v->mon.init_ckpt = ckpt;
+ 		v->mon.init_tlog = 1;	/* written by amd_sync_metadata */
+ 	}
++	/* recovery progress: the monitor's checkpoint is in member sectors */
++	if (v->mon.rebuilding && !v->mon.rebuild_done && a->curr_action == recover &&
++	    moved && a->last_checkpoint > v->mon.rebuild_ckpt &&
++	    a->last_checkpoint < v->component_size) {
++		v->mon.rebuild_ckpt = a->last_checkpoint;
++		v->mon.tlog_dirty = 1;	/* written by amd_sync_metadata */
++	}
+ }
+ 
+ static int amd_set_array_state(struct active_array *a, int consistent)
+@@ -4200,6 +4802,19 @@ static int amd_set_array_state(struct active_array *a, int consistent)
+ 		/* degraded: active, so that md rebuilds onto what it gets (as IMSM) */
+ 		if (amd_volume_state(a->container->sb, v) != AMD_LD_STATE_NORMAL)
+ 			consistent = 0;
++		/* a rebuild handed to md at assembly needs the array active */
++		if (v->mon.rebuilding && !v->mon.rebuild_done)
++			consistent = 0;
++		v->mon.target_away = amd_target_away(a, v);
++	} else if (!consistent && v->mon.target_away) {
++		/*
++		 * md is to write (write_pending; md waits for us): before it
++		 * does.  A degraded volume comes this way too: md has it clean
++		 * until its first write.  Only an array taken over active
++		 * (mdmon --takeover) writes unseen: amd_sync_progress sees
++		 * that later.
++		 */
++		amd_target_behind(a->container->sb, v);
+ 	}
+ 	/*
+ 	 * An initialization not done yet is in the LD and its progress in the
+@@ -4262,6 +4877,39 @@ static void amd_set_disk(struct active_array *a, int n, int state)
+ 
+ 	if (!v || n < 0)
+ 		return;
++	/* the spare md recovers onto is not in the config yet */
++	if (v->mon.rebuilding && n == v->mon.rebuild_slot) {
++		if (state & DS_FAULTY) {
++			d = amd_find_disk(super, __le64_to_cpu(v->mon.rebuild_el.id.id));
++			if (d)
++				d->spare_failed = 1;
++			v->mon.rebuilding = 0;
++			if (amd_rebuild_slot(v) == n) {
++				/*
++				 * RESTORE_SEGMENTS, or the migration of a
++				 * RAIDABLE, is in the packet: end it.  The
++				 * migration goes as the AMD driver drops one
++				 * the user cancels (rcblob RC_RemoveTransform-
++				 * UpdateDriver): the RAIDABLE as it was.  (On a
++				 * failed target it stops and goes on after a
++				 * reboot instead - onto the same disk.)
++				 */
++				v->mon.rebuild_recorded = 0;
++				v->mon.tlog_dirty = 2;
++				amd_ld_clear_transform(v->ld);
++				amd_end_transform(super, a->info.container_member,
++						  __le32_to_cpu(v->ld->transform_type),
++						  AMD_TRANSFORM_FAILED);
++			}
++			dprintf("array %d rebuild of member %d failed\n",
++				a->info.container_member, n);
++		} else if ((state & DS_INSYNC) && !v->mon.rebuild_done) {
++			v->mon.rebuild_done = 1;	/* recorded by amd_sync_metadata */
++			dprintf("array %d member %d rebuilt\n",
++				a->info.container_member, n);
++		}
++		return;
++	}
+ 	if (n >= v->nel || !(state & DS_FAULTY))
+ 		return;
+ 	d = amd_find_disk(super, __le64_to_cpu(v->el[n].id.id));
+@@ -4347,7 +4995,8 @@ static int amd_all_disks_here(struct amd_super *super)
+ 		if ((!d || d->fd < 0) &&
+ 		    __le32_to_cpu(super->pd[i]->device_state) == AMD_DEV_STATE_OFFLINE)
+ 			continue;
+-		if (!d || d->fd < 0 || !amd_disk_current(super, d))
++		if (!d || d->fd < 0 ||
++		    (!amd_disk_current(super, d) && !amd_rebuild_target(super, id)))
+ 			return 0;
+ 	}
+ 	return 1;
+@@ -4386,6 +5035,14 @@ static void amd_reparse_without(struct amd_super *super, int gone)
+ 	}
+ }
+ 
++/* The transform fields of @ld a transform clears as it ends. */
++static void amd_ld_clear_transform(struct amd_ld *ld)
++{
++	ld->transform_protect_size = 0;
++	ld->transform_flags = 0;
++	ld->flags &= ~__cpu_to_le32(AMD_LDF_TRANSFORM);
++}
++
+ /*
+  * End a transform the way the AMD driver does (seen in the ring of an X399
+  * RAID10 for RESTORE_SEGMENTS and CHECK_BITMAP_REDUNDANCY, and after a
+@@ -4454,6 +5111,170 @@ static void amd_finish_init(struct amd_super *super, int vol)
+ 			  AMD_TRANSFORM_COMPLETED);
+ }
+ 
++/*
++ * Record a finished rebuild the way the AMD driver ends RESTORE_SEGMENTS
++ * (the ring of an X399 RAID10): the spare's element takes the slot with
++ * flags 0, the volume is NORMAL again unless another member is still out,
++ * LastOperation RESTORE_SEGMENTS, TransformState COMPLETED.  The spare
++ * keeps SpareInfo 0x100: the AMD driver clears it only when the user
++ * unassigns the spare (rcblob RC_DeassignPhysicalDeviceGlobalSpare,
++ * rcraid.sys FUN_1400652d0).
++ * An initialization still pending stays so, with the new member in both
++ * copies of the LD.
++ */
++static void amd_finish_rebuild(struct amd_super *super, int vol)
++{
++	struct amd_vol *v = &super->vol[vol];
++	struct amd_ld *ld;
++	struct amd_disk *d;
++	__u32 state;
++
++	ld = v->ld;
++	/* a former member rebuilt in place may be stale yet: written from now on */
++	d = amd_find_disk(super, __le64_to_cpu(v->mon.rebuild_el.id.id));
++	if (d)
++		d->rejoin = 1;
++	v->mon.rebuilding = 0;
++	v->mon.rebuild_done = 0;
++	super->config_dirty = 1;
++	v->el[v->mon.rebuild_slot] = v->mon.rebuild_el;
++	if (v->link && amd_same_geometry(ld, v->link))
++		amd_link_elements(v)[v->mon.rebuild_slot] = v->mon.rebuild_el;
++	state = __cpu_to_le32(amd_volume_state(super, v));
++	ld->state = state;
++	/* the bitmap of element [0][0] is on the new member now: write it */
++	if (v->mon.rebuild_slot == 0)
++		v->mon.bitmap_dirty = -1;
++
++	if (__le32_to_cpu(ld->transform_type) == AMD_TRANSFORM_CREATE_REDUNDANCY) {
++		if (v->link)
++			v->link->state = state;
++		return;
++	}
++	/* a RESTORE_SEGMENTS in the packet has a transform log to clear */
++	if (__le32_to_cpu(ld->transform_type) == AMD_TRANSFORM_RESTORE_SEGMENTS)
++		v->mon.tlog_dirty = 2;
++	v->mon.rebuild_recorded = 0;
++	amd_ld_clear_transform(ld);
++	amd_end_transform(super, vol, AMD_TRANSFORM_RESTORE_SEGMENTS,
++			  AMD_TRANSFORM_COMPLETED);
++}
++
++/* Insert @size bytes of LD record @rec into the LD section, at offset @at. */
++static int amd_insert_ld(struct amd_super *super, unsigned int at,
++			 const void *rec, unsigned int size)
++{
++	struct amd_packet_header *h = amd_packet_insert(super, at, rec, size);
++
++	if (!h)
++		return -1;
++	h->ld_size = __cpu_to_le32(__le32_to_cpu(h->ld_size) + size);
++	amd_reparse(super);
++	return 0;
++}
++
++/*
++ * The LD a rebuild of @v goes into, *@size bytes: a copy of its LD without
++ * the dedicated spares (as the menu writes the second copy), the spare in
++ * the slot, failed members marked 0x8000 too (the ring of an X399
++ * RAID10).
++ * Made in ldbuf, as large as managemon has made it (amd_mm_activate_spare):
++ * NULL if it does not fit.
++ */
++static struct amd_ld *amd_rebuild_ld(struct amd_super *super,
++				     struct amd_vol *v, unsigned int *size)
++{
++	struct amd_ld *ld = v->ld, *t;
++	unsigned int els = sizeof(*ld) + sizeof(struct amd_element) * v->nel;
++	unsigned int refs = sizeof(struct amd_dev_id) *
++			    __le32_to_cpu(ld->parent_count);
++	struct amd_element *tel;
++	int i;
++
++	*size = els + refs;
++	if (*size > super->ldbuf_room)
++		return NULL;
++	t = super->ldbuf;
++	memcpy(t, ld, els);
++	memcpy((char *)t + *size - refs, (char *)ld + els, refs);
++	t->spare_count = 0;
++	t->packet_size = __cpu_to_le32(*size);
++	tel = amd_ld_elements(t);
++	tel[v->mon.rebuild_slot] = v->mon.rebuild_el;
++	for (i = 0; i < v->nel; i++)
++		if (i != v->mon.rebuild_slot &&
++		    (__le32_to_cpu(tel[i].flags) & AMD_ELEMENT_FAILED))
++			tel[i].flags |= __cpu_to_le32(AMD_ELEMENT_FAIL_COMMITTED);
++	return t;
++}
++
++/*
++ * Record the start of a rebuild the way the AMD driver does (the ring of
++ * an X399 RAID10): the transform log (STARTED, nothing done yet) first,
++ * then RESTORE_SEGMENTS in the LD and a second copy of it - the LD rebuilt
++ * into, with the spare in the slot - in the next config packet.  Then a
++ * reboot, into Linux or the AMD driver, goes on from the log instead of
++ * starting over.
++ * Without the log first the AMD driver would not go on with it at all.
++ * 1: not yet - another transform is pending (an initialization), or the
++ * log of one that has ended is still to be cleared: it is in the same
++ * sectors.  -1: cannot.
++ */
++static int amd_start_rebuild(struct amd_super *super, int vol)
++{
++	struct amd_vol *v = &super->vol[vol];
++	struct amd_ld *ld = v->ld;
++	unsigned int size = amd_ld_size(ld);
++	unsigned int at = (char *)ld - (char *)super->packet + size;
++	__u32 op = __cpu_to_le32(AMD_TRANSFORM_RESTORE_SEGMENTS);
++	__u32 protect = __cpu_to_le32(amd_protect_size(v));
++	struct amd_ld *t, saved;
++
++	if (size == 0)
++		return -1;
++	if (v->link || ld->transform_type || v->mon.init_tlog == 2 ||
++	    v->mon.tlog_dirty == 2)
++		return 1;
++	t = amd_rebuild_ld(super, v, &size);
++	if (!t)
++		return -1;
++	t->last_operation = op;
++	t->transform_flags = __cpu_to_le32(AMD_TFLAGS_RESTORE);
++	t->transform_protect_start = 0;
++	t->transform_percent = 0;
++	t->transform_link = 0;
++	t->transform_type = op;
++	t->transform_protect_size = protect;
++	t->flags |= __cpu_to_le32(AMD_LDF_RESTORE_DST);
++	if (amd_tlog_write(super, v, t, 0,
++			   amd_member_to_volume(v, v->mon.rebuild_ckpt),
++			   __le32_to_cpu(op)) != 0)
++		return -1;
++
++	saved = *ld;
++	ld->transform_type = op;
++	ld->last_operation = op;
++	ld->transform_flags = t->transform_flags;
++	ld->transform_protect_start = 0;
++	ld->transform_protect_size = protect;
++	/* nothing done yet: a per cent left over would say all (amd_resume_point) */
++	ld->transform_percent = 0;
++	ld->flags |= __cpu_to_le32(AMD_LDF_RESTORE_SRC);
++	ld->transform_link = __cpu_to_le32(1);
++	/*
++	 * The packet only changes if the insertion succeeds - and the log
++	 * written above goes then (REB-B7): it would lie in the elements'
++	 * service sector until the next transform.
++	 */
++	if (amd_insert_ld(super, at, t, size) != 0) {
++		*ld = saved;
++		amd_tlog_write(super, v, t, 1, 0, 0);
++		return -1;
++	}
++	super->config_dirty = 1;
++	return 0;
++}
++
+ /* write the configuration if it has changed */
+ static void amd_flush_config(struct supertype *st)
+ {
+@@ -4499,6 +5320,26 @@ static void amd_catch_up(struct amd_super *super)
+ 	}
+ }
+ 
++/*
++ * A recorded rebuild of a volume this mdmon found running (amd_open_new)
++ * that md has finished already - as the other mdmon left, or with none
++ * running: its target is in sync, and the monitor sees no recovery end
++ * (set_disk).  Left so, the packet has the rebuild in progress until the
++ * next assembly, and a failure of the source meanwhile would be recorded
++ * as one of the only copy.
++ */
++static void amd_rebuild_ended_unseen(struct active_array *a, struct amd_vol *v)
++{
++	struct mdinfo *dev;
++
++	if (!v->mon.rebuilding || v->mon.rebuild_done)
++		return;
++	for (dev = a->info.devs; dev; dev = dev->next)
++		if (dev->disk.raid_disk == v->mon.rebuild_slot &&
++		    (dev->curr_state & DS_INSYNC))
++			v->mon.rebuild_done = 1;	/* recorded by amd_sync_metadata */
++}
++
+ /* write the transform log of @vol at @done, or say it could not */
+ static int amd_sync_tlog(struct amd_super *super, int vol,
+ 			 unsigned long long done, __u32 type)
+@@ -4518,6 +5359,7 @@ static int amd_sync_tlog(struct amd_super *super, int vol,
+  */
+ static void amd_sync_progress(struct supertype *st)
+ {
++	struct amd_super *super = st->sb;
+ 	struct active_array *a;
+ 
+ 	for (a = st->arrays; a; a = a->next) {
+@@ -4540,9 +5382,12 @@ static void amd_sync_progress(struct supertype *st)
+ 		if (!v->mon.members_checked && a->curr_state > readonly &&
+ 		    a->curr_state != bad_word) {
+ 			amd_mark_missing(a, v);
++			amd_rebuild_ended_unseen(a, v);
+ 			v->mon.members_checked = 1;
+ 		}
+ 		amd_note_md_progress(a, v);
++		if (amd_target_missed(a, v))
++			amd_target_behind(super, v);
+ 	}
+ }
+ 
+@@ -4553,12 +5398,25 @@ static void amd_sync_transforms(struct amd_super *super)
+ 
+ 	for (vol = 0; vol < super->nvol; vol++) {
+ 		struct amd_vol *v = &super->vol[vol];
++		__u32 type = __le32_to_cpu(v->ld->transform_type);
+ 
++		/* the target of a recorded transform fell behind (amd_target_behind) */
++		if (v->mon.tlog_restart &&
++		    (!v->link || amd_sync_tlog(super, vol, 0, type) == 0))
++			v->mon.tlog_restart = 0;
++		/* rebuild or migration progress (RESTORE_SEGMENTS, NORMAL) */
++		if (v->mon.rebuilding && v->mon.rebuild_recorded == 1 && v->mon.tlog_dirty == 1 &&
++		    !v->mon.rebuild_done &&
++		    amd_sync_tlog(super, vol, amd_member_to_volume(v, v->mon.rebuild_ckpt),
++				  type) == 0)
++			v->mon.tlog_dirty = 0;
+ 		/* initialization progress, logged as the AMD driver does per region */
+ 		if (v->init_pending && !v->mon.init_done && v->mon.init_tlog == 1 &&
+ 		    v->link && amd_sync_tlog(super, vol, v->mon.init_ckpt,
+ 					     AMD_TRANSFORM_CREATE_REDUNDANCY) == 0)
+ 			v->mon.init_tlog = 0;
++		if (v->mon.rebuilding && v->mon.rebuild_done && amd_all_disks_here(super))
++			amd_finish_rebuild(super, vol);
+ 		if (v->init_pending && v->mon.init_done && amd_all_disks_here(super))
+ 			amd_finish_init(super, vol);
+ 	}
+@@ -4572,11 +5430,44 @@ static void amd_sync_ended_logs(struct amd_super *super)
+ 	for (vol = 0; vol < super->nvol && !super->config_dirty; vol++) {
+ 		struct amd_vol *v = &super->vol[vol];
+ 
++		if (v->mon.tlog_dirty == 2 &&
++		    amd_tlog_write(super, v, v->ld, 1, 0, 0) == 0) {
++			v->mon.tlog_dirty = 0;
++		}
+ 		if (v->mon.init_tlog == 2 && amd_tlog_write(super, v, v->ld, 1, 0, 0) == 0)
+ 			v->mon.init_tlog = 0;
+ 	}
+ }
+ 
++/*
++ * The start of a rebuild, after amd_sync_ended_logs: its log goes where
++ * the log of a transform that has just ended was (an initialization md finished
++ * by this very recovery, as with a degraded volume started --force).
++ */
++static void amd_sync_rebuilds(struct amd_super *super)
++{
++	int vol;
++
++	for (vol = 0; vol < super->nvol && !super->config_dirty; vol++) {
++		struct amd_vol *v = &super->vol[vol];
++		int rv;
++
++		if (!v->mon.rebuilding || v->mon.rebuild_recorded ||
++		    v->mon.rebuild_done ||
++		    !amd_all_disks_here(super))
++			continue;
++		rv = amd_start_rebuild(super, vol);
++		if (rv == 0) {
++			v->mon.rebuild_recorded = 1;
++		} else if (rv < 0) {
++			v->mon.rebuild_recorded = -1;
++			amd_kmsg("subarray-%d: cannot record its %s onto disk %016llx",
++				 vol, "rebuild",
++				 (unsigned long long)__le64_to_cpu(v->mon.rebuild_el.id.id));
++		}
++	}
++}
++
+ /* The write-intent bitmaps of the managed volumes, as md has them */
+ static void amd_sync_bitmaps(struct amd_super *super)
+ {
+@@ -4615,12 +5506,25 @@ static void amd_sync_metadata(struct supertype *st)
+ 	amd_sync_transforms(super);
+ 	amd_flush_config(st);
+ 	amd_sync_ended_logs(super);
++	amd_sync_rebuilds(super);
++	amd_flush_config(st);
+ 	amd_catch_up(super);
+ 	amd_sync_bitmaps(super);
+ }
+ 
++/* activate_spare -> process_update: md recovers @slot of @vol onto @el */
++struct amd_update_spare {
++	int type;
++	int vol;
++	int slot;
++	int recorded;		/* a RESTORE_SEGMENTS in the packet goes on */
++	__u32 features;		/* PD Features of the disk (amd_rebuild_pd) */
++	struct amd_element el;
++};
++
+ /* the size of an update of each type */
+ static const unsigned int amd_update_size[] = {
++	[AMD_UPDATE_SPARE]	= sizeof(struct amd_update_spare),
+ 	[AMD_UPDATE_REMOVE]	= sizeof(struct amd_update_disk),
+ 	[AMD_UPDATE_ATTACH]	= sizeof(struct amd_update_attach),
+ };
+@@ -4643,6 +5547,101 @@ static int amd_update_type(const struct metadata_update *update)
+ 	return type;
+ }
+ 
++/*
++ * The monitor's array of volume @vol, or NULL - not one it let go of
++ * (amd_sync_progress): a volume started again may be another md array.
++ */
++static struct active_array *amd_vol_array(struct supertype *st, int vol)
++{
++	struct active_array *a;
++
++	for (a = st->arrays; a; a = a->next)
++		if (a->container && !a->to_remove &&
++		    a->info.container_member == vol)
++			return a;
++	return NULL;
++}
++
++/*
++ * md has a device in @slot of @a: the rdN link of the array
++ * (Documentation/admin-guide/md.rst).  managemon queues the update of
++ * activate_spare even if md did not take the disk (manage_member:
++ * sysfs_add_disk failed - EBUSY, the disk gone meanwhile).
++ */
++static int amd_md_took(struct active_array *a, int slot)
++{
++	char path[64];
++
++	snprintf(path, sizeof(path), "/sys/block/%s/md/rd%d",
++		 a->info.sys_name, slot);
++	return access(path, F_OK) == 0;
++}
++
++static void amd_spare_update(struct supertype *st,
++			     const struct amd_update_spare *u)
++{
++	struct amd_super *super = st->sb;
++	struct active_array *a;
++	struct amd_disk *d;
++	struct amd_vol *v;
++
++	if (u->vol < 0 || u->vol >= super->nvol)
++		return;
++	v = &super->vol[u->vol];
++	if (v->mon.rebuilding || u->slot < 0 || !amd_md_slot(v, u->slot))
++		return;
++	a = amd_vol_array(st, u->vol);
++	/*
++	 * Recorded without the disk in md, the rebuild would never end
++	 * (set_disk comes for md's devices only), and while it runs no other
++	 * spare is taken (amd_activate_spare).  As with a target md fails:
++	 * that disk is not taken again while here, another may be - once md
++	 * ends the recovery it was told to run (managemon.c), the monitor has
++	 * managemon look for a spare again.  No array to ask: open_new's, not
++	 * on the list yet, which found the disk in md (amd_unrecorded_rebuild).
++	 */
++	if (a && !amd_md_took(a, u->slot)) {
++		d = amd_find_disk(super, __le64_to_cpu(u->el.id.id));
++		if (d)
++			d->spare_failed = 1;
++		amd_kmsg("subarray-%d: md did not take disk %016llx for member %d: no rebuild onto it",
++			 u->vol, (unsigned long long)__le64_to_cpu(u->el.id.id),
++			 u->slot);
++		return;
++	}
++	/*
++	 * md rebuilds the slot, so its member is out of service: if the
++	 * packet does not say so yet (managemon found the slot empty before
++	 * the monitor looked at the volume, amd_mark_missing), it does now.
++	 * A rebuild recorded with the member in service in both LD copies is
++	 * no rebuild to the next assembly: the target, half copied, in sync.
++	 */
++	if (u->slot < v->nel && amd_slot_usable(v, u->slot) &&
++	    amd_fail_element(super, v, u->slot, AMD_ELEMENT_OFFLINE))
++		amd_kmsg("subarray-%d: member %d is rebuilt, recorded as offline first",
++			 u->vol, u->slot);
++	v->mon.rebuilding = 1;
++	v->mon.rebuild_slot = u->slot;
++	v->mon.rebuild_done = 0;
++	v->mon.rebuild_el = u->el;
++	v->mon.rebuild_recorded = u->recorded;
++	v->mon.rebuild_ckpt = 0;
++	v->mon.tlog_dirty = 0;
++	amd_rebuild_pd(super, &v->mon.rebuild_el, u->features);
++	/* the target of a recorded rebuild is copied from 0 (amd_activate_spare) */
++	if (u->recorded)
++		amd_target_behind(super, v);
++	v->mon.target_away = 0;
++	/*
++	 * open_new's rebuild md may have ended already: the monitor sees no
++	 * recovery end then.  A spare activate_spare gives md is not on the
++	 * list of the array yet (managemon replaces it after this update).
++	 */
++	if (a)
++		amd_rebuild_ended_unseen(a, v);
++	dprintf("array %d rebuilds member %d\n", u->vol, u->slot);
++}
++
+ static void amd_process_update(struct supertype *st,
+ 			       struct metadata_update *update)
+ {
+@@ -4653,6 +5652,9 @@ static void amd_process_update(struct supertype *st,
+ 	if (!super)
+ 		return;
+ 	switch (amd_update_type(update)) {
++	case AMD_UPDATE_SPARE:
++		amd_spare_update(st, buf);
++		break;
+ 	case AMD_UPDATE_REMOVE:
+ 		amd_remove_disk(super, buf);
+ 		break;
+@@ -4665,6 +5667,84 @@ static void amd_process_update(struct supertype *st,
+ 	}
+ }
+ 
++/*
++ * Does an extent on disk @id - of volume @v, its second LD copy or its
++ * rebuild in progress - overlap [start, start + len)?  Then *end is where
++ * it ends.
++ */
++static int amd_vol_overlap(struct amd_vol *v, __u64 id,
++			   unsigned long long start, unsigned long long len,
++			   unsigned long long *end)
++{
++	int i, j;
++
++	for (j = 0; j < 3; j++) {
++		struct amd_element *el = v->el;
++		int n = v->nel;
++
++		if (j == 1) {
++			if (!v->link)
++				continue;
++			el = amd_link_elements(v);
++			n = amd_link_nel(v);
++		} else if (j == 2) {
++			if (!v->mon.rebuilding)
++				continue;
++			el = &v->mon.rebuild_el;
++			n = 1;
++		}
++		for (i = 0; i < n; i++) {
++			unsigned long long o = __le64_to_cpu(el[i].allocated.offset);
++			unsigned long long s = __le64_to_cpu(el[i].allocated.size);
++
++			if (__le64_to_cpu(el[i].id.id) != id || s == 0 ||
++			    o >= start + len || start >= o + s)
++				continue;
++			*end = o + s;
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/* amd_vol_overlap() of any volume */
++static int amd_extent_overlap(struct amd_super *super, __u64 id,
++			      unsigned long long start, unsigned long long len,
++			      unsigned long long *end)
++{
++	int vol;
++
++	for (vol = 0; vol < super->nvol; vol++)
++		if (amd_vol_overlap(&super->vol[vol], id, start, len, end))
++			return 1;
++	return 0;
++}
++
++/*
++ * The extent of @v's element @slot lies in another volume as well.  The
++ * AMD BIOS menu and driver count the extent of a member recorded offline
++ * as free (rcblob BuildFreeList) and give it to a volume made later, but
++ * they clear the old volume's element then (DeviceID 0, sizes 0;
++ * dumps/2026-11-12-q3j-w2): their metadata never has both.  Configuration
++ * packets of different generations put together, or a damaged one, can:
++ * the other volume's data is not to be written over then.
++ */
++static int amd_extent_given_away(struct amd_super *super,
++				 const struct amd_vol *v, int slot)
++{
++	const struct amd_element *own = &v->el[slot];
++	unsigned long long end;
++	int vol;
++
++	for (vol = 0; vol < super->nvol; vol++)
++		if (&super->vol[vol] != v &&
++		    amd_vol_overlap(&super->vol[vol], __le64_to_cpu(own->id.id),
++				    __le64_to_cpu(own->allocated.offset),
++				    __le64_to_cpu(own->allocated.size), &end))
++			return 1;
++	return 0;
++}
++
+ static int amd_in_volume(const struct amd_vol *v, __u64 id)
+ {
+ 	int i;
+@@ -4675,6 +5755,373 @@ static int amd_in_volume(const struct amd_vol *v, __u64 id)
+ 	return 0;
+ }
+ 
++/* a disk md can rebuild @v onto: present, not in @v, md has not failed it */
++static struct amd_disk *amd_target_disk(struct amd_super *super,
++					struct amd_vol *v, __u64 id)
++{
++	struct amd_disk *d = amd_find_disk(super, id);
++
++	if (!d || d->fd < 0 || d->spare_failed || (d->major == 0 && d->minor == 0) ||
++	    amd_in_volume(v, id) || amd_disk_failed(super, id))
++		return NULL;
++	return d;
++}
++
++/* a disk md can rebuild @v onto (amd_target_disk) that is up to date too: a spare */
++static struct amd_disk *amd_spare_disk(struct amd_super *super,
++				       struct amd_vol *v, __u64 id)
++{
++	struct amd_disk *d = amd_target_disk(super, v, id);
++
++	return d && amd_disk_current(super, d) ? d : NULL;
++}
++
++/*
++ * PD @pd of disk @d (may be NULL) is an AMD RAID disk to rebuild onto: ONLINE,
++ * or OFFLINE in the packet (failed, or away at the last write: the record
++ * says so until the next one, amd_pd_states) while the disk is here now and
++ * md has not failed it - as the AMD driver takes it at its start.
++ */
++static int amd_pd_usable(const struct amd_pd *pd, const struct amd_disk *d)
++{
++	__u32 state = __le32_to_cpu(pd->device_state);
++
++	if (__le32_to_cpu(pd->device_type) != AMD_DEV_RAIDCORE_DISK)
++		return 0;
++	return state == AMD_DEV_STATE_ONLINE ||
++	       (state == AMD_DEV_STATE_OFFLINE && d && d->fd >= 0 &&
++		!d->removed && !d->spare_failed);
++}
++
++/*
++ * The element to rebuild into on spare @pd (disk @d): the first free extent
++ * from 0x100000 within the disk's capacity, @size sectors as the members'
++ * AllocatedSpace, user data @gap into it.  0, or -1 if it does not fit or
++ * the disk is not an online RAIDCore disk.
++ */
++static int amd_spare_extent(struct amd_super *super, const struct amd_pd *pd,
++			    const struct amd_disk *d,
++			    const struct amd_element *model,
++			    unsigned long long size, unsigned long long gap,
++			    struct amd_element *el)
++{
++	__u64 id = __le64_to_cpu(pd->id.id);
++	unsigned long long start = AMD_DEFAULT_ALLOC_LBA, end, cap;
++
++	if (!amd_pd_usable(pd, d))
++		return -1;
++	cap = amd_pd_capacity(pd, d->sectors);
++	while (amd_extent_overlap(super, id, start, size, &end))
++		start = end;
++	if (start + size > cap)
++		return -1;
++	memset(el, 0, sizeof(*el));
++	el->id = pd->id;
++	el->allocated.offset = __cpu_to_le64(start);
++	el->allocated.size = __cpu_to_le64(size);
++	el->user_data.offset = __cpu_to_le64(start + gap);
++	el->user_data.size = model->user_data.size;
++	return 0;
++}
++
++/*
++ * amd_find_spare: the target of a recorded rebuild or migration (RAIDABLE ->
++ * RAID1) of @slot.
++ */
++static struct amd_disk *amd_spare_target(struct amd_super *super,
++					 struct amd_vol *v, int slot,
++					 struct amd_element *el, int *recorded)
++{
++	struct amd_element *lel = &amd_link_elements(v)[slot];
++	struct amd_disk *d = amd_target_disk(super, v,
++					     __le64_to_cpu(lel->id.id));
++
++	if (!amd_element_usable(lel) || !d)
++		return NULL;
++	*el = *lel;
++	el->flags = 0;
++	*recorded = 1;
++	return d;
++}
++
++/*
++ * amd_find_spare: the own disk of @slot is back (it was missing when the
++ * volume ran, or stale: offline, 0x30, or dropped from the second LD copy
++ * by the BIOS): rebuilt in place, in its extent, from the others - as IMSM
++ * takes back a returning member.  Not a disk failed on errors (0x10
++ * alone), now or before: that one waits for the user, as with the AMD
++ * driver.  (The AMD driver also counts the extent of a member it found
++ * offline as free - rcblob BuildFreeList, offline handle - and rebuilds
++ * only onto spares or on the user's request.)  Nor one whose extent lies
++ * in another volume as well (amd_extent_given_away): a rebuild in place
++ * would go over that volume's data.
++ */
++static struct amd_disk *amd_spare_own(struct amd_super *super,
++				      struct amd_vol *v, int slot,
++				      struct amd_element *el, int *recorded)
++{
++	const struct amd_element *own = &v->el[slot];
++	struct amd_disk *d = amd_find_disk(super, __le64_to_cpu(own->id.id));
++
++	if (!own->id.id || !own->allocated.size || !d || d->fd < 0 ||
++	    amd_slot_failed(v, slot) ||
++	    (!d->major && !d->minor) || d->spare_failed ||
++	    __le64_to_cpu(own->allocated.offset) +
++	    __le64_to_cpu(own->allocated.size) > d->sectors ||
++	    amd_extent_given_away(super, v, slot))
++		return NULL;
++	*el = *own;
++	el->flags = 0;
++	/* its rebuild in place was recorded already, the volume ran without it */
++	if (amd_rebuild_slot(v) == slot) {
++		const struct amd_element *lel = &amd_link_elements(v)[slot];
++
++		if (lel->id.id == own->id.id &&
++		    lel->allocated.offset == own->allocated.offset)
++			*recorded = 1;
++	}
++	return d;
++}
++
++/* the element a spare's extent is shaped after: the first in service */
++static const struct amd_element *amd_spare_model(const struct amd_vol *v)
++{
++	int i;
++
++	for (i = 0; i < v->nel; i++)
++		if (amd_slot_usable(v, i) && v->el[i].allocated.size)
++			return &v->el[i];
++	return NULL;
++}
++
++/*
++ * Find a spare for the empty @slot of @v and the extent to rebuild into,
++ * the way the AMD driver does (rcblob RC_CreateTransformDevice with a
++ * global spare, RC_AllocateSpace): a RAIDCore disk with SpareInfo 0x100
++ * that is not in the volume yet, the first free extent from 0x100000 as
++ * large as the other members' AllocatedSpace, user data at the same
++ * distance into it.  A rebuild the AMD driver started and did not finish
++ * keeps its extent (the second LD copy has it): *@recorded is 1 for its
++ * target.
++ */
++static struct amd_disk *amd_find_spare(struct amd_super *super,
++				       struct amd_vol *v, int slot,
++				       struct amd_element *el, int *recorded)
++{
++	const struct amd_element *model = NULL;
++	unsigned long long size, gap;
++	struct amd_disk *d = NULL;
++	int i;
++
++	*recorded = 0;
++	if (amd_rebuild_slot(v) == slot)
++		d = amd_spare_target(super, v, slot, el, recorded);
++	if (!d && slot < v->nel)
++		d = amd_spare_own(super, v, slot, el, recorded);
++	if (d)
++		return d;
++
++	model = amd_spare_model(v);
++	if (!model)
++		return NULL;
++	size = __le64_to_cpu(model->allocated.size);
++	gap = __le64_to_cpu(model->user_data.offset) -
++	      __le64_to_cpu(model->allocated.offset);
++
++
++	/*
++	 * A global spare is not held to the members' controller: the AMD
++	 * driver checks the controller of one only when RC_GetFeatures() lacks
++	 * 0x8 (arrays across controllers, rcblob RC_CreateTransformDevice) -
++	 * the AND of the controllers' features, 0x4b or 0x6b on every platform
++	 * seen, both with 0x8.
++	 */
++	for (i = 0; i < super->npd; i++) {
++		struct amd_pd *pd = super->pd[i];
++		__u64 id = __le64_to_cpu(pd->id.id);
++
++		if (!(__le32_to_cpu(pd->spare_info) & AMD_SPARE_GLOBAL) ||
++		    amd_dedicated_owner(super, id) >= 0)
++			continue;
++		d = amd_spare_disk(super, v, id);
++		if (!d)
++			continue;
++		if (amd_spare_extent(super, pd, d, model, size, gap, el) == 0)
++			return d;
++	}
++	return NULL;
++}
++
++/*
++ * A managed volume with a member out of service (recorded so in the
++ * config: flags 0x4030, or no disk) gets that member's own disk back if
++ * it is here again, else an AMD global spare.  Members missing when the
++ * volume went into use are out of service by then (amd_mark_missing).
++ * The start is recorded by amd_start_rebuild, the end by
++ * amd_finish_rebuild.
++ * The target of a recorded rebuild too is copied from 0, as IMSM copies
++ * any disk it adds to a running array: md may write without it until the
++ * slot is set, and the mark of its log would skip that (amd_spare_update
++ * sets the log back to 0).  The next assembly goes on from the log
++ * (container_content).
++ * 1: the spare is in @di, the update for the monitor in @u - zeroed, and
++ * allocated before the lock (amd_mm_activate_spare).
++ */
++static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
++			      struct amd_update_spare *u)
++{
++	struct amd_super *super = a->container->sb;
++	struct amd_vol *v = amd_active_vol(a);
++	struct amd_disk *d = NULL;
++	struct amd_element el;
++	struct mdinfo *dev;
++	int slot, recorded = 0;
++
++	if (!v || v->mon.rebuilding ||
++	    (v->level != 1 && v->level != 10 && v->level != 5))
++		return 0;
++	for (dev = a->info.devs; dev; dev = dev->next)
++		if (is_fd_valid(dev->state_fd) && (dev->curr_state & DS_FAULTY))
++			return 0;	/* wait for md to remove it */
++
++	/*
++	 * A slot md runs without: out of service, or its member missing - a
++	 * running volume takes no late member in sync; amd_mark_missing
++	 * records it, and the rebuild is recorded only after that.
++	 */
++	for (slot = 0; slot < a->info.array.raid_disks && amd_md_slot(v, slot);
++	     slot++) {
++		for (dev = a->info.devs; dev; dev = dev->next)
++			if (dev->disk.raid_disk == slot && is_fd_valid(dev->state_fd))
++				break;
++		if (dev)
++			continue;
++		d = amd_find_spare(super, v, slot, &el, &recorded);
++		if (d)
++			break;
++	}
++	if (!d)
++		return 0;
++
++	di->disk.number = slot;
++	di->disk.raid_disk = slot;
++	di->disk.major = d->major;
++	di->disk.minor = d->minor;
++	di->recovery_start = 0;
++	di->data_offset = __le64_to_cpu(el.user_data.offset);
++	di->component_size = a->info.component_size;
++	di->container_member = a->info.container_member;
++
++	u->type = AMD_UPDATE_SPARE;
++	u->vol = a->info.container_member;
++	u->slot = slot;
++	u->recorded = recorded;
++	u->el = el;
++	dprintf("array %d member %d: spare %d:%d at %llu\n",
++		a->info.container_member, slot, d->major, d->minor,
++		(unsigned long long)di->data_offset);
++	return 1;
++}
++
++/* the disk of the container that is @major:@minor, or NULL */
++static struct amd_disk *amd_devt_disk(struct amd_super *super, int major,
++				      int minor)
++{
++	struct amd_disk *d;
++
++	for (d = super->disks; d; d = d->next)
++		if (!d->removed && d->major == major && d->minor == minor)
++			return d;
++	return NULL;
++}
++
++/*
++ * The element md rebuilds @slot of @v into, on disk @d with user data at
++ * @offset: the slot's own, rebuilt in place, or one shaped as the others
++ * (amd_spare_extent) that lies free on the disk.  0, or -1.
++ */
++static int amd_md_element(struct amd_super *super, struct amd_vol *v,
++			  int slot, const struct amd_disk *d,
++			  unsigned long long offset, struct amd_element *el)
++{
++	const struct amd_element *model = amd_spare_model(v);
++	unsigned long long gap, size, start, end;
++	int p = amd_pd_index(super, d->device_id);
++
++	if (slot < v->nel && __le64_to_cpu(v->el[slot].id.id) == d->device_id &&
++	    __le64_to_cpu(v->el[slot].user_data.offset) == offset) {
++		*el = v->el[slot];
++		el->flags = 0;
++		return 0;
++	}
++	if (!model)
++		return -1;
++	gap = __le64_to_cpu(model->user_data.offset) -
++	      __le64_to_cpu(model->allocated.offset);
++	size = __le64_to_cpu(model->allocated.size);
++	if (offset < gap)
++		return -1;
++	start = offset - gap;
++	if (start + size > amd_pd_capacity(p >= 0 ? super->pd[p] : NULL,
++					   d->sectors) ||
++	    amd_extent_overlap(super, d->device_id, start, size, &end))
++		return -1;
++	memset(el, 0, sizeof(*el));
++	el->id.id = __cpu_to_le64(d->device_id);
++	el->allocated.offset = __cpu_to_le64(start);
++	el->allocated.size = model->allocated.size;
++	el->user_data.offset = __cpu_to_le64(offset);
++	el->user_data.size = model->user_data.size;
++	return 0;
++}
++
++/*
++ * A rebuild md runs on @v that is not recorded (REB-B5): the mdmon before
++ * this one gave md the disk (activate_spare) and went - mdmon --takeover,
++ * a restart after a crash - before its monitor wrote the start, or could
++ * not write it (amd_sync_rebuilds).  Unknown to this mdmon, its end would
++ * not be recorded either: the slot's member stays out of service, the
++ * spare a spare, and a failure of another member would be recorded as one
++ * of the last.  The update activate_spare made goes to the monitor again,
++ * from what md runs: a device in a slot it is not the member in service
++ * of, or not in sync.  1 if there is one, in @u.  (IMSM does not look
++ * for one: imsm_open_new.)
++ */
++static int amd_unrecorded_rebuild(struct amd_super *super,
++				  struct active_array *a, struct amd_vol *v,
++				  struct amd_update_spare *u)
++{
++	struct mdinfo *dev;
++
++	if (v->mon.rebuilding)
++		return 0;
++	for (dev = a->info.devs; dev; dev = dev->next) {
++		int slot = dev->disk.raid_disk;
++		struct amd_disk *d;
++
++		if (slot < 0 || !amd_md_slot(v, slot) ||
++		    (dev->disk.state & (1 << MD_DISK_FAULTY)))
++			continue;
++		d = amd_devt_disk(super, dev->disk.major, dev->disk.minor);
++		if (!d || (slot < v->nel && amd_slot_usable(v, slot) &&
++			   __le64_to_cpu(v->el[slot].id.id) == d->device_id &&
++			   (dev->disk.state & (1 << MD_DISK_SYNC))))
++			continue;
++		if (amd_md_element(super, v, slot, d, dev->data_offset,
++				   &u->el) != 0) {
++			amd_kmsg("%s: md rebuilds member %d onto %d:%d at %llu, where AMD has no room for it: not recorded",
++				 a->info.sys_name, slot, d->major, d->minor,
++				 dev->data_offset);
++			return 0;
++		}
++		u->type = AMD_UPDATE_SPARE;
++		u->vol = a->info.container_member;
++		u->slot = slot;
++		return 1;
++	}
++	return 0;
++}
++
+ /*
+  * mdmon's two threads share the metadata.  The monitor changes the config
+  * packet on its own (a failure, a member marked missing, the end of an
+@@ -4699,22 +6146,134 @@ static void amd_unlock(struct amd_super *super)
+ 	__atomic_clear(&super->busy, __ATOMIC_RELEASE);
+ }
+ 
++/*
++ * managemon: the monitor allocates no memory.  Memory is managemon's to
++ * allocate ("things which might block such as memory allocation",
++ * managemon.c), and IMSM has larger buffers ready (prepare_update) for its
++ * monitor to take: an allocation may wait for the kernel to write dirty
++ * pages out - to a volume of ours waiting for the monitor (write_pending).
++ * The packet grows as the monitor records a volume, a disk, a rebuild or
++ * a dedicated spare (amd_packet_insert): before it can, a buffer for the
++ * largest packet is put by for the packet to move into.
++ * Allocated without the lock: the monitor would wait for it.
++ */
++static void amd_mm_room(struct amd_super *super)
++{
++	void *p;
++	int want;
++
++	amd_lock(super);
++	want = super->packet && !super->next_packet &&
++	       super->packet_room < AMD_MAX_PACKET;
++	amd_unlock(super);
++	if (!want)
++		return;
++	p = amd_alloc(AMD_MAX_PACKET);
++	/* managemon alone puts one by: still none */
++	amd_lock(super);
++	super->next_packet = p;
++	amd_unlock(super);
++}
++
++/*
++ * managemon: ldbuf takes @len bytes, the LD a rebuild goes into (made by
++ * the monitor: amd_rebuild_ld).
++ */
++static void amd_mm_ldbuf(struct amd_super *super, unsigned int len)
++{
++	void *p, *old;
++
++	/* managemon alone changes it: read without the lock */
++	if (len <= super->ldbuf_room)
++		return;
++	p = amd_alloc(len);
++	if (!p)
++		return;
++	amd_lock(super);
++	old = super->ldbuf;
++	super->ldbuf = p;
++	super->ldbuf_room = len;
++	amd_unlock(super);
++	free(old);
++}
++
++/*
++ * managemon: what asks the disks themselves (ATA IDENTIFY, NVMe Identify -
++ * seconds when a disk is slow to answer) runs after the lock is released,
++ * on disks opened anew: the monitor would wait for the lock all that time,
++ * and may close the container's descriptors meanwhile (a disk removed).
++ */
+ static int amd_mm_open_new(struct supertype *c, struct active_array *a,
+ 			   int inst)
+ {
+ 	struct amd_super *super = c->sb;
+-	int rv;
++	/* before the lock, as all managemon allocates (amd_mm_room) */
++	struct amd_update_spare *u = xcalloc(1, sizeof(*u));
++	unsigned int len = 0;
++	struct mdinfo *dev;
++	int rv, fd, found = 0;
+ 
++	/* the monitor may record a rebuild of the volume from now on */
++	amd_mm_room(super);
+ 	amd_lock(super);
+ 	rv = amd_open_new(c, a, inst);
++	if (rv == 0)
++		found = amd_unrecorded_rebuild(super, a, &super->vol[inst], u);
++	if (found)
++		len = amd_ld_size(super->vol[inst].ld) + sizeof(struct amd_element);
+ 	amd_unlock(super);
++	/* managemon queues the update (manage_new), as imsm_open_new's */
++	if (!found || !c->update_tail) {
++		free(u);
++		return rv;
++	}
++	/* the LD and the disk's PD Features, as amd_mm_activate_spare has them */
++	amd_mm_ldbuf(super, len);
++	for (dev = a->info.devs; dev->disk.raid_disk != u->slot; dev = dev->next)
++		;
++	fd = amd_dev_open(dev->disk.major, dev->disk.minor, O_RDONLY);
++	u->features = amd_pd_features(fd, dev->disk.major, dev->disk.minor);
++	close_fd(&fd);
++	append_metadata_update(c, u, sizeof(*u));
+ 	return rv;
+ }
+ 
+-/* rebuilds are not recorded for AMD yet: md runs a volume degraded */
+ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
+ 					    struct metadata_update **updates)
+ {
++	struct amd_super *super = a->container->sb;
++	/* before the lock, as all managemon allocates (amd_mm_room) */
++	struct mdinfo *di = xcalloc(1, sizeof(*di));
++	struct amd_update_spare *u = xcalloc(1, sizeof(*u));
++	struct metadata_update *mu;
++	struct amd_vol *v;
++	unsigned int len;
++	int fd, found;
++
++	amd_lock(super);
++	found = amd_activate_spare(a, di, u);
++	amd_unlock(super);
++	if (!found)
++		goto none;
++	fd = amd_dev_open(di->disk.major, di->disk.minor, O_RDONLY);
++	u->features = amd_pd_features(fd, di->disk.major, di->disk.minor);
++	close_fd(&fd);
++	/* the LD the rebuild goes into: at most @v's own and an element */
++	amd_lock(super);
++	v = amd_active_vol(a);
++	len = v ? amd_ld_size(v->ld) + sizeof(struct amd_element) : 0;
++	amd_unlock(super);
++	amd_mm_ldbuf(super, len);
++	/* process_update reads it */
++	mu = xcalloc(1, sizeof(*mu));
++	mu->buf = (char *)u;
++	mu->len = sizeof(*u);
++	mu->next = *updates;
++	*updates = mu;
++	return di;
++none:
++	free(di);
++	free(u);
+ 	return NULL;
+ }
+ 
+-- 
+2.47.3
+

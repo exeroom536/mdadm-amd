@@ -1,0 +1,40 @@
+From dd9b3b646a420f5d796fcc7c0a76e125c79dbb06 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:04 +0500
+Subject: [PATCH 10/32] sysfs: set up linear arrays from external metadata
+
+sysfs_set_array() returns early for every level below 0, so for a linear
+member array of an external container (DDF CONCAT, AMD Volume) neither
+level nor raid_disks are written.  The kernel then refuses every slot,
+as it is not below raid_disks (0), and such an array can be neither
+created nor assembled:
+
+  mdadm: failed to write '0' to '/sys/block/md126/md/dev-loop1/slot' (No space left on device)
+  mdadm: ADD_NEW_DISK for /dev/md/ddf failed: No space left on device
+
+Let linear arrays through, as the levels >= 0 are.  A DDF CONCAT is then
+created, assembled and started, given a kernel with md linear (6.14 and
+later).
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ sysfs.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/sysfs.c b/sysfs.c
+index 96bfd5a7..b10ff3f9 100644
+--- a/sysfs.c
++++ b/sysfs.c
+@@ -829,7 +829,8 @@ int sysfs_set_array(struct mdinfo *info)
+ 			return 1;
+ 		}
+ 	}
+-	if (info->array.level < 0)
++	/* linear (DDF CONCAT, AMD Volume) needs level and raid_disks too */
++	if (info->array.level < 0 && info->array.level != LEVEL_LINEAR)
+ 		return 0; /* FIXME */
+ 	rv |= sysfs_set_str(info, NULL, "level",
+ 			    map_num_s(pers, info->array.level));
+-- 
+2.47.3
+

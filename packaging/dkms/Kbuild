@@ -1,0 +1,5 @@
+# md_mod only, as in drivers/md/Makefile; CONFIG_* come from the target kernel
+obj-m := md-mod.o
+md-mod-y := md.o
+md-mod-$(CONFIG_MD_BITMAP) += md-bitmap.o
+md-mod-$(CONFIG_MD_LLBITMAP) += md-llbitmap.o

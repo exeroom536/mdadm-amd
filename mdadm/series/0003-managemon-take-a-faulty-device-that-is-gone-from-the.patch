@@ -1,0 +1,49 @@
+From 15df16d55ea55fd39b97522825b37fd9ce636183 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:55:54 +0500
+Subject: [PATCH 03/32] managemon: take a faulty device that is gone from the
+ array as removed
+
+managemon_disk_remove() fails when it cannot open the "state" attribute
+of the faulty device.  If the device is no longer in the member array -
+"remove" was written to it by hand while md refused mdmon - that never
+changes: manage_member() returns before it looks for a spare, on every
+pass, and the array stays degraded with a spare in the container.
+
+Take ENOENT for what it is: the device is out of the array.  Close its
+descriptors as after a removal, and go on to the spare.
+
+IMSM RAID1 with a spare on loop devices, the write of "remove" by mdmon
+failing with EBUSY (an LD_PRELOAD shim) after "mdadm --fail", then
+"remove" written to md/dev-loop0/state by hand: before, the array stays
+degraded with the spare in the container; with the change the spare is
+taken.
+
+Written by Claude Fable 5.2, an AI model by Anthropic.
+---
+ managemon.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/managemon.c b/managemon.c
+index 41767954..8e74154c 100644
+--- a/managemon.c
++++ b/managemon.c
+@@ -459,10 +459,11 @@ static mdadm_status_t managemon_disk_remove(struct mdinfo *disk, char *array_dev
+ {
+ 	int new_state_fd = sysfs_open2(array_devnm, disk->sys_name, "state");
+ 
+-	if (!is_fd_valid(new_state_fd))
+-		return MDADM_STATUS_ERROR;
+-
+-	if (write_attr("remove", new_state_fd) != MDADM_STATUS_SUCCESS) {
++	if (!is_fd_valid(new_state_fd)) {
++		/* No longer in the array (removed by hand): it is out. */
++		if (errno != ENOENT)
++			return MDADM_STATUS_ERROR;
++	} else if (write_attr("remove", new_state_fd) != MDADM_STATUS_SUCCESS) {
+ 		close_fd(&new_state_fd);
+ 		return MDADM_STATUS_ERROR;
+ 	}
+-- 
+2.47.3
+

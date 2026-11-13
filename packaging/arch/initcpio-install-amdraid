@@ -1,0 +1,20 @@
+#!/bin/bash
+# AMD RAIDXpert2 volumes (mdadm with metadata=amd): assembled by udev, mdmon from the initramfs
+build() {
+    add_checked_modules -f 'dm-' 'drivers/md/*'
+    # as mdadm_udev: with ARRAY lines the volumes get the names of mdadm.conf (/dev/md/<name>)
+    # in the initramfs too; without them mdadm -I names a volume <name>_0, as for IMSM
+    if grep -qw ^ARRAY /etc/mdadm.conf; then
+        add_file /etc/mdadm.conf
+    fi
+    map add_udev_rule '63-md-raid-arrays.rules' '64-md-raid-assembly.rules' '64-amd-raid-assembly.rules'
+    add_binary mdadm
+    add_binary mdmon
+    add_systemd_unit 'mdmon@.service'
+    add_systemd_unit 'mdadm-last-resort@.timer'
+    add_systemd_unit 'mdadm-last-resort@.service'
+}
+
+help() {
+    echo "Assembles AMD RAIDXpert2 (RAIDCore) volumes with mdadm; needs the systemd hook."
+}

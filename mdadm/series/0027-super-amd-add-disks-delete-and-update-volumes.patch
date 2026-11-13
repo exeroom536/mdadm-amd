@@ -1,0 +1,912 @@
+From 9e3dfd6a926846c98b09de5745e216946410d650 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:57:02 +0500
+Subject: [PATCH 27/32] super-amd: add disks, delete and update volumes
+
+- --add to the container: a new disk becomes an AMD global hot spare,
+  as the BIOS menu initializes and assigns one; a former member failed
+  on errors is given back and rebuilt in its slot.  A disk with a
+  partition table, a Legacy (non-RAID) disk, one the configuration has
+  as a non-RAID disk, or a 64th disk (the packet has room for 64 device
+  records, the controller's among them) is refused; one with an ext2/3/4
+  or reiserfs file system or the volumes of another AMD configuration on
+  it is taken only with --force, as its ends are zeroed.  mdmon records
+  it, so it must run for the container: it does while a RAID1, RAID10,
+  RAID5 or RAIDABLE volume runs (not for RAID0 and Volume).  A disk with
+  a lower DeviceID than the others changes the container UUID: mdadm
+  says so and updates the map.
+- --kill-subarray: the volume is deleted as the AMD driver deletes one
+  (its transform log cleared, its LD records gone, the data left on the
+  disks); not while a later volume runs, which would be renumbered.
+- --update-subarray: the volume's name (not that of another volume),
+  and the AMD driver's cache policy (read-cache, write-back and their
+  no- forms).
+- Without mdmon both write the configuration themselves, so that a write
+  that fails is reported.
+
+Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
+---
+ super-amd.c | 683 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 672 insertions(+), 11 deletions(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index d6451543..bd250f88 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -12,7 +12,9 @@
+  * global spares and of a returning member into its slot - both go on after
+  * a reboot from where md stopped);
+  * --create of a container (the disks "initialized" as the BIOS menu does)
+- * and of Volume/RAID0/1/10/5 volumes in it.
++ * and of Volume/RAID0/1/10/5 volumes in it; --add, --remove,
++ * --kill-subarray, --update-subarray (name, the AMD driver's cache
++ * policy).
+  *
+  * On-disk layout, little-endian, 512-byte sectors:
+  *   LBA 0x5000         RC_MetaData: per-disk label, "RAIDCore", DeviceId
+@@ -118,6 +120,7 @@
+  * Of a RAID0 or Volume it keeps no 0x10 at all (@140018b80).
+  */
+ #define AMD_ELEMENT_FAILED	0x10
++#define AMD_ELEMENT_MISSING	0x20
+ #define AMD_ELEMENT_OFFLINE	0x30
+ /*
+  * The failure is committed to the configuration (rcblob
+@@ -358,6 +361,7 @@ struct amd_disk {
+ 	int write_failed;	/* a configuration write to it failed: stale until back */
+ 	int rejoin;		/* a former member rebuilt in place: gets configs again */
+ 	int removed;		/* taken out of the container (mdmon): gone, as missing */
++	int fresh;		/* mdadm --add initialized it: no configuration yet */
+ 	__u64 last_online;	/* LastOnlineSerialNumber of its commit block */
+ 	int foreign;		/* ... not AMD_SERIAL: last online on another controller */
+ 	int mbr;		/* LBA 0 against its label: AMD_MBR_* */
+@@ -392,7 +396,10 @@ struct amd_disk {
+ #define AMD_UPDATE_SPARE	1	/* struct amd_update_spare */
+ #define AMD_UPDATE_CREATE	2	/* struct amd_update_create */
+ #define AMD_UPDATE_REMOVE	3
++#define AMD_UPDATE_ADD		4
+ #define AMD_UPDATE_ATTACH	5	/* amd_update_attach */
++#define AMD_UPDATE_KILL		6	/* mdadm --kill-subarray: @major = volume, @id = its LD */
++#define AMD_UPDATE_SUBARRAY	7	/* mdadm --update-subarray: struct amd_update_subarray */
+ 
+ struct amd_update_disk {
+ 	int type;
+@@ -484,6 +491,8 @@ struct amd_super {
+ 	int foreign;		/* the live packet is from a disk last online elsewhere */
+ 	int from_md;		/* the disks of a running container (amd_load_md) */
+ 	int attached;		/* add_to_super took a disk in, nothing to init */
++	int add_checked;	/* mdadm --add: amd_check_add passed, the disk may be initialized */
++	__u64 add_id;		/* mdadm --add: DeviceID the disk had, if it was ours */
+ 	void *iobuf;		/* one sector, for mdmon's writes */
+ 	/* ... for reads and writes under amd_lock by managemon (and mdadm) */
+ 	void *mmbuf;
+@@ -3346,8 +3355,9 @@ static void amd_pd_states(struct amd_super *super)
+ 		    (state != AMD_DEV_STATE_ONLINE && state != AMD_DEV_STATE_OFFLINE))
+ 			continue;
+ 		d = amd_find_disk(super, __le64_to_cpu(pd->id.id));
++		/* added by mdadm --add, its descriptor not handed over yet: here */
+ 		want = d && !d->spare_failed && !d->removed &&
+-		       d->fd >= 0 ?
++		       (d->fd >= 0 || d->fresh) ?
+ 		       AMD_DEV_STATE_ONLINE : AMD_DEV_STATE_OFFLINE;
+ 		if (state != want) {
+ 			pd->device_state = __cpu_to_le32(want);
+@@ -4058,6 +4068,7 @@ static int update_super_amd(struct supertype *st, struct mdinfo *info,
+ static int amd_insert_ld(struct amd_super *super, unsigned int at,
+ 			 const void *rec, unsigned int size);
+ static int amd_packet_reserve(struct amd_super *super, unsigned int size);
++static int amd_add_new(struct supertype *st, int fd, char *devname);
+ static int amd_erase(int fd);
+ static int amd_in_volume(const struct amd_vol *v, __u64 id);
+ static int amd_vol_has_disk(const struct amd_vol *v, __u64 id);
+@@ -4725,6 +4736,154 @@ static int amd_pick_disk(struct supertype *st, char *subdev, int whole,
+ 	return 1;
+ }
+ 
++/*
++ * A partition table on @fd (read into @buf, a sector) other than the MBR
++ * AMD writes - one 0x82 partition, the first, from 0x3F - or a GPT: a
++ * Legacy disk has no RAIDCore label, its partitions tell it.  -1 if LBA 0
++ * cannot be read.
++ */
++static int amd_foreign_table(int fd, void *buf)
++{
++	const struct MBR *pt = buf;
++	int k, table = 0, amd = 0;
++
++	if (amd_read(fd, 0, buf, AMD_SECTOR) != 0)
++		return -1;
++	if (pt->magic == MBR_SIGNATURE_MAGIC)
++		for (k = 0; k < MBR_PARTITIONS; k++) {
++			const struct MBR_part_record *pe = &pt->parts[k];
++
++			if (pe->part_type == 0)
++				continue;
++			table = 1;
++			/* any partition after the first makes it another table */
++			amd = k == 0 && pe->part_type == AMD_MBR_TYPE &&
++			      __le32_to_cpu(pe->first_sect_lba) == AMD_MBR_START;
++		}
++	if (!table && amd_read(fd, 1, buf, AMD_SECTOR) == 0 &&
++	    ((struct GPT *)buf)->magic == GPT_SIGNATURE_MAGIC)
++		table = 1;
++	return table && !amd;
++}
++
++/*
++ * mdadm --add of a disk that is not of this configuration: Initialize zeroes
++ * its first and last 20 MiB.  What mdadm can tell holds data is refused
++ * unless --force, as Create asks before it goes on: a file system it knows
++ * on the whole disk (check_ext2, check_reiser - they say what they found),
++ * or a member of a volume of another AMD RAID configuration.  A volume of
++ * @super is no reason: its member comes back (the AMD driver dropped the PD
++ * of a disk it ran without).
++ */
++static int amd_add_holds_data(struct amd_super *super, int fd, char *subdev)
++{
++	struct amd_super *other;
++	int vol, foreign = 0;
++
++	if (check_ext2(fd, subdev) | check_reiser(fd, subdev)) {
++		cont_err("not adding %s: --force wipes it\n", subdev);
++		return 1;
++	}
++	other = amd_new_super();
++	if (amd_load_disk(other, fd, NULL, 0) == 0 && other->disks)
++		for (vol = 0; vol < other->nvol; vol++) {
++			struct amd_vol *v = &other->vol[vol];
++
++			foreign += amd_vol_has_disk(v, other->disks->device_id) &&
++				   !amd_ld_by_id(super, __le64_to_cpu(v->ld->id.id));
++		}
++	amd_free(other);
++	if (foreign)
++		pr_err("%s is a member of %d volume%s of another AMD RAID configuration: not adding it (--force wipes it)\n",
++		       subdev, foreign, foreign == 1 ? "" : "s");
++	return foreign;
++}
++
++/*
++ * mdadm --add of @subdev to the container, before Manage wipes the disk
++ * (Kill) and hands it to add_to_super_amd blank.  mdmon records the disk,
++ * so it must run.  A Legacy disk holds data: never - nor a disk we cannot
++ * read to tell.  A disk of this configuration keeps its DeviceID (a member
++ * failed on errors given back).
++ */
++static int amd_check_add(struct supertype *st, char *subdev)
++{
++	struct amd_super *super = st->sb;
++	struct amd_metadata *md = amd_alloc(AMD_SECTOR);
++	int fd = -1, i, rv = 0, table;
++
++	super->add_id = 0;
++	super->add_checked = 0;
++	if (!mdmon_running(st->container_devnm)) {
++		pr_err("%s: mdmon records a new disk, and it does not run for this container: it runs while a RAID1, RAID10, RAID5 or RAIDABLE volume of it is started\n",
++		       subdev);
++		goto out;
++	}
++	fd = open(subdev, O_RDONLY);
++	table = md && is_fd_valid(fd) ? amd_foreign_table(fd, md) : -1;
++	if (table < 0) {
++		pr_err("cannot read %s, not adding it\n", subdev);
++		goto out;
++	}
++	if (table) {
++		pr_err("%s has a partition table: it may hold data, not adding it (wipe it first)\n",
++		       subdev);
++		goto out;
++	}
++	i = -1;
++	if (amd_read(fd, AMD_METADATA_LBA, md, AMD_SECTOR) == 0 &&
++	    __le64_to_cpu(md->ident) == AMD_RC_IDENT)
++		i = amd_pd_index(super, __le64_to_cpu(md->device_id));
++	if (i >= 0) {
++		if (__le32_to_cpu(super->pd[i]->device_type) != AMD_DEV_RAIDCORE_DISK) {
++			pr_err("%s is a Legacy (non-RAID) disk of the AMD RAID configuration: it holds data, not adding it\n",
++			       subdev);
++			goto out;
++		}
++		super->add_id = __le64_to_cpu(md->device_id);
++	}
++	/*
++	 * No label, but the configuration has the disk (its DeviceID is the
++	 * hash of its serial number).  As a non-RAID one: the AMD driver for
++	 * Windows records a blank NVMe drive so, NOT_INITIALIZE with a Legacy
++	 * LD of its own (rcadm -M -id turns the PD into a RAIDCore disk and
++	 * drops that LD).  As a RAID disk: its label was wiped while its record
++	 * stayed.  Here it would get another, random, DeviceID and two records.
++	 */
++	if (!super->add_id) {
++		unsigned char sn[20];
++
++		i = amd_disk_serial(fd, sn) == 0 ?
++		    amd_pd_index(super, amd_serial_hash(sn)) : -1;
++		if (i >= 0 &&
++		    __le32_to_cpu(super->pd[i]->device_type) != AMD_DEV_RAIDCORE_DISK) {
++			pr_err("%s is a non-RAID disk of the AMD RAID configuration (not initialized or Legacy): initialize it in the BIOS RAID menu or with rcadm -M -id first\n",
++			       subdev);
++			goto out;
++		}
++		if (i >= 0) {
++			pr_err("%s has no AMD label, but the AMD RAID configuration has it as a RAID disk (was its label wiped?): it would be recorded twice, not adding it\n",
++			       subdev);
++			goto out;
++		}
++	}
++	if (!super->add_id && !st->force &&
++	    amd_add_holds_data(super, fd, subdev))
++		goto out;
++	/* a disk new to the configuration takes one more PD record */
++	if (!super->add_id && super->npd >= AMD_MAX_PD) {
++		pr_err("the AMD RAID configuration has %d device records, as many as mdadm reads: not adding %s\n",
++		       AMD_MAX_PD, subdev);
++		goto out;
++	}
++	super->add_checked = 1;
++	rv = 1;
++out:
++	close_fd(&fd);
++	free(md);
++	return rv;
++}
++
+ /* map_update() frees the entry's path before copying the new one */
+ static void amd_map_set_uuid(struct map_ent **map, struct map_ent *me,
+ 			     int uuid[4])
+@@ -4738,6 +4897,31 @@ static void amd_map_set_uuid(struct map_ent **map, struct map_ent *me,
+ 	free(path);
+ }
+ 
++/*
++ * The container UUID comes from its lowest DeviceID (AMD records no ID of
++ * the disk set, see amd_container_uuid): a disk added with a lower one
++ * changes it.  Keep the map of the running container in step and say so -
++ * an mdadm.conf that names the container by UUID needs the new one.  The
++ * map is locked: we are called from add_to_super through Manage_add(),
++ * which holds the map lock (one per process, mapfile.c) until the disk is
++ * in - taking and dropping it here would drop Manage's.
++ */
++static void amd_new_container_uuid(struct supertype *st, __u64 id,
++				   const char *name)
++{
++	struct map_ent *map = NULL, *me;
++	char buf[64];
++	int uuid[4];
++
++	amd_uuid("container", AMD_SERIAL, id, uuid);
++	me = map_by_devnm(&map, st->container_devnm);
++	if (me)
++		amd_map_set_uuid(&map, me, uuid);
++	map_free(map);
++	pr_err("%s has the lowest DeviceID now: the container UUID becomes %s (update mdadm.conf if it names the container)\n",
++	       name, amd_uuid_text(uuid, buf));
++}
++
+ /*
+  * Send the updates queued for mdmon and see that it has recorded them.  It
+  * sends no answer, and an update that no longer fits its configuration -
+@@ -4775,6 +4959,87 @@ static int amd_mdmon_recorded(struct supertype *st,
+ 	return rv;
+ }
+ 
++/* amd_mdmon_recorded of --add: disk @id has a PD record */
++static int amd_has_pd(struct amd_super *super, const void *id)
++{
++	return amd_pd_index(super, *(const __u64 *)id) >= 0;
++}
++
++/*
++ * mdadm --add, after Manage wiped the disk: initialize it as the BIOS
++ * menu does (Initialize; a new disk also Assign Global Hot Spare: label
++ * SpareInfo 0x100) and tell mdmon (ADD), which records it in
++ * the configuration and rebuilds onto it.  The descriptor is ours on
++ * success (Manage): closed here, as the disk must be free for the kernel.
++ */
++static int amd_add_new(struct supertype *st, int fd, char *devname)
++{
++	struct amd_super *super = st->sb;
++	const char *name = devname ? devname : "the disk";
++	struct amd_update_disk *u;
++	unsigned long long dsize;
++	__u32 spare = AMD_SPARE_GLOBAL;
++	struct amd_disk d;
++	struct stat stb;
++	int rv;
++
++	if (fd < 0 || !get_dev_size(fd, devname, &dsize) ||
++	    fstat(fd, &stb) != 0 || !S_ISBLK(stb.st_mode))
++		return 1;
++	memset(&d, 0, sizeof(d));
++	d.fd = fd;
++	d.sectors = dsize / AMD_SECTOR;
++	d.major = major(stb.st_rdev);
++	d.minor = minor(stb.st_rdev);
++	d.device_id = super->add_id ? super->add_id : amd_disk_id(super, fd);
++	/* a former global spare stays one (the PD keeps SpareInfo 0x100) */
++	if (super->add_id) {
++		int i = amd_pd_index(super, super->add_id);
++
++		spare = i >= 0 ? __le32_to_cpu(super->pd[i]->spare_info) &
++				 AMD_SPARE_GLOBAL : 0;
++		/* in no volume any more: a global spare (amd_add_pd) */
++		if (!amd_disk_in_volumes(super, super->add_id))
++			spare = AMD_SPARE_GLOBAL;
++	}
++	if (amd_init_disk(&d, spare, super->add_id != 0) != 0) {
++		pr_err("%s: cannot initialize the disk\n", name);
++		return 1;
++	}
++	u = xcalloc(1, sizeof(*u));
++	u->type = AMD_UPDATE_ADD;
++	u->id = d.device_id;
++	u->known = super->add_id != 0;
++	u->sectors = d.sectors;
++	u->features = amd_pd_features(fd, d.major, d.minor);
++	st->update_tail = &st->updates;
++	append_metadata_update(st, u, sizeof(*u));
++	rv = amd_mdmon_recorded(st, amd_has_pd, &d.device_id);
++	if (rv) {
++		/* not in the configuration: no label of it on the disk either */
++		amd_erase(fd);
++		if (rv > 0)
++			pr_err("%s: mdmon did not record the disk (see dmesg)\n",
++			       name);
++		return 1;
++	}
++	if (!super->add_id && d.device_id < super->container_id)
++		amd_new_container_uuid(st, d.device_id, name);
++	if (st->verbose >= 0) {
++		if (super->add_id &&
++		    !amd_disk_in_volumes(super, super->add_id))
++			pr_err("%s: dropped from its volumes, added back as an AMD global hot spare\n",
++			       name);
++		else if (super->add_id)
++			pr_err("%s: a former member, it will be rebuilt\n",
++			       name);
++		else
++			pr_err("%s: added as an AMD global hot spare\n", name);
++	}
++	close(fd);
++	return 0;
++}
++
+ /* the LD record with volume ID @id in the packet, any type; NULL if none */
+ static struct amd_ld *amd_ld_by_id(struct amd_super *super, __u64 id)
+ {
+@@ -4788,6 +5053,17 @@ static struct amd_ld *amd_ld_by_id(struct amd_super *super, __u64 id)
+ 	return NULL;
+ }
+ 
++/* the volume whose (first) LD record has ID @id, or NULL */
++static struct amd_vol *amd_vol_by_id(struct amd_super *super, __u64 id)
++{
++	int vol;
++
++	for (vol = 0; vol < super->nvol; vol++)
++		if (__le64_to_cpu(super->vol[vol].ld->id.id) == id)
++			return &super->vol[vol];
++	return NULL;
++}
++
+ /* @subdev can be a disk of the container: a whole disk, not in use */
+ static int amd_validate_disk(struct supertype *st, char *subdev,
+ 			     unsigned long long *freesize, int verbose)
+@@ -4797,11 +5073,10 @@ static int amd_validate_disk(struct supertype *st, char *subdev,
+ 	unsigned int sectsize;
+ 	int fd;
+ 
+-	/* mdadm --add to a container we read: not yet (before it is wiped) */
+-	if (super && super->packet && !super->creating) {
+-		pr_err("--add to an AMD RAID container is not supported yet\n");
++	/* mdadm --add to a container we read: checked before mdadm wipes it */
++	if (super && super->packet && !super->creating &&
++	    !amd_check_add(st, subdev))
+ 		return 0;
+-	}
+ 	fd = open(subdev, O_RDONLY | O_EXCL);
+ 	if (!is_fd_valid(fd)) {
+ 		if (verbose)
+@@ -5454,6 +5729,98 @@ static void amd_rebuild_pd(struct amd_super *super, struct amd_element *el,
+ 		el->id.handle = super->pd[i]->id.handle;
+ }
+ 
++/*
++ * Element @el, if it is disk @id's and failed on errors (0x10), becomes
++ * offline (0x30).  An element of another disk keeps its flags: in the
++ * second LD copy of a recorded rebuild the slot holds the rebuild target,
++ * which a 0x20 alone would have the AMD driver take back without a rebuild
++ * (see AMD_ELEMENT_FAILED).
++ */
++static void amd_give_back(struct amd_element *el, __u64 id)
++{
++	if (__le64_to_cpu(el->id.id) == id &&
++	    (el->flags & __cpu_to_le32(AMD_ELEMENT_FAILED)))
++		el->flags |= __cpu_to_le32(AMD_ELEMENT_MISSING);
++}
++
++/*
++ * ADD (monitor): a former member failed on errors becomes offline (0x30)
++ * and is rebuilt in its slot (amd_find_spare); a new disk gets a PD record
++ * as a global hot spare, as the BIOS menu writes one (Initialize, then
++ * Assign Global Hot Spare) - the next free Handle, SATA 0x2300 or NVMe 0x2100
++ * features, SpareInfo 0x100.  *@space: a zeroed struct amd_disk, taken if
++ * the disk needs a record.
++ */
++static void amd_add_pd(struct supertype *st, const struct amd_update_disk *u,
++		       void **space)
++{
++	struct amd_super *super = st->sb;
++	struct active_array *a;
++	struct amd_disk *d;
++	int vol, i;
++
++	if (u->known && amd_pd_index(super, u->id) >= 0) {
++		/*
++		 * Its volumes dropped it (the AMD driver, back after running
++		 * without it, zeroes its elements; rcraid.sys 9.3.3.218):
++		 * given back as rcadm gives a disk to a volume, a global
++		 * spare - rebuilt onto.
++		 */
++		if (!amd_disk_in_volumes(super, u->id)) {
++			struct amd_pd *pd = super->pd[amd_pd_index(super, u->id)];
++
++			pd->spare_info |= __cpu_to_le32(AMD_SPARE_GLOBAL);
++			dprintf("disk %016llx: in no volume, a global spare\n",
++				(unsigned long long)u->id);
++		}
++		for (vol = 0; vol < super->nvol; vol++) {
++			struct amd_vol *v = &super->vol[vol];
++
++			for (i = 0; i < v->nel; i++) {
++				if (__le64_to_cpu(v->el[i].id.id) != u->id ||
++				    !amd_slot_failed(v, i))
++					continue;
++				amd_give_back(&v->el[i], u->id);
++				if (amd_link_same_shape(v))
++					amd_give_back(&amd_link_elements(v)[i], u->id);
++				dprintf("array %d member %d given back\n", vol, i);
++			}
++		}
++		d = amd_find_disk(super, u->id);
++		if (d)
++			d->spare_failed = 0;
++	} else if (!u->known && amd_pd_index(super, u->id) < 0) {
++		/* one more record would be one amd_parse_packet does not see */
++		int handle = super->npd >= AMD_MAX_PD ? -1 :
++			   amd_new_pd(super, u->id, u->sectors, u->features,
++				      AMD_SPARE_GLOBAL);
++
++		if (handle < 0) {
++			amd_kmsg("cannot record new disk %016llx",
++				 (unsigned long long)u->id);
++			return;
++		}
++		dprintf("disk %016llx: a global spare, handle %d\n",
++			(unsigned long long)u->id, handle);
++	} else {
++		return;
++	}
++	/* the disk's record waits for it (amd_attach_disk), no configuration on it */
++	d = amd_find_disk(super, u->id);
++	if (!d) {
++		d = *space;	/* amd_prepare_update's */
++		*space = NULL;
++		d->device_id = u->id;
++		d->fd = -1;
++		d->removed = 1;
++		amd_add_disk(super, d);
++	}
++	d->fresh = 1;
++	super->config_dirty = 1;
++	for (a = st->arrays; a; a = a->next)
++		a->check_degraded = 1;
++}
++
+ /*
+  * A disk joins the running container (udev adds disks one at a time, or
+  * mdadm --add): managemon calls add_to_super.  It only reads the disk's
+@@ -5545,8 +5912,20 @@ static void amd_attach_update(struct supertype *st,
+ 			     !amd_disk_in_volumes(super, u->id)))
+ 		goto refuse;
+ 	d = amd_find_disk(super, u->id);
+-	if (u->commit_valid && u->generation <= super->generation &&
+-	    (!d || d->fd < 0)) {
++	if (d && d->fresh && d->fd < 0) {
++		d->commit_valid = 1;
++		d->generation = super->generation;
++		d->committed_checksum = __le64_to_cpu(h->checksum);
++		d->packet_lba = 0;
++		d->packet_size = 0;
++		d->packet_number = 0;
++		d->features = AMD_FEATURES;
++		d->spare_failed = 0;
++		d->last_online = super->serial;
++		d->foreign = super->foreign;
++		super->config_dirty = 1;
++	} else if (u->commit_valid && u->generation <= super->generation &&
++		   (!d || d->fd < 0)) {
+ 		if (!d) {
+ 			d = rec;
+ 			rec = NULL;
+@@ -5648,9 +6027,16 @@ static int add_to_super_amd(struct supertype *st, mdu_disk_info_t *dinfo,
+ 		super->add_slot = dinfo->raid_disk;
+ 		return 0;
+ 	}
++	/* mdadm --add (Manage, no update list): the disk checked, then wiped */
++	if (dinfo->raid_disk < 0 && !st->update_tail && super && super->packet &&
++	    !super->creating && super->add_checked) {
++		super->add_checked = 0;
++		return amd_add_new(st, fd, devname);
++	}
+ 	if (dinfo->raid_disk < 0)
+ 		return amd_attach_disk(st, fd, devname);	/* mdmon */
+-	pr_err("writing AMD RAID metadata is not supported yet\n");
++	pr_err("adding %s this way is not supported for AMD metadata: add it to the container\n",
++	       devname ? devname : "the disk");
+ 	return 1;
+ }
+ 
+@@ -5836,6 +6222,12 @@ static int amd_has_volume(struct amd_super *super, const void *id)
+ 	return amd_ld_by_id(super, *(const __u64 *)id) != NULL;
+ }
+ 
++/* ... of --kill-subarray: it is not */
++static int amd_lacks_volume(struct amd_super *super, const void *id)
++{
++	return !amd_has_volume(super, id);
++}
++
+ /*
+  * --create while mdmon runs the container: mdmon records new volume @v -
+  * or not, if a rebuild it began meanwhile took an extent of it, as onto a
+@@ -6075,7 +6467,7 @@ static int store_super_amd(struct supertype *st, int fd)
+ 	/* Kill() frees the loaded metadata before asking us to store it */
+ 	if (st->sb == NULL)
+ 		return amd_erase(fd);
+-	pr_err("storing AMD metadata on a single disk is not supported\n");
++	pr_err("storing AMD metadata on a single disk is not supported (volumes take --update-subarray)\n");
+ 	return 1;
+ }
+ 
+@@ -6658,6 +7050,126 @@ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
+ 	amd_reparse(super);
+ }
+ 
++/*
++ * Delete volume @vol as the AMD driver does (rcblob RC_DeleteLogicalDevice
++ * @0013f230: the volume's transform log cleared, its LD records - and the
++ * second copy of a transform - gone; the data is left on the disks).  The
++ * later volumes move down a place.  Written by sync_metadata.
++ */
++static void amd_remove_volume(struct amd_super *super, int vol)
++{
++	struct amd_vol *v = &super->vol[vol];
++	unsigned int at = (char *)v->ld - (char *)super->packet;
++	unsigned int size = amd_ld_size(v->ld), lat = 0, lsize = 0;
++
++	/* only where there is a service area in front of the data */
++	if (__le64_to_cpu(v->el[0].user_data.offset) >
++	    __le64_to_cpu(v->el[0].allocated.offset) &&
++	    amd_tlog_write(super, v, v->ld, 1, 0, 0) != 0)
++		dprintf("volume %d: transform log not cleared\n", vol);
++	if (v->link) {
++		lat = (char *)v->link - (char *)super->packet;
++		lsize = amd_ld_size(v->link);
++	}
++	/* the later record first: the offset of the other stays good */
++	if (v->link && lat > at)
++		amd_cut_ld(super, lat, lsize);
++	amd_cut_ld(super, at, size);
++	if (v->link && lat < at)
++		amd_cut_ld(super, lat, lsize);
++	amd_trim_packet(super);
++	amd_reparse_without(super, vol);
++	super->config_dirty = 1;
++}
++
++/*
++ * mdadm without mdmon writes the configuration it has changed, here: after
++ * kill_subarray and update_subarray the callers leave it to sync_metadata,
++ * which cannot tell them that the write failed ("these routines do not
++ * report success/failure", Kill.c) - they would report the change as made.
++ */
++static int amd_write_changed(struct amd_super *super)
++{
++	if (amd_write_config(super) != 0) {
++		pr_err("cannot write the AMD RAID configuration\n");
++		return 2;
++	}
++	super->config_dirty = 0;
++	return 0;
++}
++
++/*
++ * mdadm --kill-subarray: the volume is stopped (Kill_subarray checks).  As
++ * IMSM, not when a later volume runs: it would be renumbered under md.  A
++ * Legacy LD (a disk with data) is no subarray (amd_parse_packet).
++ */
++static int kill_subarray_amd(struct supertype *st, char *subarray_id)
++{
++	struct amd_super *super = st->sb;
++	struct amd_update_disk *u;
++	unsigned long vol;
++	char *ep, sub[16];
++	int i, rv;
++
++	vol = strtoul(subarray_id, &ep, 10);
++	if (!super || !super->packet || *ep || ep == subarray_id ||
++	    vol >= (unsigned long)super->nvol)
++		return 2;
++	for (i = vol + 1; i < super->nvol; i++) {
++		snprintf(sub, sizeof(sub), "%d", i);
++		if (is_subarray_active(sub, st->devnm)) {
++			pr_err("deleting subarray-%lu would renumber active subarray-%d, aborting\n",
++			       vol, i);
++			return 2;
++		}
++	}
++	if (st->update_tail) {
++		__u64 id = __le64_to_cpu(super->vol[vol].ld->id.id);
++
++		u = xcalloc(1, sizeof(*u));
++		u->type = AMD_UPDATE_KILL;
++		u->major = vol;
++		u->id = id;
++		append_metadata_update(st, u, sizeof(*u));
++		/* sent here: Kill_subarray would not know how it went */
++		rv = amd_mdmon_recorded(st, amd_lacks_volume, &id);
++		if (rv > 0)
++			pr_err("mdmon did not delete subarray-%lu (see dmesg)\n",
++			       vol);
++		return rv != 0;
++	}
++	/* no mdmon: this process writes it */
++	amd_remove_volume(super, vol);
++	return amd_write_changed(super);
++}
++
++/*
++ * KILL (monitor): the volume mdadm --kill-subarray named, if not running.
++ * mdadm has checked both already; a refusal here (a volume started or the
++ * packet changed in between) goes to the log, and mdadm finds the volume
++ * still on the disks (amd_mdmon_recorded).
++ */
++static void amd_kill_volume(struct supertype *st, const struct amd_update_disk *u)
++{
++	struct amd_super *super = st->sb;
++	struct active_array *a;
++
++	if (u->major < 0 || u->major >= super->nvol ||
++	    __le64_to_cpu(super->vol[u->major].ld->id.id) != u->id) {
++		amd_kmsg("cannot delete subarray-%d: the volume changed meanwhile",
++			 u->major);
++		return;
++	}
++	for (a = st->arrays; a; a = a->next)
++		if (a->info.container_member >= u->major) {
++			amd_kmsg("cannot delete subarray-%d: subarray-%d is running",
++				 u->major, a->info.container_member);
++			return;
++		}
++	amd_remove_volume(super, u->major);
++	dprintf("volume %d deleted\n", u->major);
++}
++
+ /* the volume number of member array @devnm (its metadata_version: "/md127/1"), or -1 */
+ static int amd_devnm_volume(struct amd_super *super, char *devnm)
+ {
+@@ -6702,6 +7214,120 @@ static int amd_rebuilt_into(struct amd_super *super, const struct amd_disk *d)
+ 	return vol;
+ }
+ 
++/*
++ * mdadm --update-subarray: the AMD driver's cache policy of a volume (LD
++ * Cache: read-ahead, write back - what the menu and RAIDXpert2 set, used by
++ * the Windows driver; md has no such cache) or its name (DevicePrivate).
++ */
++struct amd_update_subarray {
++	int type;
++	int vol;
++	__u64 id;
++	__u32 cache_set, cache_clear;
++	int rename;
++	char name[32];
++};
++
++static int amd_apply_subarray(struct amd_super *super,
++			      const struct amd_update_subarray *u)
++{
++	struct amd_ld *ld[2];
++	int i;
++
++	if (u->vol < 0 || u->vol >= super->nvol ||
++	    __le64_to_cpu(super->vol[u->vol].ld->id.id) != u->id)
++		return 1;
++	ld[0] = super->vol[u->vol].ld;
++	ld[1] = super->vol[u->vol].link;	/* the copy a transform keeps */
++	for (i = 0; i < 2; i++) {
++		if (!ld[i])
++			continue;
++		ld[i]->cache = __cpu_to_le32((__le32_to_cpu(ld[i]->cache) &
++					      ~u->cache_clear) | u->cache_set);
++		if (u->rename) {
++			memset(ld[i]->name, 0, sizeof(ld[i]->name));
++			memcpy(ld[i]->name, u->name, sizeof(ld[i]->name) - 1);
++		}
++	}
++	super->config_dirty = 1;
++	return 0;
++}
++
++/* amd_mdmon_recorded of --update-subarray: the volume is as @u makes it */
++static int amd_subarray_recorded(struct amd_super *super, const void *arg)
++{
++	const struct amd_update_subarray *u = arg;
++	const struct amd_vol *v = amd_vol_by_id(super, u->id);
++	__u32 cache;
++
++	if (!v)
++		return 0;
++	cache = __le32_to_cpu(v->ld->cache);
++	return (cache & u->cache_set) == u->cache_set &&
++	       !(cache & u->cache_clear) &&
++	       (!u->rename ||
++		memcmp(v->ld->name, u->name, sizeof(v->ld->name)) == 0);
++}
++
++static int update_subarray_amd(struct supertype *st, char *subarray,
++			       enum update_opt update, struct mddev_ident *ident)
++{
++	struct amd_super *super = st->sb;
++	struct amd_update_subarray u;
++	unsigned long vol;
++	char *ep;
++
++	vol = strtoul(subarray, &ep, 10);
++	if (!super || !super->packet || *ep || ep == subarray ||
++	    vol >= (unsigned long)super->nvol)
++		return 2;
++	memset(&u, 0, sizeof(u));
++	u.type = AMD_UPDATE_SUBARRAY;
++	u.vol = vol;
++	u.id = __le64_to_cpu(super->vol[vol].ld->id.id);
++	switch (update) {
++	case UOPT_READ_CACHE:
++		u.cache_set = AMD_CACHE_READ;
++		break;
++	case UOPT_NO_READ_CACHE:
++		u.cache_clear = AMD_CACHE_READ;
++		break;
++	case UOPT_WRITE_BACK:
++		u.cache_set = AMD_CACHE_WRITE_BACK;
++		break;
++	case UOPT_NO_WRITE_BACK:
++		u.cache_clear = AMD_CACHE_WRITE_BACK;
++		break;
++	case UOPT_NAME:
++		if (!ident || !amd_name_ok(super, ident->name, vol))
++			return 2;
++		u.rename = 1;
++		memcpy(u.name, ident->name, strlen(ident->name) + 1);
++		break;
++	default:
++		pr_err("--update=%s is not supported for an AMD RAID volume\n",
++		       map_num_s(update_options, update));
++		return 2;
++	}
++	if (st->update_tail) {
++		struct amd_update_subarray *m = xmalloc(sizeof(*m));
++		int rv;
++
++		*m = u;
++		append_metadata_update(st, m, sizeof(*m));
++		/* sent here: Update_subarray would not know how it went */
++		rv = amd_mdmon_recorded(st, amd_subarray_recorded, &u);
++		if (rv > 0)
++			pr_err("mdmon did not update subarray-%lu (see dmesg)\n",
++			       vol);
++		return rv != 0 ? 2 : 0;
++	}
++	/* no mdmon: this process writes it */
++	if (amd_apply_subarray(super, &u))
++		return 2;
++	return amd_write_changed(super);
++}
++
+ /* Cut @size bytes at offset @at out of the LD section of the packet. */
+ static void amd_cut_ld(struct amd_super *super, unsigned int at,
+ 		       unsigned int size)
+@@ -6908,6 +7534,7 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
+ static void amd_flush_config(struct supertype *st)
+ {
+ 	struct amd_super *super = st->sb;
++	struct amd_disk *d;
+ 
+ 	if (!super->config_dirty)
+ 		return;
+@@ -6916,6 +7543,15 @@ static void amd_flush_config(struct supertype *st)
+ 		return;
+ 	}
+ 	super->config_dirty = 0;
++	/* a disk mdadm --add initialized has its first one: a spare */
++	for (d = super->disks; d; d = d->next)
++		if (d->fresh && d->update) {
++			struct active_array *a;
++
++			d->fresh = 0;
++			for (a = st->arrays; a; a = a->next)
++				a->check_degraded = 1;
++		}
+ }
+ 
+ /*
+@@ -7156,7 +7792,10 @@ static const unsigned int amd_update_size[] = {
+ 	[AMD_UPDATE_SPARE]	= sizeof(struct amd_update_spare),
+ 	[AMD_UPDATE_CREATE]	= sizeof(struct amd_update_create),
+ 	[AMD_UPDATE_REMOVE]	= sizeof(struct amd_update_disk),
++	[AMD_UPDATE_ADD]	= sizeof(struct amd_update_disk),
+ 	[AMD_UPDATE_ATTACH]	= sizeof(struct amd_update_attach),
++	[AMD_UPDATE_KILL]	= sizeof(struct amd_update_disk),
++	[AMD_UPDATE_SUBARRAY]	= sizeof(struct amd_update_subarray),
+ };
+ 
+ /*
+@@ -7180,7 +7819,10 @@ static int amd_update_type(const struct metadata_update *update)
+ 	return type;
+ }
+ 
+-/* The updates mdadm sends (--create); mdmon makes the others itself. */
++/*
++ * The updates mdadm sends (--create, --add, --kill-subarray,
++ * --update-subarray); mdmon makes the others itself.
++ */
+ static int amd_prepare_update(struct supertype *st,
+ 			      struct metadata_update *update)
+ {
+@@ -7191,6 +7833,13 @@ static int amd_prepare_update(struct supertype *st,
+ 		/* the monitor allocates nothing (amd_mm_room): zeroes to clear with */
+ 		update->space = amd_alloc(AMD_SERVICE_BYTES);
+ 		break;
++	case AMD_UPDATE_ADD:
++		/* ... a record for a disk new to the container */
++		update->space = xcalloc(1, sizeof(struct amd_disk));
++		break;
++	case AMD_UPDATE_KILL:
++	case AMD_UPDATE_SUBARRAY:
++		break;
+ 	default:
+ 		return 0;
+ 	}
+@@ -7380,9 +8029,19 @@ static void amd_process_update(struct supertype *st,
+ 	case AMD_UPDATE_REMOVE:
+ 		amd_remove_disk(super, buf);
+ 		break;
++	case AMD_UPDATE_ADD:
++		amd_add_pd(st, buf, &update->space);
++		break;
+ 	case AMD_UPDATE_ATTACH:
+ 		amd_attach_update(st, buf);
+ 		break;
++	case AMD_UPDATE_KILL:
++		amd_kill_volume(st, buf);
++		break;
++	case AMD_UPDATE_SUBARRAY:
++		if (amd_apply_subarray(super, buf))
++			amd_kmsg("cannot update the volume: it changed meanwhile");
++		break;
+ 		for (a = st->arrays; a; a = a->next)
+ 			a->check_degraded = 1;
+ 		break;
+@@ -8072,6 +8731,8 @@ struct superswitch super_amd = {
+ 	.write_init_super = write_init_super_amd,
+ 	.add_to_super	= add_to_super_amd,
+ 	.remove_from_super	= remove_from_super_amd,
++	.kill_subarray	= kill_subarray_amd,
++	.update_subarray = update_subarray_amd,
+ 	.load_container	= load_container_amd,
+ 	.match_home	= match_home_amd,
+ 	.uuid_from_super = uuid_from_super_amd,
+-- 
+2.47.3
+

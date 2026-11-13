@@ -1,0 +1,77 @@
+From 7b7a118a8747083c213f8060009eaf4e4ee76056 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:08 +0500
+Subject: [PATCH 12/32] mdadm: pass --force to metadata handlers for --create
+ and --add
+
+A metadata handler may refuse a disk it could use, e.g. one behind a
+controller the platform's firmware does not see (it would then be missing
+from the array there), and let the user take it anyway with --force.
+
+Add supertype.force and set it from --force for --create (before
+validate_geometry(), also when the member array is created in a container
+named without devices) and for --add to an external container.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Create.c | 8 ++++++++
+ Manage.c | 1 +
+ mdadm.h  | 4 ++++
+ 3 files changed, 13 insertions(+)
+
+diff --git a/Create.c b/Create.c
+index 6bcdcccd..b20d1fe1 100644
+--- a/Create.c
++++ b/Create.c
+@@ -677,6 +677,13 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
+ 			return 1;
+ 
+ 	newsize = s->size * 2;
++	/*
++	 * --force for the metadata handler: set here for the metadata given,
++	 * also for a member array of a container, where no devices are
++	 * walked below; metadata from mdadm.conf gets it in that walk.
++	 */
++	if (st)
++		st->force = c->force;
+ 	if (st && ! st->ss->validate_geometry(st, s->level, s->layout, s->raiddisks,
+ 					      &s->chunk, s->size*2,
+ 					      s->data_offset, NULL,
+@@ -811,6 +818,7 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
+ 		} else {
+ 			if (do_default_layout)
+ 				s->layout = default_layout(st, s->level, 0);
++			st->force = c->force;
+ 			if (!st->ss->validate_geometry(st, s->level, s->layout,
+ 						       s->raiddisks,
+ 						       &s->chunk, s->size*2,
+diff --git a/Manage.c b/Manage.c
+index 55a1ecc2..f5df90b1 100644
+--- a/Manage.c
++++ b/Manage.c
+@@ -1073,6 +1073,7 @@ int Manage_add(int fd, int tfd, struct mddev_dev *dv,
+ 	if (dv->failfast == FlagSet)
+ 		disc.state |= (1 << MD_DISK_FAILFAST);
+ 	if (tst->ss->external) {
++		tst->force = force;
+ 		if (manage_add_external(tst, fd, dv->devname, &disc) != MDADM_STATUS_SUCCESS)
+ 			goto unlock;
+ 	} else {
+diff --git a/mdadm.h b/mdadm.h
+index da05c8bd..ae162729 100644
+--- a/mdadm.h
++++ b/mdadm.h
+@@ -1302,6 +1302,10 @@ struct supertype {
+ 				 Used when examining metadata to display content of disk
+ 				 when user has no hw/firmare compatible system.
+ 			      */
++	int force;	/* --force with --create or --add: a metadata
++			 * handler may take a disk it would refuse, e.g. one
++			 * its platform's firmware does not see.
++			 */
+ 	struct metadata_update *updates;
+ 	struct metadata_update **update_tail;
+ 
+-- 
+2.47.3
+

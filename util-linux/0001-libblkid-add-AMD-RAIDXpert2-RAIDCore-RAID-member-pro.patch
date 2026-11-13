@@ -1,0 +1,247 @@
+From f8aa219b60bc87b260156eea7c8468a18861b917 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 17:39:51 +0500
+Subject: [PATCH] libblkid: add AMD RAIDXpert2 (RAIDCore) RAID member prober
+
+AMD RAIDXpert2 is the RAID of AMD chipsets (X399, X570, X670, X870...).
+Its BIOS and drivers write a label at LBA 0x5000 of every disk they
+initialize: "RAIDCore" at offset 8, a version (0x30000), the location
+of the configuration ring, and a 64-bit checksum over the rest of the
+sector.  Without a prober these disks look like disks with an MBR and
+one partition of type 0x82, so nothing warns before they are reused.
+
+Report them as amd_raid_member when the version and the checksum match.
+
+The test image is the first 12 MiB of a member of a RAID10 created by
+the BIOS of an ASUS X399 board, rebuilt from a public CC0 dump
+(https://github.com/PlaidPiper/x399-raidcore-fixtures); no volume data
+is included.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ libblkid/meson.build                     |   1 +
+ libblkid/src/Makemodule.am               |   1 +
+ libblkid/src/superblocks/amd_raid.c      | 102 +++++++++++++++++++++++
+ libblkid/src/superblocks/superblocks.c   |   1 +
+ libblkid/src/superblocks/superblocks.h   |   1 +
+ tests/expected/blkid/low-probe-amd-raid  |   3 +
+ tests/ts/blkid/images-fs/amd-raid.img.xz | Bin 0 -> 3152 bytes
+ 7 files changed, 109 insertions(+)
+ create mode 100644 libblkid/src/superblocks/amd_raid.c
+ create mode 100644 tests/expected/blkid/low-probe-amd-raid
+ create mode 100644 tests/ts/blkid/images-fs/amd-raid.img.xz
+
+diff --git a/libblkid/meson.build b/libblkid/meson.build
+index 621ec921e..68015aa14 100644
+--- a/libblkid/meson.build
++++ b/libblkid/meson.build
+@@ -57,6 +57,7 @@ lib_blkid_sources = '''
+   src/partitions/unixware.c
+ 
+   src/superblocks/adaptec_raid.c
++  src/superblocks/amd_raid.c
+   src/superblocks/apfs.c
+   src/superblocks/bcache.c
+   src/superblocks/befs.c
+diff --git a/libblkid/src/Makemodule.am b/libblkid/src/Makemodule.am
+index 9b8c4c59b..2984154f7 100644
+--- a/libblkid/src/Makemodule.am
++++ b/libblkid/src/Makemodule.am
+@@ -44,6 +44,7 @@ libblkid_la_SOURCES = \
+ 	libblkid/src/partitions/unixware.c \
+ 	\
+ 	libblkid/src/superblocks/adaptec_raid.c \
++	libblkid/src/superblocks/amd_raid.c \
+ 	libblkid/src/superblocks/apfs.c \
+ 	libblkid/src/superblocks/bcache.c \
+ 	libblkid/src/superblocks/befs.c \
+diff --git a/libblkid/src/superblocks/amd_raid.c b/libblkid/src/superblocks/amd_raid.c
+new file mode 100644
+index 000000000..597ef40e8
+--- /dev/null
++++ b/libblkid/src/superblocks/amd_raid.c
+@@ -0,0 +1,102 @@
++/*
++ * SPDX-License-Identifier: LGPL-2.1-or-later
++ *
++ * Copyright (C) 2026 exeroom536 <352890649+exeroom536@users.noreply.github.com>
++ *
++ * AMD RAIDXpert2 ("RAIDCore") is the RAID of AMD chipsets: the BIOS and the
++ * AMD drivers keep a label on every disk they initialized, at LBA 0x5000
++ * (512-byte sectors), followed by the commit block and the configuration
++ * ring up to LBA 0x6000.  mdadm assembles these arrays (metadata=amd).
++ */
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <string.h>
++#include <stdint.h>
++
++#include "superblocks.h"
++
++#define AMD_LABEL_OFFSET	(0x5000ULL * 0x200)
++#define AMD_AREA_END		(0x6000ULL * 0x200)
++#define AMD_VERSION		0x30000
++
++struct amd_label {
++	uint64_t	checksum;	/* over bytes 0x08..0x1ff */
++	uint8_t		ident[8];	/* "RAIDCore" */
++	uint64_t	device_id;
++	uint64_t	commit_offset;	/* LBA of the commit block */
++	uint64_t	ring_offset;	/* LBA of the configuration ring */
++	uint32_t	ring_size;	/* sectors */
++	uint32_t	version;
++	uint8_t		reserved[0x200 - 0x30];
++} __attribute__((packed));
++
++/*
++ * XOR of the little-endian 64-bit words, each with two of its 16-bit lanes
++ * swapped first: the lanes given by the low two bits of the word and of the
++ * sum so far, or, when those are the same, by the word's index.
++ */
++static uint64_t amd_checksum(const unsigned char *buf, size_t len)
++{
++	uint64_t sum = 0;
++	size_t i;
++
++	for (i = 0; i < len / 8; i++) {
++		uint64_t w, la, lb;
++		unsigned int a, b;
++
++		memcpy(&w, buf + i * 8, sizeof(w));
++		w = le64_to_cpu(w);
++		a = w & 3;
++		b = sum & 3;
++		if (a == b) {
++			a = i & 3;
++			b = (i + 1) & 3;
++		}
++		la = (w >> (16 * a)) & 0xffff;
++		lb = (w >> (16 * b)) & 0xffff;
++		w &= ~((0xffffULL << (16 * a)) | (0xffffULL << (16 * b)));
++		w |= (lb << (16 * a)) | (la << (16 * b));
++		sum ^= w;
++	}
++	return sum;
++}
++
++static int probe_amdraid(blkid_probe pr, const struct blkid_idmag *mag)
++{
++	const struct amd_label *lb;
++	uint32_t version;
++
++	if (!S_ISREG(pr->mode) && !blkid_probe_is_wholedisk(pr))
++		return 1;
++
++	lb = blkid_probe_get_sb(pr, mag, struct amd_label);
++	if (!lb)
++		return errno ? -errno : 1;
++
++	version = le32_to_cpu(lb->version);
++	if (version != AMD_VERSION)
++		return 1;
++	if (!blkid_probe_verify_csum(pr,
++			amd_checksum((const unsigned char *) lb + 8,
++				     sizeof(*lb) - 8),
++			le64_to_cpu(lb->checksum)))
++		return 1;
++
++	if (blkid_probe_sprintf_version(pr, "%u.%u",
++			version >> 16, version & 0xffff) != 0)
++		return 1;
++	return 0;
++}
++
++const struct blkid_idinfo amdraid_idinfo = {
++	.name		= "amd_raid_member",
++	.usage		= BLKID_USAGE_RAID,
++	.minsz		= AMD_AREA_END,
++	.probefunc	= probe_amdraid,
++	.magics		= {
++		{ .magic = "RAIDCore", .len = 8,
++		  .kboff = AMD_LABEL_OFFSET >> 10, .sboff = 8 },
++		{ NULL }
++	}
++};
+diff --git a/libblkid/src/superblocks/superblocks.c b/libblkid/src/superblocks/superblocks.c
+index 2dd4dfdaf..288ae4798 100644
+--- a/libblkid/src/superblocks/superblocks.c
++++ b/libblkid/src/superblocks/superblocks.c
+@@ -110,6 +110,7 @@ static const struct blkid_idinfo *idinfos[] =
+ 	&highpoint37x_idinfo,
+ 	&adraid_idinfo,
+ 	&jmraid_idinfo,
++	&amdraid_idinfo,
+ 
+ 	&bcache_idinfo,
+ 	&bcachefs_idinfo,
+diff --git a/libblkid/src/superblocks/superblocks.h b/libblkid/src/superblocks/superblocks.h
+index 7dd863f80..3cf72a9b9 100644
+--- a/libblkid/src/superblocks/superblocks.h
++++ b/libblkid/src/superblocks/superblocks.h
+@@ -27,6 +27,7 @@ extern const struct blkid_idinfo swsuspend_idinfo;
+ extern const struct blkid_idinfo adraid_idinfo;
+ extern const struct blkid_idinfo ddfraid_idinfo;
+ extern const struct blkid_idinfo iswraid_idinfo;
++extern const struct blkid_idinfo amdraid_idinfo;
+ extern const struct blkid_idinfo jmraid_idinfo;
+ extern const struct blkid_idinfo lsiraid_idinfo;
+ extern const struct blkid_idinfo nvraid_idinfo;
+diff --git a/tests/expected/blkid/low-probe-amd-raid b/tests/expected/blkid/low-probe-amd-raid
+new file mode 100644
+index 000000000..9ef785c13
+--- /dev/null
++++ b/tests/expected/blkid/low-probe-amd-raid
+@@ -0,0 +1,3 @@
++ID_FS_TYPE=amd_raid_member
++ID_FS_USAGE=raid
++ID_FS_VERSION=3.0
+diff --git a/tests/ts/blkid/images-fs/amd-raid.img.xz b/tests/ts/blkid/images-fs/amd-raid.img.xz
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa405cb3a65dae723805af5ba98b240eac430472
+GIT binary patch
+literal 3152
+zcmeI#cT>{|8VB$nk>b+JDp`;=AOT!M6A)2UR4@xcLjVa2Mrs6U!9b))5hG>7hR|1m
+z05ORm%F;t9qChZ9lNLcQ7^Mq@CPS#Xdkfy(+&||lcxFEHeV+L~`&O|Yo&X>|%dNKu
+z0XkyG002-N^ym|bl*B^30U&%|B%(Hn9Bi*1iL~}XFtZJ2sgI<#1=E@jMvS}9oE3Ad
+zN#JB;z>TSL6N&UGqOKB>j{<i`WqiR48*>w7gF7a1F#j(LUdUSU@vY0U&(U(B_6swe
+z(P>TjH>w)ppMx~QcOBCdL+pCf&U*o*ch1%N2Dw<Rb0odb5hV;=^pZg@VJNRKBf*Hg
+z4vE_Or9-k1UbsJAJ(i`=bsQ<&BwLzF(EbvHzm9-A$PST}Dqq~vU=7qjz+R|F3xO^k
+z?F-RWsOg#CB@S=*e0Z_9>v96uulc*S-8K(-PH5==lTA{uQOKtTo7Jv1D7sR?)-lj7
+zOGRF!m?OmALkVU2MR^AH3Ke_tle>>ipza+c!bVDRN5Fr1bn8{ftOrG;D0Tu^x{GA&
+zx4(=xRiiXznuh)V7<?Z;Lg9Sv53ujZ>kqK+T<{-Y{}$MR!~l@hY!(RH%?qA8N8T|6
+zO0E(74M4o0pvIYWm9ki(T4^`v>I54<!s9}f*rTrtbC@fXr?AGt&36r!nVaceVHzB$
+z(t`iS+SGnl@*pcW$h7#h58Ssh9~!G3Xgp?{$i}1W2ed~Ip&M?k)U{=QaOd>3P0VM!
+zC^#vCE<XOBpZ`!l`)Lp<|5%|)!Eo!I<lpTz-3cn&5k}ZEBX|6+!%fR{98+f+tKB~>
+zOa7U&$YveQMyh6$%+L~CT~@c+a!>)y<Evd{vQ_2$<sy7Xuy`C@?Gc^BXEUl2dMBDm
+zk=GuokK5NU>%cMS{t%5tWk}P@lPwg5_g*DYK7!(68DCKUD<j90B#RC6B>^nUKDZD=
+zJVww(N&iuPR%WB=wVUmcX3UW0RAeIQi|nkPNf@Coq)UT`hQ@r;(oR05N{WviuiK5b
+zka`C3v*a@iM!=JNmi)=SPE|<5pV82Z%bQnUm^wdia@}BRD%E!#=t1NQFi+hT>EzRP
+z9ryI20@|kA*Sdgc`MI7!@Hahc*)`Wg&yBCArt8<SJa)F5ov>89(Dk<&2f0hNTSq#g
+z!YS`=H>{;IY*rXIh7#d{+o@z;e#|Po$m-#xarFn~6`kx#|EPZXwvVL+-uO3pFEPnB
+zP~yBBE=Pk~e>ng_)`!R0E8h{cLbdGTRE>T`OQz4k>U{vkOWL*UQy<qYuJOQ~4L8gI
+zh<<d8!_5{dPx0C6(M&wS^}IfQOEpFPx9BwP!Pi$f{R&4=evX>wo{IdU5q6Qo9f`Sy
+z=hPNp^vFl&P%lrGL$LRU?J0d@s`?`eZJi_UK<m#}>#BTd@p?{)Rx_{aEfI)nTqzyv
+zdA6vh#Q6bo9NYz$mbqy_)3Fu%0D}|_>F`tMzW7#-dM9hm5W`yMaaN%T4$l9mW@m;`
+z9aXQ$v|JR(^MHQM32v)&w0jtkpaL1M|7g2Wl*DxQ9Ue5$PqNsVP=7Fa=-%PTyG4TL
+zgSGoo=|sJrzozHU2!3_0=s_L+Sx54KiPf%|l1kS(4&{%eVV#&dUK_P6wvmll*2fA0
+z_^JF)Z%%h@Q}Q|((wZ%}?Q{4`1;d)%PQe6+3#V)twc%fPN+R5lw_S<oGMC>rM#jVg
+z0vNe023~X7nrj3vwEDx{6mg2y=<vj3)y4#S)5WS9OuZnb?U*8i1KBom=5AukK{HB}
+z_j#f-K83CM8ZK=KaQrS=i^CwEK!_bjd6cQgQll|DE^<^Fj&#vhn019dU6NT&ZY*gx
+z&1(O;(=${}D1MJnLwi?+?q;A*w?p_Y>I6_}-E|4|vefv@m29rYvf4Ag_L?|(usp4Y
+zW^=Uei8hf}EL6T?+`ryQQ8@-XK*CJqLx{>XhB5a_{Uk^7S>9CVP5gqgTWMSfflb(B
+zi+g%E+2vU4YEA^R=HyDGEp8{4C9Q&p^y(JzGV?f0FfDT1G=?X#+^P}AH&Idr$E}~v
+zcld$F<aI8z+GWWtMG4p5h68L_Rg4>*c8BS}h%(baM@(>-e2?oghaL7UV|CkR+CMD}
+z*Lkbx5d`c$QEB#@%IRhd8ymNR@fIir@t#mRIGe6&G~e0qpPk0u<GJ<mholf)hK1*G
+zpZ<;<|JIM6n!5z@dnHGOeI`XD$I*ix-!ib6+SFzHtZ56~i;Yued%fW5qc`q`(m%gF
+zh|y_yW=`^bc;6G@n~j5cb%oYu&y~I%kP;VACTah9r-qr0{*okK2}lBDLq6Ob0FaLo
+hi4G+`d4O0II4LPfasXDKThoQv1^w%90K`$A{{+t!DNz6b
+
+literal 0
+HcmV?d00001
+
+
+base-commit: 985ceb86ade23fb7d4d6f00f5b93e882aad9a159
+-- 
+2.47.3
+

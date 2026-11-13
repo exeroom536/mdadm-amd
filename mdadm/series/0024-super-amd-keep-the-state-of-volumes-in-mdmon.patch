@@ -1,0 +1,2147 @@
+From 51b409643942fade418b4b98b83b1dbe985c5d0a Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:54 +0500
+Subject: [PATCH 24/32] super-amd: keep the state of volumes in mdmon
+
+RAID1, RAID10 and RAID5 volumes (they have an AMD write-intent bitmap)
+and RAIDABLE ones (it has none) now run read-write: mdmon keeps their
+state the way the AMD driver does.
+
+- dirty/clean in the write-intent bitmap on element [0][0]: the whole
+  volume is marked while md has it active, so that the AMD driver checks
+  it after a crash under Linux; after a crash under either, md resyncs
+  from the first bit set;
+- a member md fails is recorded as failed (element flags 0x10), a member
+  missing when the volume goes into use, or when an mdmon takes the
+  running volume over, as offline (0x30), and the volume CRITICAL, in a
+  new configuration: the packet goes to the next slot of the ring of
+  every up-to-date disk, then the commit blocks with the
+  generation bumped; disks that are missing or failing are left alone
+  and stay stale, and so does a member out of date (its generation
+  keeps it out of the volume), while a disk that is here and holds no
+  part of a volume in use - free, a spare, a member failed out - gets
+  every configuration, and the live one when it is behind, as the AMD
+  driver writes its configuration to every disk it finds
+  (RC_WriteAllConfigData);
+- the initialization (CREATE_REDUNDANCY) of a volume made in the BIOS:
+  md resyncs it, its progress goes to the AMD transform log - a reboot,
+  into Linux or the AMD driver, goes on from there - and its end into
+  the configuration;
+- a disk that joins the running container (udev adds them one at a
+  time) or leaves it is taken in or dropped by the monitor.
+
+A volume with another transform under way (a rebuild, a migration)
+stays read-only.  mdmon's two threads share the metadata: one of them
+at a time works on it.
+
+Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
+---
+ super-amd.c | 1889 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 1875 insertions(+), 14 deletions(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index 394240db..97d5d5c0 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -6,8 +6,10 @@
+  * interoperability from metadata found on our own disks and firmware.
+  *
+  * What is supported: --examine, --detail and assembly of every volume the
+- * AMD RAID BIOS or driver made; Volume (linear) and RAID0 read-write, the
+- * other levels read-only.
++ * AMD RAID BIOS or driver made; Volume (linear) and RAID0 read-write,
++ * RAID1/RAID10/RAID5 managed by mdmon (clean/dirty in the AMD bitmap,
++ * member failures and missing members, initialization - which goes on
++ * after a reboot from where md stopped).
+  *
+  * On-disk layout, little-endian, 512-byte sectors:
+  *   LBA 0x5000         RC_MetaData: per-disk label, "RAIDCore", DeviceId
+@@ -68,6 +70,7 @@
+ #define AMD_DEV_LEGACY		0x1203
+ 
+ #define AMD_DEV_STATE_ONLINE	0x3000
++#define AMD_DEV_STATE_OFFLINE	0x3001
+ 
+ /* RC_LogicalDeviceTypes */
+ #define AMD_LDT_RAID50		0x1bf5	/* RAID5 when FirstCount == 1 */
+@@ -80,12 +83,20 @@
+ 
+ #define AMD_LD_STATE_NORMAL	0x200
+ #define AMD_LD_STATE_CRITICAL	0x201
++#define AMD_LD_STATE_OFFLINE	0x202
+ #define AMD_LD_STATE_LOCKED	0x204	/* a member behind an ATA password (rcraid.sys 9.3.3.291) */
+ 
++/* Attribute bits */
++#define AMD_ATTR_BITMAP		0x1	/* the volume keeps a write-intent bitmap */
++
+ /* RC_LogicalDevice.Cache: the AMD driver's cache (RAIDCoreDxe FUN_0001d234, FUN_000158d4) */
+ #define AMD_CACHE_READ		0x80000000	/* menu "Read Cache": read-ahead */
+ #define AMD_CACHE_WRITE_BACK	0x40000000	/* menu "Write Back Cache" */
+ 
++/* write-intent bitmap: one sector, on element [0][0] */
++#define AMD_BITMAP_OFFSET	0x80	/* from AllocatedSpace.SectorOffset */
++#define AMD_BITMAP_BYTES	512
++
+ /*
+  * Element flags for a member out of service, as the AMD driver records them
+  * (rcblob): a member it fails on I/O errors gets 0x10
+@@ -100,6 +111,8 @@
+  */
+ #define AMD_ELEMENT_FAILED	0x10
+ #define AMD_ELEMENT_OFFLINE	0x30
++#define AMD_TRANSFORM_CREATE_REDUNDANCY	0x5355	/* initialization of a new volume */
++#define AMD_TRANSFORM_RESTORE_SEGMENTS	0x5358	/* rebuild onto a spare */
+ #define AMD_TRANSFORM_COMPLETED	0xa1a6
+ 
+ /* SpareInfo of a PD: a global hot spare */
+@@ -258,8 +271,35 @@ _Static_assert(sizeof(struct amd_commit) == AMD_SECTOR, "RC_ConfigCommit");
+ _Static_assert(sizeof(struct amd_packet_header) == AMD_SECTOR, "RC_ConfigPacketHeader");
+ _Static_assert(sizeof(struct amd_pd) == 0x80, "RC_PhysicalDeviceOnDisk");
+ _Static_assert(sizeof(struct amd_ld) == 0x200, "RC_LogicalDevice");
++/*
++ * Transform log of a volume (RC_TransformLogStruct_LE): one sector at
++ * AllocatedSpace + 0 of each element of stripe column 0 of the LD being
++ * transformed into.  The AMD driver resumes a transform from it.
++ */
++struct amd_tlog {
++	__u64 checksum;		/* over 0x08..0x67, Reserved fields as 0 */
++	struct amd_dev_id id;	/* the volume */
++	__u32 type;
++	__u64 protect_start;	/* volume sectors below this are done */
++	__u64 io_start;
++	__u32 io_size;
++	__u32 flags;
++	__u32 protect_size;
++	__u32 current_stripe;
++	__u32 dynamic_protect_stripe;
++	__u32 log_update_stripe;
++	__u32 status;
++	struct amd_dev_id copy_to;
++	__u64 copy_start;
++	__u64 copy_size;
++} __attribute__((packed));
++
++#define AMD_TLOG_STARTED	1
++#define AMD_TFLAGS_RESTORE	0x241	/* TransformFlags of RESTORE_SEGMENTS */
++#define AMD_TFLAGS_CREATE	0x211	/* of CREATE_REDUNDANCY (menu, mdadm -C) */
+ 
+ _Static_assert(sizeof(struct amd_element) == 0x40, "RC_LogicalElement_LE");
++_Static_assert(sizeof(struct amd_tlog) == 0x68, "RC_TransformLogStruct_LE");
+ 
+ /* A disk we have read */
+ /*
+@@ -286,7 +326,11 @@ struct amd_disk {
+ 	__u32 packet_lba;	/* where this disk's live packet is */
+ 	__u32 packet_size;
+ 	int fd;			/* open for writing (container only), or -1 */
++	int update;		/* amd_write_config: gets the new packet */
++	__u32 new_lba;
+ 	/* md failed it (a member, or a rebuild onto it): not again until back */
++	int spare_failed;
++	int write_failed;	/* a configuration write to it failed: stale until back */
+ 	int removed;		/* taken out of the container (mdmon): gone, as missing */
+ 	__u64 last_online;	/* LastOnlineSerialNumber of its commit block */
+ 	int foreign;		/* ... not AMD_SERIAL: last online on another controller */
+@@ -312,6 +356,7 @@ struct amd_disk {
+ #define AMD_MBR_TYPE	0x82
+ #define AMD_MBR_START	0x3f	/* its first sector */
+ #define AMD_UPDATE_REMOVE	3
++#define AMD_UPDATE_ATTACH	5	/* amd_update_attach */
+ 
+ struct amd_update_disk {
+ 	int type;
+@@ -322,6 +367,42 @@ struct amd_update_disk {
+ 	__u64 sectors;
+ };
+ 
++struct amd_update_attach {
++	int type;
++	int fd;			/* the monitor's now: kept by the disk, or closed */
++	int major, minor;
++	int commit_valid;
++	__u32 features;
++	__u32 spare_info;	/* of the label */
++	__u32 packet_lba, packet_size;
++	__u64 id;		/* from the label, 0: no RAIDCore label */
++	__u64 sectors;
++	__u64 generation, packet_number, committed_checksum;
++	__u64 last_online;
++	int mbr;
++	/* zeroed, for a disk new to us: the monitor's now, taken or freed */
++	struct amd_disk *disk;
++};
++
++/*
++ * mdmon's state of a volume: what it has seen md do, and how much of that
++ * is on disk yet.  amd_open_new() sets it up; amd_parse_packet() builds the
++ * rest of struct amd_vol from the packet and clears this, so amd_reparse()
++ * carries it over whole.
++ */
++struct amd_vol_mon {
++	int bitmap_dirty;	/* AMD write-intent bitmap has bits set */
++	int bitmap_want;	/* state to write at the next sync_metadata */
++	unsigned int bitmap_dirty_from;	/* ... from this bit to the end */
++	unsigned int bitmap_from;	/* ... from this bit to the end */
++	unsigned long long resync_ckpt;	/* resync after a crash, volume sectors */
++	unsigned long long ckpt_seen;	/* the monitor's checkpoint, last call */
++	int members_checked;	/* the members md runs without are recorded (amd_mark_missing) */
++	int init_done;		/* md finished the init: record that at sync_metadata */
++	unsigned long long init_ckpt;	/* volume sectors md has initialized */
++	int init_tlog;		/* 1: write init_ckpt to the log, 2: clear it */
++};
++
+ /* A logical device exposed as an md array */
+ struct amd_vol {
+ 	struct amd_ld *ld;
+@@ -332,7 +413,10 @@ struct amd_vol {
+ 	int chunk_sectors;
+ 	unsigned long long component_size;
+ 	int readonly;
++	int managed;		/* mdmon keeps its state in the AMD metadata */
+ 	int single;		/* RAIDABLE: md raid1 of its one member, no bitmap */
++	int init_pending;	/* CREATE_REDUNDANCY not completed: md resyncs */
++	struct amd_vol_mon mon;
+ 	const char *blocked;	/* why it cannot be assembled */
+ };
+ 
+@@ -348,15 +432,31 @@ struct amd_super {
+ 	struct amd_vol vol[AMD_MAX_VOL];
+ 	int nvol;
+ 	int current_vol;
++	int config_dirty;	/* the packet changed, write it out */
+ 	int foreign;		/* the live packet is from a disk last online elsewhere */
+ 	int from_md;		/* the disks of a running container (amd_load_md) */
+ 	int attached;		/* add_to_super took a disk in, nothing to init */
++	void *iobuf;		/* one sector, for mdmon's writes */
++	/* ... for reads and writes under amd_lock by managemon (and mdadm) */
++	void *mmbuf;
++	/* mdmon: the LD a rebuild goes into is made here (amd_rebuild_ld) */
++	bool busy;		/* mdmon: a thread works on it (amd_lock) */
+ 	int whole;		/* it is a RAIDABLE: one whole disk free of volumes */
+ };
+ 
+ static int amd_open_new(struct supertype *c, struct active_array *a, int inst);
++static void amd_lock(struct amd_super *super);
++static void amd_unlock(struct amd_super *super);
++static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
++			      __u32 tstate);
++static void amd_cut_ld(struct amd_super *super, unsigned int at,
++		       unsigned int size);
++static void amd_trim_packet(struct amd_super *super);
++static void amd_reparse(struct amd_super *super);
++static void amd_reparse_without(struct amd_super *super, int gone);
+ static int amd_pd_index(struct amd_super *super, __u64 id);
+ static int amd_disk_in_volumes(struct amd_super *super, __u64 id);
++static void amd_kmsg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+ 
+ /*
+  * Checksum used by every RAIDCore structure: xor of 64-bit words, each
+@@ -753,7 +853,7 @@ static int amd_equal_size(struct amd_vol *v, unsigned long long data_disks)
+ 	return 1;
+ }
+ 
+-/* md runs @v read-write or read-only: by its state and transform */
++/* mdmon manages @v, or md runs it read-only: by its state and transform */
+ static void amd_classify_state(struct amd_vol *v)
+ {
+ 	struct amd_ld *ld = v->ld;
+@@ -778,14 +878,47 @@ static void amd_classify_state(struct amd_vol *v)
+ 	 */
+ 	if (state == AMD_LD_STATE_LOCKED)
+ 		state = AMD_LD_STATE_CRITICAL;
+-	/* a transform not ended (initialization, rebuild, migration) */
+-	transform = ld->transform_type &&
++	v->init_pending = __le32_to_cpu(ld->transform_type) ==
++			  AMD_TRANSFORM_CREATE_REDUNDANCY &&
+ 		__le32_to_cpu(ld->transform_state) != AMD_TRANSFORM_COMPLETED;
+-	/* nothing is recorded for AMD yet: what has state stays read-only */
+-	if (v->level == 0 || v->level == LEVEL_LINEAR)
++	/*
++	 * An initialization or a rebuild left unfinished goes on from the
++	 * volume's transform log (amd_tlog_read).  Any other transform is an
++	 * AMD migration: only RAIDABLE -> RAID1 is supported (v->grow), with
++	 * any other the volume is not assembled.
++	 */
++	transform = ld->transform_type && !v->init_pending &&
++		__le32_to_cpu(ld->transform_state) != AMD_TRANSFORM_COMPLETED &&
++		ld->transform_state;
++	if (v->single) {
++		/*
++		 * md raid1 needs mdmon for its clean/active transitions even
++		 * with one member; an AMD RAIDABLE keeps no write-intent
++		 * bitmap (attribute 0), so there is nothing to record but
++		 * failures.
++		 */
++		v->managed = state == AMD_LD_STATE_NORMAL && !transform;
++		v->readonly = !v->managed;
++	} else if (v->level == 0 || v->level == LEVEL_LINEAR) {
+ 		v->readonly = state != AMD_LD_STATE_NORMAL || transform;
+-	else
++	} else if ((v->level == 1 || v->level == 10 || v->level == 5) &&
++		   !transform &&
++		   (__le32_to_cpu(ld->attribute) & AMD_ATTR_BITMAP) &&
++		   (state == AMD_LD_STATE_NORMAL ||
++		    state == AMD_LD_STATE_CRITICAL)) {
++		/*
++		 * Mirrors and RAID5: mdmon records dirty/clean in the AMD
++		 * write-intent bitmap and member failures in the config
++		 * packet.  RAID5 is md raid5 right-asymmetric, checked against
++		 * the AMD Windows driver (rcraid.sys 9.3.3): md check finds the
++		 * parity it writes right, and it reads what md wrote with a
++		 * member missing, through md's parity.
++		 */
++		v->managed = 1;
++		v->readonly = 0;
++	} else {
+ 		v->readonly = 1;
++	}
+ }
+ 
+ /*
+@@ -1194,6 +1327,15 @@ static struct amd_disk *amd_find_disk(struct amd_super *super, __u64 id)
+ 	return NULL;
+ }
+ 
++/*
++ * A descriptor to read @d through: the container's, or one opened here,
++ * which the caller closes (it is not d->fd).
++ */
++static int amd_disk_fd(const struct amd_disk *d)
++{
++	return d->fd >= 0 ? d->fd : amd_dev_open(d->major, d->minor, O_RDONLY);
++}
++
+ /*
+  * A disk that missed configuration updates (lower generation, or another
+  * packet under the same generation) may hold stale data: it must not
+@@ -1340,6 +1482,14 @@ static int amd_read_mbr_state(int fd, const struct amd_metadata *md)
+ 	return rv;
+ }
+ 
++/* the disk holding this element, if it is present and up to date */
++static struct amd_disk *amd_member_disk(struct amd_super *super, __u64 id)
++{
++	struct amd_disk *d = amd_find_disk(super, id);
++
++	return d && amd_disk_current(super, d) ? d : NULL;
++}
++
+ /*
+  * @d can be a member in sync of @v, whose element @el in service it holds.
+  * Up to date - or, for a volume without redundancy, with an older
+@@ -1564,6 +1714,8 @@ static struct amd_super *amd_new_super(void)
+ 	struct amd_super *super = xcalloc(1, sizeof(*super));
+ 
+ 	super->current_vol = -1;
++	super->iobuf = amd_alloc(AMD_SECTOR);
++	super->mmbuf = amd_alloc(AMD_SECTOR);
+ 	return super;
+ }
+ 
+@@ -1576,6 +1728,8 @@ static void amd_free(struct amd_super *super)
+ 		amd_free_disk(d);
+ 	}
+ 	free(super->packet);
++	free(super->iobuf);
++	free(super->mmbuf);
+ 	free(super);
+ }
+ 
+@@ -2234,6 +2388,19 @@ static int amd_volume_enough(struct amd_super *super, struct amd_vol *v)
+ 	return newly_missing ? 0 : 1;
+ }
+ 
++/* State to record for @v: CRITICAL while some member is out of service. */
++static __u32 amd_volume_state(struct amd_super *super, struct amd_vol *v)
++{
++	int i;
++
++	if (amd_volume_enough(super, v) < 0)
++		return AMD_LD_STATE_OFFLINE;
++	for (i = 0; i < v->nel; i++)
++		if (!amd_slot_usable(v, i))
++			return AMD_LD_STATE_CRITICAL;
++	return AMD_LD_STATE_NORMAL;
++}
++
+ static int amd_container_enough(struct amd_super *super)
+ {
+ 	int vol, most = -1, any = 0;
+@@ -2451,6 +2618,761 @@ static int compare_super_amd(struct supertype *st, struct supertype *tst,
+ 	return amd_merge(first, second);
+ }
+ 
++/* Data elements of one parity set (RC_SecondElementCount). */
++static unsigned int amd_data_per_set(const struct amd_ld *ld)
++{
++	__u32 s = __le32_to_cpu(ld->second_count);
++
++	switch (__le32_to_cpu(ld->device_type)) {
++	case AMD_LDT_RAID50:
++		return s - 1;
++	case AMD_LDT_RAID60:
++		return s - 2;
++	case AMD_LDT_RAW:
++		return s;
++	default:
++		return 1;
++	}
++}
++
++/*
++ * RC_TransformProtectSize: min(data elements x FirstCount x 0x4800, 0x8000)
++ * sectors (no cap for RAID5/6), cut down to whole stripes.
++ */
++static unsigned long long amd_protect_size(const struct amd_vol *v)
++{
++	const struct amd_ld *ld = v->ld;
++	unsigned long long f = __le32_to_cpu(ld->first_count);
++	unsigned long long data = amd_data_per_set(ld);
++	unsigned long long protect, stripe;
++	__u32 type = __le32_to_cpu(ld->device_type);
++
++	stripe = v->chunk_sectors * data * f;
++	protect = data * f * 0x4800;
++	if (protect > 0x8000 && type != AMD_LDT_RAID50 && type != AMD_LDT_RAID60)
++		protect = 0x8000;
++	if (stripe && protect >= stripe)
++		protect -= protect % stripe;
++	return protect;
++}
++
++/*
++ * Sectors covered by one bit of the write-intent bitmap (RC_BitCoverSize):
++ * the next power of two >= capacity spread over the 4096 bits, at least
++ * 0x32000 sectors and the transform protect size, rounded up to whole
++ * protect units and whole stripes.  0 if the volume is too large for a
++ * one-sector bitmap.
++ */
++static unsigned long long amd_bitmap_cover(const struct amd_vol *v)
++{
++	const struct amd_ld *ld = v->ld;
++	unsigned long long cap = __le64_to_cpu(ld->capacity);
++	unsigned long long f = __le32_to_cpu(ld->first_count);
++	unsigned long long data = amd_data_per_set(ld);
++	unsigned long long p = 0x200000, c, protect, stripe;
++
++	while (p < cap) {
++		p <<= 1;
++		if (p > (1ULL << 43))
++			return 0;
++	}
++	stripe = v->chunk_sectors * data * f;
++	protect = amd_protect_size(v);
++
++	c = p / (AMD_BITMAP_BYTES * 8);
++	if (c < 0x32000)
++		c = 0x32000;
++	if (c < protect)
++		c = protect;
++	if (protect && c % protect)
++		c += protect - c % protect;
++	if (stripe && c % stripe)
++		c += stripe - c % stripe;
++	if (c > cap)
++		c = cap;
++	return c;
++}
++
++static unsigned int amd_bitmap_bits(const struct amd_vol *v)
++{
++	unsigned long long cover = amd_bitmap_cover(v);
++	unsigned long long cap = __le64_to_cpu(v->ld->capacity);
++
++	return cover ? (cap + cover - 1) / cover : 0;
++}
++
++/*
++ * The up-to-date disk holding element [0][0], which keeps the bitmap.
++ */
++static struct amd_disk *amd_bitmap_disk(struct amd_super *super,
++					struct amd_vol *v)
++{
++	const struct amd_ld *ld = v->ld;
++
++	if (!(__le32_to_cpu(ld->attribute) & AMD_ATTR_BITMAP) ||
++	    !amd_slot_usable(v, 0) || amd_bitmap_bits(v) == 0 ||
++	    amd_bitmap_bits(v) > AMD_BITMAP_BYTES * 8)
++		return NULL;
++	return amd_member_disk(super, __le64_to_cpu(v->el[0].id.id));
++}
++
++static unsigned long long amd_bitmap_lba(const struct amd_vol *v)
++{
++	return __le64_to_cpu(v->el[0].allocated.offset) + AMD_BITMAP_OFFSET;
++}
++
++/* The AMD bitmap of @v into @buf (AMD_BITMAP_BYTES): 0, or -1 if unreadable */
++static int amd_bitmap_load(struct amd_super *super, struct amd_vol *v,
++			   __u8 *buf)
++{
++	struct amd_disk *d = amd_bitmap_disk(super, v);
++	int fd, rv;
++
++	if (!d)
++		return -1;
++	fd = amd_disk_fd(d);
++	if (!is_fd_valid(fd))
++		return -1;
++	rv = amd_read(fd, amd_bitmap_lba(v), buf, AMD_BITMAP_BYTES);
++	if (fd != d->fd)
++		close(fd);
++	return rv;
++}
++
++/* the first bit set in AMD bitmap @buf of @v, or -1 */
++static int amd_bitmap_first(const struct amd_vol *v, const __u8 *buf)
++{
++	unsigned int i, bits = amd_bitmap_bits(v);
++
++	for (i = 0; i < bits; i++)
++		if (buf[i >> 3] & (1 << (i & 7)))
++			return i;
++	return -1;
++}
++
++/*
++ * 1: some bit of the volume's bitmap is set (the first in *@first, if
++ * given), 0: clean, -1: unreadable
++ */
++static int amd_bitmap_read(struct amd_super *super, struct amd_vol *v,
++			   unsigned int *first)
++{
++	__u8 *buf = super->mmbuf;
++	int i;
++
++	if (v->single)
++		return 0;	/* no bitmap, and nothing to resync */
++	/* managemon reads (open_new), the monitor writes iobuf meanwhile */
++	if (!buf || amd_bitmap_load(super, v, buf) != 0)
++		return -1;
++	i = amd_bitmap_first(v, buf);
++	if (i < 0)
++		return 0;
++	if (first)
++		*first = i;
++	return 1;
++}
++
++/* AMD bitmap @buf of @v as mdmon writes it: dirty from bit @from, or clean */
++static void amd_bitmap_fill(const struct amd_vol *v, __u8 *buf, int dirty,
++			    unsigned int from)
++{
++	unsigned int i, bits = dirty ? amd_bitmap_bits(v) : 0;
++
++	memset(buf, 0, AMD_BITMAP_BYTES);
++	for (i = from; i < bits; i++)
++		buf[i >> 3] |= 1 << (i & 7);
++}
++
++/*
++ * Mark the volume dirty from bit @from to the end, or clean, in the AMD
++ * bitmap.  From 0 while md may write anywhere; later bits only while a
++ * resync after a crash runs and md is clean: what it has done is in step.
++ */
++static int amd_bitmap_write(struct amd_super *super, struct amd_vol *v,
++			    int dirty, unsigned int from)
++{
++	struct amd_disk *d = amd_bitmap_disk(super, v);
++	__u8 *buf = super->iobuf;
++
++	if (v->single)
++		return 0;
++	if (!d || d->fd < 0 || !buf)
++		return -1;
++	amd_bitmap_fill(v, buf, dirty, from);
++	if (pwrite(d->fd, buf, AMD_BITMAP_BYTES,
++		   (off_t)amd_bitmap_lba(v) * AMD_SECTOR) != AMD_BITMAP_BYTES ||
++	    fsync(d->fd) != 0)
++		return -1;
++	return 0;
++}
++
++/*
++ * Member sectors <-> volume sectors, at whole stripes.  In RAID1 they are
++ * the same; in RAID10 (near copies, AMD order) a member holds one chunk of
++ * each stripe of FirstCount chunks, in RAID5 one chunk (data or parity) of
++ * each stripe of SecondCount - 1 data chunks.
++ */
++static unsigned long long amd_stripe_data(const struct amd_vol *v)
++{
++	if (v->chunk_sectors == 0)
++		return 0;
++	if (v->level == 10)
++		return __le32_to_cpu(v->ld->first_count);
++	if (v->level == 5)
++		return amd_data_per_set(v->ld);
++	return 0;
++}
++
++static unsigned long long amd_member_to_volume(const struct amd_vol *v,
++					       unsigned long long sectors)
++{
++	unsigned long long chunk = v->chunk_sectors;
++	unsigned long long data = amd_stripe_data(v);
++
++	if (data == 0)
++		return sectors;
++	return sectors / chunk * chunk * data;
++}
++
++static unsigned long long amd_volume_to_member(const struct amd_vol *v,
++					       unsigned long long sectors)
++{
++	unsigned long long chunk = v->chunk_sectors;
++	unsigned long long data = amd_stripe_data(v);
++
++	if (data == 0)
++		return sectors;
++	return sectors / (chunk * data) * chunk;
++}
++
++/*
++ * md counts a resync in array sectors for raid1/raid10 (resync_max_sectors
++ * = the array size) but in member sectors for raid5 (= dev_sectors), as a
++ * recovery for every level; AMD logs and its bitmap count volume sectors.
++ */
++static unsigned long long amd_sync_to_volume(const struct amd_vol *v,
++					     unsigned long long sectors)
++{
++	return v->level == 5 ? amd_member_to_volume(v, sectors) : sectors;
++}
++
++static unsigned long long amd_volume_to_sync(const struct amd_vol *v,
++					     unsigned long long sectors)
++{
++	return v->level == 5 ? amd_volume_to_member(v, sectors) : sectors;
++}
++
++static __u64 amd_tlog_checksum(const struct amd_tlog *t)
++{
++	struct amd_tlog c = *t;
++
++	c.id.reserved = 0;
++	c.copy_to.reserved = 0;
++	return amd_checksum((char *)&c + 8, sizeof(c) - 8);
++}
++
++/*
++ * The transform log of transform @type of @v, the LD @tl transformed into,
++ * into @t: STARTED, @done volume sectors done.  One log for every transform
++ * type: Type and Flags come from the LD, the AMD driver resumes any of them
++ * from ProtectStart (RC_SetTaskLog, RC_RestartTask, RC_InitTransformStruct).
++ * For a rebuild of a mirror IOStart/IOSize and the stripe fields stay 0
++ * (the AMD driver works its I/O size out again each region, see below);
++ * a migration (NORMAL), an initialization and any transform of RAID5
++ * (@raid5) have them as the AMD drivers write them.
++ */
++static void amd_tlog_fill(const struct amd_vol *v, const struct amd_ld *tl,
++			  struct amd_tlog *t, unsigned long long done,
++			  __u32 type, int raid5)
++{
++	t->id = v->ld->id;
++	t->id.reserved = 0;
++	t->type = __cpu_to_le32(type);
++	t->protect_start = __cpu_to_le64(done);
++	t->flags = type == AMD_TRANSFORM_RESTORE_SEGMENTS ?
++		   __cpu_to_le32(AMD_TFLAGS_RESTORE) : tl->transform_flags;
++	if (!t->flags)
++		t->flags = __cpu_to_le32(AMD_TFLAGS_CREATE);
++	t->protect_size = __cpu_to_le32(amd_protect_size(v));
++	if (raid5 ||
++	    type == AMD_TRANSFORM_CREATE_REDUNDANCY) {
++		/*
++		 * The I/O at ProtectStart and the protect window in
++		 * stripes, as the AMD drivers log them: initializing a
++		 * RAID1, rcraid 0x100 sectors, 0x90 stripes; RAID5,
++		 * rcraid.sys a chunk (RAID10 a chunk by rcblob
++		 * RC_SetTransformSize).  The flags are those of the
++		 * LD at any level: 0x211 on a volume of the menu or
++		 * of mdadm -C, 0x241 of rcadm -C (rcraid on mirrors,
++		 * rcraid.sys on a RAID5).  Resuming,
++		 * the driver takes the I/O size from the log
++		 * (RC_InitTransformInfo skips RC_SetTransformSize); a
++		 * rebuild or migration works it out again each region
++		 * (RC_MaxDynamicTransformIoSize), an initialization
++		 * does not (RC_TransformUpdateNextRegionFromBeginning).
++		 * Left 0, rcraid 9.3.3-00302 makes no headway on an
++		 * initialization - I/O past the mark times out, the
++		 * volume goes critical - and rcraid.sys 9.3.3.218 fails
++		 * a RAID5 transform ("rebuild/create task has failed").
++		 */
++		unsigned long long stripe = v->chunk_sectors *
++			amd_data_per_set(v->ld) *
++			__le32_to_cpu(v->ld->first_count);
++
++		t->io_start = t->protect_start;
++		t->io_size = __cpu_to_le32(v->level == 1 ? 0x100 :
++					   v->chunk_sectors);
++		if (stripe)
++			t->dynamic_protect_stripe =
++				__cpu_to_le32(amd_protect_size(v) / stripe);
++		t->log_update_stripe = t->dynamic_protect_stripe;
++	}
++	t->status = __cpu_to_le32(AMD_TLOG_STARTED);
++	t->checksum = __cpu_to_le64(amd_tlog_checksum(t));
++}
++
++/*
++ * Write the transform log of transform @type of @v (amd_tlog_fill) - or
++ * clear it (@erase) - on each in-service element of column 0 of @tl, the
++ * LD transformed into (rcblob RC_TransformDiskLogNextRegion: logical
++ * sector Capacity with I/O flag 0x10000 is AllocatedSpace + 0 of the
++ * column-0 elements).  RAID5 (F = 1): the log is on the data and the
++ * parity element of chunk 0 of the stripe past the end
++ * (RC_Raid50LogicalToPhysical with 0x10000: data and parity I/O).
++ */
++static int amd_tlog_write(struct amd_super *super, struct amd_vol *v,
++			  const struct amd_ld *tl, int erase,
++			  unsigned long long done, __u32 type)
++{
++	const struct amd_element *el = amd_ld_elements(tl);
++	struct amd_tlog *t = super->iobuf;
++	int s = __le32_to_cpu(tl->second_count);
++	int j, n = 0, only[2] = { -1, -1 };
++
++	if (!t)
++		return -1;
++	memset(t, 0, AMD_SECTOR);
++	/*
++	 * RAID5: the two elements rcraid.sys keeps the log on, the data and
++	 * the parity element of the stripe past the end (seen on a RAID5
++	 * it was initializing, shut down midway).  Cleared on all of them.
++	 */
++	if (v->level == 5 && !erase && v->chunk_sectors && s >= 3) {
++		unsigned long long stripes = __le64_to_cpu(tl->capacity) /
++			(v->chunk_sectors * (unsigned long long)(s - 1));
++
++		only[0] = stripes % s;
++		only[1] = only[0] == 0 ? 1 : 0;
++	}
++	if (!erase)
++		amd_tlog_fill(v, tl, t, done, type, only[0] >= 0);
++	for (j = 0; j < s; j++) {
++		struct amd_disk *d;
++
++		if (!amd_element_usable(&el[j]) ||
++		    (only[0] >= 0 && j != only[0] && j != only[1]))
++			continue;
++		d = amd_find_disk(super, __le64_to_cpu(el[j].id.id));
++		/* one a configuration write failed on is stale: no member next time */
++		if (!d || d->fd < 0 || d->spare_failed || d->write_failed)
++			continue;
++		if (pwrite(d->fd, t, AMD_SECTOR,
++			   (off_t)__le64_to_cpu(el[j].allocated.offset) * AMD_SECTOR) !=
++		    AMD_SECTOR || fsync(d->fd) != 0)
++			return -1;
++		n++;
++	}
++	return n ? 0 : -1;
++}
++
++/*
++ * Volume sectors done by transform @type of @v, from its transform log on
++ * the column-0 elements of @tl (written by us or by the AMD driver), or 0
++ * if no copy is valid (rcblob RC_IsTransformLogValid, RC_RestartTask).
++ * The least of the valid copies: a copy on a disk that was missing lags
++ * behind, or predates a restart from 0 (amd_target_behind); copying more
++ * is harmless, less is not.
++ */
++static unsigned long long amd_tlog_read(struct amd_super *super,
++					struct amd_vol *v,
++					const struct amd_ld *tl, __u32 type)
++{
++	const struct amd_element *el = amd_ld_elements(tl);
++	/* managemon reads (activate_spare), the monitor writes iobuf meanwhile */
++	struct amd_tlog *t = super->mmbuf;
++	unsigned long long cap = __le64_to_cpu(v->ld->capacity), least = cap;
++	int s = __le32_to_cpu(tl->second_count);
++	int j, valid = 0;
++
++	for (j = 0; t && j < s; j++) {
++		struct amd_disk *d;
++		int fd, rv;
++
++		if (!amd_element_usable(&el[j]))
++			continue;
++		d = amd_find_disk(super, __le64_to_cpu(el[j].id.id));
++		if (!d)
++			continue;
++		fd = amd_disk_fd(d);
++		if (!is_fd_valid(fd))
++			continue;
++		rv = amd_read(fd, __le64_to_cpu(el[j].allocated.offset), t,
++			      AMD_SECTOR);
++		if (fd != d->fd)
++			close(fd);
++		if (rv != 0 || !t->checksum ||
++		    __le64_to_cpu(t->checksum) != amd_tlog_checksum(t) ||
++		    t->id.id != v->ld->id.id || !t->flags ||
++		    __le32_to_cpu(t->type) != type ||
++		    __le32_to_cpu(t->status) != AMD_TLOG_STARTED)
++			continue;
++		valid = 1;
++		if (__le64_to_cpu(t->protect_start) < least)
++			least = __le64_to_cpu(t->protect_start);
++	}
++	return valid ? least : 0;
++}
++
++/*
++ * @done, but at least a MiB short of @end, at a whole MiB: md must still
++ * run the resync or recovery for mdmon to see it finish.
++ */
++static unsigned long long amd_short_of_end(unsigned long long done,
++					   unsigned long long end)
++{
++	if (done + AMD_MIB <= end)
++		return done;
++	return end > AMD_MIB ? (end - AMD_MIB) / AMD_MIB * AMD_MIB : 0;
++}
++
++/*
++ * Volume sector an initialization (CREATE_REDUNDANCY) of @v that was
++ * stopped resumes from: what its transform log says, short of the end so
++ * that md still resyncs and mdmon sees it finish.  md resyncs a mirror in
++ * volume sectors (RAID10: the array's).
++ */
++static unsigned long long amd_init_resume_point(struct amd_super *super,
++						struct amd_vol *v)
++{
++	unsigned long long cap = __le64_to_cpu(v->ld->capacity);
++	unsigned long long done;
++
++	if (!v->link)
++		return 0;
++	done = amd_tlog_read(super, v, v->link,
++			     AMD_TRANSFORM_CREATE_REDUNDANCY);
++	return amd_short_of_end(done, cap);
++}
++
++static int amd_disk_failed(struct amd_super *super, __u64 id)
++{
++	int vol, i;
++
++	for (vol = 0; vol < super->nvol; vol++)
++		for (i = 0; i < super->vol[vol].nel; i++) {
++			struct amd_element *el = &super->vol[vol].el[i];
++
++			if (__le64_to_cpu(el->id.id) == id &&
++			    (__le32_to_cpu(el->flags) & AMD_ELEMENT_FAILED))
++				return 1;
++		}
++	return 0;
++}
++
++/* a configuration write to @d failed: it gets no further ones (amd_write_config) */
++static void amd_write_failed(struct amd_disk *d)
++{
++	d->write_failed = 1;
++	d->update = 0;
++	/* the number: glibc's strerror() allocates (gettext), the monitor must not */
++	amd_kmsg("cannot write the configuration to %d:%d (errno %d): it stays stale",
++		 d->major, d->minor, errno);
++}
++
++/*
++ * DeviceState of the PD records, as the AMD driver keeps it (rcraid 9.3.2):
++ * a disk that is here is ONLINE - again, when one that failed is back; one
++ * that failed or went away is OFFLINE.  The driver drops the PD of a disk
++ * that was not there when it started (so does the Windows one); we keep the
++ * record, OFFLINE, so that the disk is known when it is back.  Only set
++ * while a configuration is written anyway: a disk still on its way at
++ * assembly does not cause a write.  Other states (SMART error, new, locked)
++ * are kept.
++ */
++static void amd_pd_states(struct amd_super *super)
++{
++	int i;
++
++	for (i = 0; i < super->npd; i++) {
++		struct amd_pd *pd = super->pd[i];
++		__u32 state = __le32_to_cpu(pd->device_state), want;
++		struct amd_disk *d;
++
++		if (__le32_to_cpu(pd->device_type) != AMD_DEV_RAIDCORE_DISK ||
++		    (state != AMD_DEV_STATE_ONLINE && state != AMD_DEV_STATE_OFFLINE))
++			continue;
++		d = amd_find_disk(super, __le64_to_cpu(pd->id.id));
++		want = d && !d->spare_failed && !d->removed &&
++		       d->fd >= 0 ?
++		       AMD_DEV_STATE_ONLINE : AMD_DEV_STATE_OFFLINE;
++		if (state != want) {
++			pd->device_state = __cpu_to_le32(want);
++			dprintf("PD of disk %016llx %s\n",
++				(unsigned long long)__le64_to_cpu(pd->id.id),
++				want == AMD_DEV_STATE_ONLINE ? "online" : "offline");
++		}
++	}
++}
++
++/*
++ * A configuration another controller wrote becomes this one's, as with the
++ * AMD driver: it builds the configuration of disks last online elsewhere
++ * (rcblob 9.3.3 RC_ReadConfig @0013d6e0, group FOREIGN) and writes it back
++ * with its own serial number (RC_UpdateConfig @0013aba0) - the Windows
++ * driver over what the AMD driver for Linux wrote, and that one the other
++ * way round (MSI X870E, 08.11).  Here the packet gets AMD_SERIAL in place
++ * of the old one: in its header, as the controller's PD and as the
++ * volumes' parent reference; the commit blocks follow (amd_write_config).
++ */
++static void amd_take_over(struct amd_super *super)
++{
++	struct amd_packet_header *h = super->packet;
++	__u64 old = super->serial;
++	unsigned int off = __le32_to_cpu(h->ld_offset);
++	struct amd_ld *ld;
++	int i;
++
++	h->modifier_sn = __cpu_to_le64(AMD_SERIAL);
++	for (i = 0; i < super->npd; i++)
++		if (__le64_to_cpu(super->pd[i]->id.id) == old)
++			super->pd[i]->id.id = __cpu_to_le64(AMD_SERIAL);
++	while ((ld = amd_next_ld(super, &off))) {
++		struct amd_dev_id *ref = (struct amd_dev_id *)
++			(amd_ld_elements(ld) + __le32_to_cpu(ld->first_count) *
++					       __le32_to_cpu(ld->second_count));
++
++		for (i = 0; i < (int)__le32_to_cpu(ld->parent_count); i++)
++			if (__le64_to_cpu(ref[i].id) == old)
++				ref[i].id = __cpu_to_le64(AMD_SERIAL);
++	}
++	super->serial = AMD_SERIAL;
++	amd_kmsg("the configuration of controller %012llx is this one's now",
++		 (unsigned long long)old);
++}
++
++/*
++ * Handles of the LD records as RAIDCoreDxe gives them when it reads a
++ * configuration (FUN_0002be1c): each LD takes the first free slot from 1,
++ * in packet order, Legacy ones too, and its Handle is the slot number; the
++ * second copy of a transform has the Handle of the first.  RoutingPath it
++ * keeps as read (FUN_00026460), and every packet we know has 0 there.  If a
++ * Handle differs from that, the firmware writes the configuration back at
++ * boot (FUN_0002b908, RC_UpdateConfig FUN_00028e98) with the DeviceID,
++ * Handle and BusType of the PD records left out (see amd_repair_pds).  A
++ * deleted volume leaves a gap: the BIOS menu and the AMD driver keep the
++ * Handles they have until they read the configuration again (rcblob
++ * RC_AddLogicalDevice numbers the same way, RC_NextAvailableLogicalNumber),
++ * and so did older versions of this code.  A volume the firmware does not
++ * take (OFFLINE: its disks are not there) gets no slot and the later ones
++ * move down, but then it does not write either: a volume short of its
++ * disks keeps it from writing at boot (FUN_000250b8).  Nothing refers to
++ * an LD by its Handle but the transform log, which the AMD driver matches
++ * by DeviceID alone (rcblob RC_CheckTransformLogs).
++ */
++static void amd_number_lds(struct amd_super *super)
++{
++	struct amd_packet_header *h = super->packet;
++	unsigned int off = __le32_to_cpu(h->ld_offset);
++	struct amd_ld *ld;
++	int slot = 0, copy = 0;
++
++	while ((ld = amd_next_ld(super, &off))) {
++		if (!copy)
++			slot++;
++		ld->id.handle = __cpu_to_le16(slot);
++		copy = !copy && __le32_to_cpu(ld->transform_link) == 1;
++	}
++}
++
++/*
++ * Disk @id holds an element in service, in either LD copy, of a volume
++ * that an older generation keeps it out of: any but one without
++ * redundancy - and that one too when @d, the disk itself, is here and no
++ * member of it (amd_disk_serves): written apart from the others, or with
++ * something else in its own packet.
++ */
++static int amd_disk_guarded(struct amd_super *super, const struct amd_disk *d,
++			    __u64 id)
++{
++	int vol, i;
++
++	for (vol = 0; vol < super->nvol; vol++) {
++		struct amd_vol *v = &super->vol[vol];
++		int plain = amd_volume_plain(v);
++
++		for (i = 0; i < v->nel; i++)
++			if (__le64_to_cpu(v->el[i].id.id) == id &&
++			    amd_element_usable(&v->el[i]) &&
++			    (!plain ||
++			     (d && !amd_disk_serves(super, d, v, &v->el[i]))))
++				return 1;
++		for (i = 0; i < amd_link_nel(v); i++)
++			if (__le64_to_cpu(amd_link_elements(v)[i].id.id) == id &&
++			    amd_element_usable(&amd_link_elements(v)[i]))
++				return 1;
++	}
++	return 0;
++}
++
++/*
++ * @d is a RAID disk of the configuration that is here, with the live
++ * configuration or an older one, and no volume needs what it has: a free
++ * disk, a spare, a member out of service (failed, offline, or replaced) -
++ * or a member of volumes without redundancy only, which missed nothing
++ * with an older configuration (amd_volume_disk) and, left stale, would
++ * stay so for good.
++ * The AMD driver writes each configuration to every RAIDCore disk that is
++ * here (rcblob 9.3.3 RC_WriteAllConfigData @00134ad0: PD ONLINE, as a disk
++ * a scan finds is, RC_InsertCorePhysicalDevice @0015b670), and a disk that
++ * comes back makes it scan and write again (RC_ConfigRescan @0015c8e0); so
++ * does mdmon.  Left stale, such a disk would make Incremental refuse the
++ * next one when it is the container's first device (its UUID is of the
++ * old packet), and hold back the end of a rebuild or an initialization
++ * (amd_all_disks_here).
++ *
++ * Not a member in service of a mirror or a RAID5 (amd_disk_guarded): its
++ * older generation is what keeps it out of the volume (amd_disk_current),
++ * or has a rebuild target copied from 0
++ * (amd_spare_target).  Not a disk md failed while mdmon runs - it may be
++ * dying - until it has left the container and is back (amd_attach_update).
++ * One that failed before (its element FAILED, 0x10) is idle as the others:
++ * the AMD driver writes to every disk a scan finds, failed elements or not
++ * (rcraid at start-up, notes/rcraid-judge.md D); the element keeps it out
++ * of the volume, and a rebuild onto it copies it from 0 (amd_spare_own).
++ */
++static int amd_disk_idle(struct amd_super *super, const struct amd_disk *d)
++{
++	return d->fd >= 0 && !d->removed && !d->write_failed &&
++	       !d->spare_failed && d->commit_valid &&
++	       d->generation <= super->generation &&
++	       d->foreign == super->foreign &&
++	       amd_pd_index(super, d->device_id) >= 0 &&
++	       !amd_disk_guarded(super, d, d->device_id);
++}
++
++/* Packet @h (@nsec sectors) to the next slot of @d's ring, at d->new_lba. */
++static int amd_put_packet(struct amd_disk *d, struct amd_packet_header *h,
++			  unsigned int nsec)
++{
++	__u32 lba = d->packet_lba + (d->packet_size + AMD_SECTOR - 1) / AMD_SECTOR;
++
++	if (lba < AMD_RING_LBA || lba + nsec > AMD_RING_END)
++		lba = AMD_RING_LBA;
++	h->prev_offset = __cpu_to_le32(d->packet_lba);	/* not checksummed */
++	if (pwrite(d->fd, h, nsec * AMD_SECTOR, (off_t)lba * AMD_SECTOR) !=
++	    (ssize_t)(nsec * AMD_SECTOR) || fsync(d->fd) != 0) {
++		amd_write_failed(d);
++		return -1;
++	}
++	d->new_lba = lba;
++	return 0;
++}
++
++/* The commit block naming @d's new packet (amd_put_packet), generation @gen. */
++static int amd_put_commit(struct amd_super *super, struct amd_disk *d,
++			  __u64 gen)
++{
++	struct amd_packet_header *h = super->packet;
++	struct amd_commit *c = super->iobuf;
++
++	memset(c, 0, AMD_SECTOR);
++	c->packet_offset = __cpu_to_le32(d->new_lba);
++	c->packet_size = __cpu_to_le32(super->packet_len);
++	c->committed_checksum = h->checksum;
++	c->generation = __cpu_to_le64(gen);
++	c->last_modifier_sn = __cpu_to_le64(super->serial);
++	c->last_online_sn = __cpu_to_le64(super->serial);
++	c->packet_number = __cpu_to_le64(d->packet_number + 1);
++	c->checksum = __cpu_to_le64(amd_sector_sum(c));
++	if (pwrite(d->fd, c, AMD_SECTOR,
++		   (off_t)AMD_COMMIT_LBA * AMD_SECTOR) != AMD_SECTOR ||
++	    fsync(d->fd) != 0) {
++		amd_write_failed(d);
++		return -1;
++	}
++	d->packet_lba = d->new_lba;
++	d->packet_size = super->packet_len;
++	d->generation = gen;
++	d->committed_checksum = __le64_to_cpu(h->checksum);
++	d->packet_number++;
++	d->last_online = super->serial;
++	d->foreign = super->serial != AMD_SERIAL;
++	amd_note_own(d, super);
++	return 0;
++}
++
++/*
++ * Write the in-memory packet as a new configuration, like the AMD driver
++ * (RC_UpdateConfig): the packet goes to the next slot of each up-to-date
++ * disk's ring, then every such disk gets a commit block naming it with
++ * the generation number bumped; so does an idle disk (amd_disk_idle).
++ * Other disks that are missing or stale are left alone and stay stale,
++ * and so does a disk a write fails on: as with IMSM, the others get the
++ * configuration all the same (it may record that very disk's failure),
++ * and with its older generation the next assembly does not take that
++ * disk as current.  Fails only if no disk took the configuration.
++ */
++static int amd_write_config(struct amd_super *super)
++{
++	struct amd_packet_header *h = super->packet;
++	unsigned int size = super->packet_len;
++	unsigned int nsec = (size + AMD_SECTOR - 1) / AMD_SECTOR;
++	__u64 gen = super->generation + 1;
++	struct amd_disk *d;
++	int n = 0;
++
++	if (!h || !super->iobuf)
++		return -1;
++	for (d = super->disks; d; d = d->next) {
++		/*
++		 * A member md has failed may be dying: do not write to it.  One
++		 * taken out of the container is gone, as a missing one.
++		 */
++		d->update = !d->removed && !d->write_failed &&
++			    amd_disk_current(super, d) && !d->spare_failed &&
++			    !amd_disk_failed(super, d->device_id);
++		if (d->update && d->fd < 0)
++			return -1;	/* all of them, or none */
++		d->update |= amd_disk_idle(super, d);
++		n += d->update;
++	}
++	if (n == 0)
++		return -1;
++
++	if (super->serial != AMD_SERIAL)
++		amd_take_over(super);
++	amd_pd_states(super);
++	amd_number_lds(super);
++	/* as observed: the packet carries the previous generation number */
++	h->generation = __cpu_to_le64(super->generation);
++	h->checksum = __cpu_to_le64(amd_checksum((char *)h + 0x0c, size - 0x0c));
++
++	for (d = super->disks; d; d = d->next)
++		if (d->update)
++			amd_put_packet(d, h, nsec);
++
++	n = 0;
++	for (d = super->disks; d; d = d->next)
++		if (d->update && amd_put_commit(super, d, gen) == 0)
++			n++;
++	if (n == 0)
++		return -1;
++	super->generation = gen;
++	super->foreign = super->serial != AMD_SERIAL;
++	return 0;
++}
++
+ /* the md device of element @el of a volume, in slot @slot, on disk @d */
+ static struct mdinfo *amd_member_info(struct amd_super *super,
+ 				      const struct amd_element *el,
+@@ -2470,6 +3392,58 @@ static struct mdinfo *amd_member_info(struct amd_super *super,
+ 	return dev;
+ }
+ 
++/* Where md starts the resync of @v (array @this), if it needs one. */
++static void amd_resync_start(struct amd_super *super, struct amd_vol *v,
++			     struct mdinfo *this)
++{
++	unsigned long long done = MaxSector;
++	unsigned int first = 0;
++	int bm;
++
++	if (!v->managed)
++		return;
++	/*
++	 * Bits left in the AMD bitmap (unclean shutdown), or the volume
++	 * is not initialized yet: resync.  An initialization goes on
++	 * from its transform log, as the AMD driver resumes it
++	 * (RC_RestartTask) - but not past bits in the bitmap: those
++	 * are writes that were in flight when the system went down,
++	 * below the log too (mdmon marks the bitmap while md writes,
++	 * an initialization alone leaves it clean), so the resync
++	 * starts at the first one - from 0 after mdmon's "anywhere";
++	 * after a resync that stopped cleanly, from where it stopped.
++	 * A volume with the root file system on it must be left
++	 * clean at shutdown (mdadm --wait-clean from the shutdown
++	 * ramfs), or every reboot looks like a crash.
++	 */
++	bm = amd_bitmap_read(super, v, &first);
++	if (bm == 1)
++		done = (unsigned long long)first * amd_bitmap_cover(v);
++	if (v->init_pending) {
++		unsigned long long logged = amd_init_resume_point(super, v);
++
++		if (logged < done)
++			done = logged;
++	}
++	/*
++	 * The bitmap is on element [0][0] only (the AMD driver too does
++	 * no bitmap I/O without it): a RAID10 without that member could
++	 * not record a crash, its other mirrors may differ - resync.
++	 * (A RAID1 without it has one mirror left; a RAID5 without it
++	 * is degraded: md could not resync it, nor could the AMD
++	 * driver have recorded a crash.)  With -I per disk, an mdadm
++	 * that has not got [0][0] yet may set the array up so; the one
++	 * that starts it gives md its own resync point
++	 * (assemble_container_content).
++	 */
++	if (!v->init_pending && bm < 0 && v->level == 10)
++		done = 0;
++	if (done == MaxSector)
++		return;
++	this->array.state &= ~(1 << MD_SB_CLEAN);
++	this->resync_start = amd_volume_to_sync(v, done);
++}
++
+ /* The members of @v that are here, as this->devs. */
+ static void amd_volume_devs(struct amd_super *super, struct amd_vol *v,
+ 			    struct mdinfo *this)
+@@ -2526,6 +3500,7 @@ static struct mdinfo *container_content_amd(struct supertype *st,
+ 			 st->container_devnm, vol);
+ 		if (v->blocked)
+ 			continue;
++		amd_resync_start(super, v, this);
+ 		amd_volume_devs(super, v, this);
+ 	}
+ 	return rest;
+@@ -2786,6 +3761,34 @@ static __u64 avail_size_amd(struct supertype *st, __u64 devsize,
+ 	return (devsize - AMD_DEFAULT_ALLOC_LBA - AMD_SERVICE) / AMD_MIB * AMD_MIB;
+ }
+ 
++/* end of the last section of the packet (PD, LD, 25BE, 25BF) */
++static unsigned int amd_sections_end(const struct amd_packet_header *h)
++{
++	unsigned int end = __le32_to_cpu(h->ld_offset) + __le32_to_cpu(h->ld_size);
++
++	if (__le32_to_cpu(h->ctrl_offset) + __le32_to_cpu(h->ctrl_size) > end)
++		end = __le32_to_cpu(h->ctrl_offset) + __le32_to_cpu(h->ctrl_size);
++	if (__le32_to_cpu(h->sep_offset) + __le32_to_cpu(h->sep_size) > end)
++		end = __le32_to_cpu(h->sep_offset) + __le32_to_cpu(h->sep_size);
++	return end;
++}
++
++/*
++ * @delta bytes were inserted (or cut, < 0) at offset @at: move the 25BE and
++ * 25BF sections behind it.  Offset 0 is a section the packet does not have
++ * (the BIOS writes 0/0); an empty section keeps its place right behind the
++ * one before, as the AMD drivers write it (dump ASRock X670E: 25BF at the
++ * end of 25BE, size 0; rcraid 9.3.3 the same after every change).
++ */
++static void amd_move_sections(struct amd_packet_header *h, unsigned int at,
++			      int delta)
++{
++	if (h->ctrl_offset && __le32_to_cpu(h->ctrl_offset) >= at)
++		h->ctrl_offset = __cpu_to_le32(__le32_to_cpu(h->ctrl_offset) + delta);
++	if (h->sep_offset && __le32_to_cpu(h->sep_offset) >= at)
++		h->sep_offset = __cpu_to_le32(__le32_to_cpu(h->sep_offset) + delta);
++}
++
+ /* Is disk @id in an element of @v (or of its second LD copy)? */
+ static int amd_vol_has_disk(const struct amd_vol *v, __u64 id)
+ {
+@@ -2810,12 +3813,156 @@ static int amd_disk_in_volumes(struct amd_super *super, __u64 id)
+ 	return 0;
+ }
+ 
++/*
++ * A disk joins the running container (udev adds disks one at a time, or
++ * mdadm --add): managemon calls add_to_super.  It only reads the disk's
++ * label and commit block and hands them, with the descriptor (ours, as IMSM
++ * keeps it), to the monitor (ATTACH): the monitor alone changes the super -
++ * it may be rebuilding the packet meanwhile.  Nothing is written here.
++ */
++static int amd_attach_disk(struct supertype *st, int fd, char *devname)
++{
++	struct amd_super *super = st->sb;
++	struct amd_metadata *md;
++	struct amd_commit *c;
++	struct amd_update_attach *u;
++	unsigned long long dsize;
++	struct stat stb;
++	void *packet;
++
++	if (!super || !super->packet || fd < 0 || !st->update_tail ||
++	    fstat(fd, &stb) != 0 || !S_ISBLK(stb.st_mode) ||
++	    !get_dev_size(fd, devname, &dsize)) {
++		amd_kmsg("cannot take %s into the container",
++			 devname ? devname : "a new disk");
++		if (fd >= 0)
++			close(fd);
++		return 1;
++	}
++	md = amd_alloc(AMD_SECTOR);
++	c = amd_alloc(AMD_SECTOR);
++	u = xcalloc(1, sizeof(*u));
++	u->type = AMD_UPDATE_ATTACH;
++	u->fd = fd;
++	u->disk = xcalloc(1, sizeof(*u->disk));	/* the monitor allocates nothing */
++	u->major = major(stb.st_rdev);
++	u->minor = minor(stb.st_rdev);
++	u->sectors = dsize / AMD_SECTOR;
++	if (md && amd_read(fd, AMD_METADATA_LBA, md, AMD_SECTOR) == 0 &&
++	    __le64_to_cpu(md->ident) == AMD_RC_IDENT) {
++		u->id = __le64_to_cpu(md->device_id);
++		u->features = __le32_to_cpu(md->features);
++		u->spare_info = __le32_to_cpu(md->spare_info);
++		u->mbr = amd_read_mbr_state(fd, md);
++	}
++	if (c && amd_read(fd, AMD_COMMIT_LBA, c, AMD_SECTOR) == 0 &&
++	    amd_check_commit(c)) {
++		u->commit_valid = 1;
++		u->generation = __le64_to_cpu(c->generation);
++		u->packet_number = __le64_to_cpu(c->packet_number);
++		u->committed_checksum = __le64_to_cpu(c->committed_checksum);
++		u->packet_lba = __le32_to_cpu(c->packet_offset);
++		u->packet_size = __le32_to_cpu(c->packet_size);
++		u->last_online = __le64_to_cpu(c->last_online_sn);
++		packet = amd_read_packet(fd, c);
++		if (packet) {
++			u->disk->device_id = u->id;
++			amd_note_own_packet(u->disk, packet, u->packet_size);
++			free(packet);
++		}
++	}
++	free(md);
++	free(c);
++	append_metadata_update(st, u, sizeof(*u));
++	super->attached = 1;
++	return 0;
++}
++
++/*
++ * ATTACH (monitor): a disk of this configuration that has seen no newer
++ * one is taken in and gets the following configurations too; one mdadm
++ * --add initialized (its record waits, fresh: amd_add_pd) has "seen" the
++ * current packet, as the disks of mdadm -C.  A disk we have open already
++ * is left alone.  Other disks - new, foreign, with a newer configuration
++ * than ours - are refused as before (the descriptor is closed).
++ */
++static void amd_attach_update(struct supertype *st,
++			      const struct amd_update_attach *u)
++{
++	struct amd_super *super = st->sb;
++	struct amd_packet_header *h = super->packet;
++	struct amd_disk *rec = u->disk;
++	struct active_array *a;
++	struct amd_disk *d;
++
++	/*
++	 * Not in the PD list: the AMD driver drops the PD of a disk it ran
++	 * without (its elements stay, offline) - such a former member is
++	 * taken in, other disks are refused.
++	 */
++	if (!u->id || !h || (amd_pd_index(super, u->id) < 0 &&
++			     !amd_disk_in_volumes(super, u->id)))
++		goto refuse;
++	d = amd_find_disk(super, u->id);
++	if (u->commit_valid && u->generation <= super->generation &&
++	    (!d || d->fd < 0)) {
++		if (!d) {
++			d = rec;
++			rec = NULL;
++			d->device_id = u->id;
++			d->fd = -1;
++			amd_add_disk(super, d);
++		} else {
++			memcpy(d->own, rec->own, sizeof(d->own));
++			d->nown = rec->nown;
++		}
++		d->commit_valid = 1;
++		d->generation = u->generation;
++		d->packet_number = u->packet_number;
++		d->committed_checksum = u->committed_checksum;
++		d->packet_lba = u->packet_lba;
++		d->packet_size = u->packet_size;
++		d->features = u->features;
++		d->label_spare = u->spare_info;
++		d->last_online = u->last_online;
++		d->foreign = u->last_online != AMD_SERIAL;
++		/*
++		 * Failed or written to in vain before it left: back, it is a
++		 * disk found anew, as on the AMD driver's rescan (PD ONLINE,
++		 * the configuration written to it: amd_disk_idle).  Its
++		 * failed elements stay so: it is no member again unless
++		 * rebuilt.
++		 */
++		d->spare_failed = 0;
++		d->write_failed = 0;
++	} else {
++		goto refuse;
++	}
++	d->mbr = u->mbr;
++	d->major = u->major;
++	d->minor = u->minor;
++	d->sectors = u->sectors;
++	d->removed = 0;
++	d->fd = u->fd;
++	dprintf("disk %016llx (%d:%d) joins the container\n",
++		(unsigned long long)u->id, u->major, u->minor);
++	/* it may be the spare, or the target of a rebuild, a volume waits for */
++	for (a = st->arrays; a; a = a->next)
++		a->check_degraded = 1;
++	free(rec);
++	return;
++refuse:
++	dprintf("disk %d:%d not taken into the container\n",
++		u->major, u->minor);
++	close(u->fd);
++	free(rec);
++}
++
+ static int add_to_super_amd(struct supertype *st, mdu_disk_info_t *dinfo,
+ 			    int fd, char *devname, unsigned long long data_offset)
+ {
+-	/* mdmon hands over a disk joining the container: not recorded yet */
+-	if (fd >= 0)
+-		close(fd);
++	if (dinfo->raid_disk < 0)
++		return amd_attach_disk(st, fd, devname);	/* mdmon */
+ 	pr_err("writing AMD RAID metadata is not supported yet\n");
+ 	return 1;
+ }
+@@ -2852,6 +3999,10 @@ static int remove_from_super_amd(struct supertype *st, mdu_disk_info_t *dk)
+ 	u->minor = dk->minor;
+ 	/* managemon calls write_init_super next: nothing to write */
+ 	((struct amd_super *)st->sb)->attached = 1;
++	if (st->update_tail) {
++		append_metadata_update(st, u, sizeof(*u));
++		return 0;
++	}
+ 	amd_remove_disk(st->sb, u);
+ 	free(u);
+ 	return 0;
+@@ -2878,13 +4029,642 @@ static int store_super_amd(struct supertype *st, int fd)
+ 	return 1;
+ }
+ 
+-/* nothing is recorded for AMD yet: mdmon leaves the volumes alone, read-only */
++/*
++ * mdmon.  Managed volumes (RAID1/RAID10 with an AMD bitmap, see
++ * amd_classify) keep their state the way the AMD driver does:
++ *  - dirty/clean in the write-intent bitmap on element [0][0]: the whole
++ *    volume is marked while md has it dirty, so that the AMD driver checks
++ *    it after a crash under Linux (and we resync after a crash under it);
++ *  - a failed member as element flags 0x10, a missing one as 0x30, and the
++ *    volume CRITICAL, in a new config packet;
++ *  - the initialization (CREATE_REDUNDANCY) of a volume made in the BIOS:
++ *    md resyncs it, and when that is done a new config packet has the
++ *    transform completed (amd_finish_init);
++ * Other volumes are not taken.
++ */
++static struct amd_vol *amd_active_vol(struct active_array *a)
++{
++	struct amd_super *super = a->container->sb;
++	int inst = a->info.container_member;
++
++	if (inst < 0 || inst >= super->nvol || !super->vol[inst].managed)
++		return NULL;
++	return &super->vol[inst];
++}
++
++/*
++ * A message that must not get lost: once mdmon runs, its stderr is
++ * /dev/null (manage_fork_fds), so the message goes to the kernel log too.
++ * The "amd: " prefix tells it from the messages of other metadata there.
++ */
++static void amd_kmsg(const char *fmt, ...)
++{
++	char msg[256], line[300];
++	va_list ap;
++	int fd, n;
++
++	va_start(ap, fmt);
++	vsnprintf(msg, sizeof(msg), fmt, ap);
++	va_end(ap);
++	pr_err("amd: %s\n", msg);
++	fd = open("/dev/kmsg", O_WRONLY | O_CLOEXEC);
++	if (fd < 0)
++		return;
++	n = snprintf(line, sizeof(line), "<5>%s: amd: %s\n", Name, msg);
++	if (write(fd, line, n) != n)
++		dprintf("/dev/kmsg: %s\n", strerror(errno));
++	close(fd);
++}
++
+ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
+ {
+-	dprintf("not managing array %d\n", inst);
++	struct amd_super *super = c->sb;
++	unsigned int first;
++	struct amd_vol *v;
++
++	if (inst < 0 || inst >= super->nvol)
++		return -ENODEV;
++	v = &super->vol[inst];
++	if (!v->managed) {
++		dprintf("not managing array %d\n", inst);
++		return -1;
++	}
++	/* unreadable counts as dirty: then we never try to write it */
++	first = 0;
++	v->mon.bitmap_dirty = amd_bitmap_read(super, v, &first) != 0;
++	v->mon.bitmap_want = v->mon.bitmap_dirty;
++	v->mon.bitmap_dirty_from = v->mon.bitmap_from = first;
++	v->mon.resync_ckpt = 0;
++	v->mon.ckpt_seen = a->last_checkpoint;
++	/*
++	 * Here already, not only as the array leaves readonly (amd_set_array_state):
++	 * an mdmon that takes a running array over never sees that.
++	 */
++	v->mon.members_checked = 0;
++	a->info.container_member = inst;
++
++	return 0;
++}
++
++static void amd_mark_missing(struct active_array *a, struct amd_vol *v);
++
++/*
++ * What md itself records as done, exact where a sync action was
++ * interrupted (frozen, md -S, the shutdown): resync_start for an
++ * initialization, the rebuilt member's recovery_start for a rebuild.  The
++ * monitor's checkpoints move only every 1/16 of the array or so, and the
++ * last, exact one comes when the action is no longer resync or recover.
++ * Only forward: an array being stopped reads 0 (md_clean), or nothing.
++ */
++static void amd_note_md_progress(struct active_array *a, struct amd_vol *v)
++{
++	if (v->init_pending && !v->mon.init_done &&
++	    a->info.resync_start != MaxSector) {
++		unsigned long long cap = __le64_to_cpu(v->ld->capacity);
++		unsigned long long done = amd_sync_to_volume(v,
++						a->info.resync_start);
++
++		if (done > v->mon.init_ckpt && done < cap) {
++			v->mon.init_ckpt = done;
++			v->mon.init_tlog = 1;	/* written by amd_sync_metadata */
++		}
++	}
++}
++
++/*
++ * The monitor's checkpoints of md's sync actions, the furthest each has
++ * reached: a resync after a crash, an initialization and a rebuild - and
++ * the end of an initialization.
++ */
++static void amd_note_checkpoints(struct active_array *a, struct amd_vol *v)
++{
++	unsigned long long ckpt;
++	int moved;
++
++	/*
++	 * The monitor keeps the last checkpoint of the previous sync action
++	 * (a recovery's, in member sectors) until the next one passes it: a
++	 * checkpoint counts only when it has moved since the last call.  The
++	 * monitor moves it only where it writes a checkpoint, and that comes
++	 * here - the first one of an action too, which may be the first call
++	 * in that action (a recovery that waited for another, DELAYED).  When
++	 * an action is complete it goes back to 0, which counts for nothing.
++	 */
++	moved = a->last_checkpoint != v->mon.ckpt_seen;
++	v->mon.ckpt_seen = a->last_checkpoint;
++	/* resync after a crash: the monitor's checkpoint, in volume sectors */
++	ckpt = amd_sync_to_volume(v, a->last_checkpoint);
++	if (!v->init_pending && a->curr_action == resync && moved &&
++	    ckpt > v->mon.resync_ckpt && ckpt < __le64_to_cpu(v->ld->capacity))
++		v->mon.resync_ckpt = ckpt;
++	/*
++	 * The initialization is done when md has ended its resync: resync_start
++	 * "none" with the array running and its sync action idle - or recover
++	 * (a recovery leaves resync_start as it is; md runs it before a resync
++	 * it owes, which then follows): a degraded volume started --force is
++	 * in sync for md from the start, the recovery of its missing member
++	 * makes its stripes whole, and that rebuild is recorded once the
++	 * initialization has ended (amd_sync_metadata).  Not while the array stops
++	 * (array_state inactive/clear, sync_action frozen or gone): what
++	 * resync_start then reads is no proof, and a completion recorded
++	 * wrongly leaves the rest of the volume unsynced for good (one stopped
++	 * at ~15% was recorded COMPLETED so).  An end missed so is only late:
++	 * the next assembly resyncs from the log.
++	 */
++	if (v->init_pending && !v->mon.init_done && is_resync_complete(&a->info) &&
++	    a->curr_state > inactive && a->curr_state != bad_word &&
++	    (a->curr_action == idle || a->curr_action == recover)) {
++		v->mon.init_done = 1;	/* recorded by amd_sync_metadata */
++		dprintf("array %d initialized\n", a->info.container_member);
++	}
++	/* initialization progress, volume sectors: the monitor's checkpoint */
++	if (v->init_pending && !v->mon.init_done && a->curr_action == resync &&
++	    moved && ckpt > v->mon.init_ckpt &&
++	    ckpt < __le64_to_cpu(v->ld->capacity)) {
++		v->mon.init_ckpt = ckpt;
++		v->mon.init_tlog = 1;	/* written by amd_sync_metadata */
++	}
++}
++
++static int amd_set_array_state(struct active_array *a, int consistent)
++{
++	struct amd_vol *v = amd_active_vol(a);
++
++	if (!v)
++		return consistent;
++	if (consistent == 2) {
++		/* before md may write: written by amd_sync_metadata first */
++		amd_mark_missing(a, v);
++		v->mon.members_checked = 1;
++		consistent = is_resync_complete(&a->info);
++		/* degraded: active, so that md rebuilds onto what it gets (as IMSM) */
++		if (amd_volume_state(a->container->sb, v) != AMD_LD_STATE_NORMAL)
++			consistent = 0;
++	}
++	/*
++	 * An initialization not done yet is in the LD and its progress in the
++	 * transform log: it leaves the bitmap to tell a crash from a clean stop.
++	 */
++	v->mon.bitmap_want = !consistent ||
++			 (!is_resync_complete(&a->info) && !v->init_pending);
++	amd_note_checkpoints(a, v);
++	amd_note_md_progress(a, v);
++	/* clean, resyncing after a crash: dirty past what md has resynced */
++	v->mon.bitmap_from = 0;
++	if (v->mon.bitmap_want && consistent && !v->init_pending) {
++		unsigned long long done = v->mon.resync_ckpt;
++		unsigned long long cover = amd_bitmap_cover(v);
++
++		if (a->info.resync_start != MaxSector &&
++		    amd_sync_to_volume(v, a->info.resync_start) > done)
++			done = amd_sync_to_volume(v, a->info.resync_start);
++		if (cover)
++			v->mon.bitmap_from = done / cover;
++	}
++	dprintf("array %d %s\n", a->info.container_member,
++		v->mon.bitmap_want ? "dirty" : "clean");
++	if (v->mon.bitmap_want && v->mon.bitmap_from)
++		dprintf("array %d bitmap from bit %u\n",
++			a->info.container_member, v->mon.bitmap_from);
++	return consistent;
++}
++
++/*
++ * Element @n of @v out of service, as the AMD driver records it: @mark
++ * (AMD_ELEMENT_FAILED or AMD_ELEMENT_OFFLINE) in the LD and its second
++ * copy, CRITICAL.  0 if it was so already.
++ */
++static int amd_fail_element(struct amd_super *super, struct amd_vol *v, int n,
++			    __u32 mark)
++{
++	struct amd_element *el = &v->el[n];
++	__u32 flags = __le32_to_cpu(el->flags);
++
++	if (flags & AMD_ELEMENT_FAILED)
++		return 0;
++	el->flags = __cpu_to_le32(flags | mark);
++	/* the same element in the second copy */
++	if (amd_link_same_shape(v)) {
++		el = &amd_link_elements(v)[n];
++		el->flags |= __cpu_to_le32(mark);
++		v->link->state = __cpu_to_le32(amd_volume_state(super, v));
++	}
++	v->ld->state = __cpu_to_le32(amd_volume_state(super, v));
++	super->config_dirty = 1;
++	return 1;
++}
++
++static void amd_set_disk(struct active_array *a, int n, int state)
++{
++	struct amd_super *super = a->container->sb;
++	struct amd_vol *v = amd_active_vol(a);
++	struct amd_disk *d;
++
++	if (!v || n < 0)
++		return;
++	if (n >= v->nel || !(state & DS_FAULTY))
++		return;
++	d = amd_find_disk(super, __le64_to_cpu(v->el[n].id.id));
++	if (d)
++		d->spare_failed = 1;	/* not rebuilt onto while here (mdmon) */
++	if (amd_fail_element(super, v, n, AMD_ELEMENT_FAILED))
++		dprintf("array %d member %d failed\n",
++			a->info.container_member, n);
++}
++
++/*
++ * The volume is about to be used with members missing (started degraded:
++ * mdadm -R, or mdadm-last-resort at boot) or stale (left out at assembly):
++ * record them as failed before md writes anything, or the copies would
++ * look in step when the disk is back.  As IMSM's handle_missing().  The
++ * AMD driver does the same in two steps: a member without its disk gets
++ * 0x20 when the volume is validated (rcblob RC_ValidateLogicalElement
++ * @0012f1e0, "logical element offline"), 0x20 becomes 0x30 on the first
++ * write (RC_UpdateDriveErrors @0012f080).  So 0x30, not the 0x10 of a
++ * failure: when the disk is back it is rebuilt in place (amd_find_spare).
++ */
++static void amd_mark_missing(struct active_array *a, struct amd_vol *v)
++{
++	struct amd_super *super = a->container->sb;
++	struct mdinfo *dev;
++	int i;
++
++	for (i = 0; i < v->nel; i++) {
++		if (!amd_slot_usable(v, i))
++			continue;
++		/* in sync in md; a spare md may already rebuild onto does not count */
++		for (dev = a->info.devs; dev; dev = dev->next)
++			if (dev->disk.raid_disk == i && (dev->curr_state & DS_INSYNC))
++				break;
++		if (dev)
++			continue;
++		if (amd_fail_element(super, v, i, AMD_ELEMENT_OFFLINE))
++			amd_kmsg("subarray-%d: member %d (disk %016llx) is missing, recorded as offline",
++				 a->info.container_member, i,
++				 (unsigned long long)__le64_to_cpu(v->el[i].id.id));
++	}
++}
++
++/*
++ * Every RAID disk a mirror or a RAID5 has in service is in the container
++ * and up to date (members md has failed aside; a rebuild target that missed
++ * some gets the next one: amd_write_config).  A configuration written
++ * without one makes it stale, and the AMD driver then drops it from its
++ * volumes - so writes that can wait, wait for this.  Not for a disk no
++ * volume needs (a free disk, a spare, a member out of service) nor for a
++ * member of volumes without redundancy only, which is taken with an older
++ * configuration too (amd_volume_disk): it gets the live configuration
++ * when it is back (amd_disk_idle), and one gone for good
++ * would hold these writes back for good - the end of an initialization
++ * never recorded, every assembly resyncing its tail again.
++ */
++static int amd_all_disks_here(struct amd_super *super)
++{
++	int i;
++
++	for (i = 0; i < super->npd; i++) {
++		__u64 id = __le64_to_cpu(super->pd[i]->id.id);
++		struct amd_disk *d;
++
++		if (__le32_to_cpu(super->pd[i]->device_type) !=
++		    AMD_DEV_RAIDCORE_DISK || amd_disk_failed(super, id) ||
++		    !amd_disk_guarded(super, NULL, id))
++			continue;
++		d = amd_find_disk(super, id);
++		/*
++		 * Failed, taken out of the container, or stale already: the
++		 * configuration it failed to take is on the other disks.
++		 */
++		if (d && (d->spare_failed || d->removed || d->write_failed))
++			continue;
++		/*
++		 * Gone, and a configuration written since says so (its PD
++		 * OFFLINE, amd_pd_states): its label is stale already, and
++		 * waiting for it would hold these writes back for good - the
++		 * end of an initialization never recorded, every assembly
++		 * initializing again (08.11, a disk pulled for good).
++		 */
++		if ((!d || d->fd < 0) &&
++		    __le32_to_cpu(super->pd[i]->device_state) == AMD_DEV_STATE_OFFLINE)
++			continue;
++		if (!d || d->fd < 0 || !amd_disk_current(super, d))
++			return 0;
++	}
++	return 1;
++}
++
++/*
++ * Index the LD records again after the packet changed shape, keeping
++ * mdmon's state of each volume.  Volume numbers do not change: of the two
++ * copies of an LD only one is ever dropped - the second, or the first when
++ * a migration has made the second the volume (amd_end_transform).
++ */
++static void amd_reparse(struct amd_super *super)
++{
++	amd_reparse_without(super, -1);
++}
++
++/* amd_reparse() after volume @gone left the packet: the later ones move down a place */
++static void amd_reparse_without(struct amd_super *super, int gone)
++{
++	/*
++	 * Not on the stack: the monitor runs on a small one (mdmon.c asks
++	 * for 4 KiB, which musl grants).  One user at a time: mdadm, or the
++	 * monitor under amd_lock - managemon never changes the packet.
++	 */
++	static struct amd_vol_mon keep[AMD_MAX_VOL];
++	int i, j, n = super->nvol;
++
++	for (i = 0; i < n; i++)
++		keep[i] = super->vol[i].mon;
++	amd_parse_packet(super);
++	for (i = 0; i < super->nvol; i++) {
++		j = gone >= 0 && i >= gone ? i + 1 : i;
++		if (j >= n)
++			break;
++		super->vol[i].mon = keep[j];
++	}
++}
++
++/*
++ * End a transform the way the AMD driver does (seen in the ring of an X399
++ * RAID10 for RESTORE_SEGMENTS and CHECK_BITMAP_REDUNDANCY, and after a
++ * migration by rcraid 9.3.3): one copy of the LD is dropped from the
++ * packet - the second, or, of a migration that has completed, the first:
++ * the volume is the LD it made (rcblob RC_TransformUpdateDriver).  The one
++ * kept has TransformType 0, LastOperation = the transform and
++ * TransformState @tstate.
++ */
++static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
++			      __u32 tstate)
++{
++	struct amd_vol *v = &super->vol[vol];
++	struct amd_ld *ld = v->ld, *gone = v->link;
++
++	super->config_dirty = 1;
++	ld->transform_type = 0;
++	ld->last_operation = __cpu_to_le32(op);
++	ld->transform_state = __cpu_to_le32(tstate);
++	ld->transform_protect_start = 0;
++	ld->transform_percent = 0;
++	ld->transform_link = 0;
++
++	if (gone)
++		amd_cut_ld(super, (char *)gone - (char *)super->packet,
++			   amd_ld_size(gone));
++	amd_trim_packet(super);
++	amd_reparse(super);
++}
++
++/* Cut @size bytes at offset @at out of the LD section of the packet. */
++static void amd_cut_ld(struct amd_super *super, unsigned int at,
++		       unsigned int size)
++{
++	struct amd_packet_header *h = super->packet;
++	char *p = super->packet;
++
++	memmove(p + at, p + at + size, super->packet_len - at - size);
++	memset(p + super->packet_len - size, 0, size);
++	h->ld_size = __cpu_to_le32(__le32_to_cpu(h->ld_size) - size);
++	amd_move_sections(h, at, -(int)size);
++}
++
++/* the packet is the sections rounded up to whole sectors */
++static void amd_trim_packet(struct amd_super *super)
++{
++	struct amd_packet_header *h = super->packet;
++	unsigned int end;
++
++	end = ROUND_UP(amd_sections_end(h), AMD_SECTOR);
++	if (end && end <= super->packet_len) {
++		super->packet_len = end;
++		h->packet_size = __cpu_to_le32(end);
++	}
++}
++
++/* Record a finished initialization (CREATE_REDUNDANCY). */
++static void amd_finish_init(struct amd_super *super, int vol)
++{
++	struct amd_ld *ld = super->vol[vol].ld;
++
++	if (ld->state == 0)
++		ld->state = __cpu_to_le32(AMD_LD_STATE_NORMAL);
++	super->vol[vol].mon.init_tlog = 2;	/* cleared once the end is written */
++	amd_end_transform(super, vol, AMD_TRANSFORM_CREATE_REDUNDANCY,
++			  AMD_TRANSFORM_COMPLETED);
++}
++
++/* write the configuration if it has changed */
++static void amd_flush_config(struct supertype *st)
++{
++	struct amd_super *super = st->sb;
++
++	if (!super->config_dirty)
++		return;
++	if (amd_write_config(super) != 0) {
++		amd_kmsg("cannot write the configuration");
++		return;
++	}
++	super->config_dirty = 0;
++}
++
++/*
++ * An idle disk (amd_disk_idle) with an older configuration, or another one
++ * under the same generation (written on its own: a fork) - back in the
++ * container, or so when mdmon started - gets the live one as it is, under
++ * its generation: a new one would make stale the disks still on their way
++ * (-I per disk) and their members out of date.  Only while the packet in
++ * memory is the one committed; else the next configuration written
++ * reaches the disk (amd_write_config).
++ */
++static void amd_catch_up(struct amd_super *super)
++{
++	struct amd_packet_header *h = super->packet;
++	unsigned int nsec = (super->packet_len + AMD_SECTOR - 1) / AMD_SECTOR;
++	struct amd_disk *d;
++
++	if (!h || !super->iobuf || super->config_dirty)
++		return;
++	for (d = super->disks; d; d = d->next) {
++		/* an older one, or another packet under this generation */
++		if (!amd_disk_idle(super, d) || amd_disk_current(super, d))
++			continue;
++		if (amd_checksum((char *)h + 0x0c, super->packet_len - 0x0c) !=
++		    __le64_to_cpu(h->checksum))
++			return;
++		if (amd_put_packet(d, h, nsec) == 0 &&
++		    amd_put_commit(super, d, super->generation) == 0)
++			amd_kmsg("disk %d:%d missed configurations: it has the live one again",
++				 d->major, d->minor);
++	}
++}
++
++/* write the transform log of @vol at @done, or say it could not */
++static int amd_sync_tlog(struct amd_super *super, int vol,
++			 unsigned long long done, __u32 type)
++{
++	struct amd_vol *v = &super->vol[vol];
++
++	if (amd_tlog_write(super, v, v->link, 0, done, type) == 0)
++		return 0;
++	amd_kmsg("cannot write the transform log of subarray-%d", vol);
+ 	return -1;
+ }
+ 
++/*
++ * md's own progress records, of every array of the monitor.  An array the
++ * monitor let go of (stopped, or clean on SIGTERM) stays on the list with
++ * no container until the manager drops it.
++ */
++static void amd_sync_progress(struct supertype *st)
++{
++	struct active_array *a;
++
++	for (a = st->arrays; a; a = a->next) {
++		struct amd_vol *v;
++
++		if (!a->container || a->to_remove)
++			continue;
++		v = amd_active_vol(a);
++		if (!v)
++			continue;
++		/*
++		 * A volume this mdmon found running (it took over from another
++		 * mdmon, or was started anew) never is read-only for it, so
++		 * set_array_state(2) did not look: a member md lost meanwhile -
++		 * failed as the other mdmon left, its record written after this
++		 * one read the configuration - is recorded now, once the monitor
++		 * has read the array's state.  In service in the packet, it would
++		 * be taken in sync at the next assembly.
++		 */
++		if (!v->mon.members_checked && a->curr_state > readonly &&
++		    a->curr_state != bad_word) {
++			amd_mark_missing(a, v);
++			v->mon.members_checked = 1;
++		}
++		amd_note_md_progress(a, v);
++	}
++}
++
++/* The transform logs of the volumes, and the transforms md has finished */
++static void amd_sync_transforms(struct amd_super *super)
++{
++	int vol;
++
++	for (vol = 0; vol < super->nvol; vol++) {
++		struct amd_vol *v = &super->vol[vol];
++
++		/* initialization progress, logged as the AMD driver does per region */
++		if (v->init_pending && !v->mon.init_done && v->mon.init_tlog == 1 &&
++		    v->link && amd_sync_tlog(super, vol, v->mon.init_ckpt,
++					     AMD_TRANSFORM_CREATE_REDUNDANCY) == 0)
++			v->mon.init_tlog = 0;
++		if (v->init_pending && v->mon.init_done && amd_all_disks_here(super))
++			amd_finish_init(super, vol);
++	}
++}
++
++/* The transform has ended in the config: its log goes */
++static void amd_sync_ended_logs(struct amd_super *super)
++{
++	int vol;
++
++	for (vol = 0; vol < super->nvol && !super->config_dirty; vol++) {
++		struct amd_vol *v = &super->vol[vol];
++
++		if (v->mon.init_tlog == 2 && amd_tlog_write(super, v, v->ld, 1, 0, 0) == 0)
++			v->mon.init_tlog = 0;
++	}
++}
++
++/* The write-intent bitmaps of the managed volumes, as md has them */
++static void amd_sync_bitmaps(struct amd_super *super)
++{
++	int vol;
++
++	for (vol = 0; vol < super->nvol; vol++) {
++		struct amd_vol *v = &super->vol[vol];
++
++		if (!v->managed || (v->mon.bitmap_want == v->mon.bitmap_dirty &&
++				    (!v->mon.bitmap_want ||
++				     v->mon.bitmap_from == v->mon.bitmap_dirty_from)))
++			continue;
++		/*
++		 * With no disk for element [0][0] there is no bitmap to write,
++		 * and the AMD driver skips its I/O then too (rcblob
++		 * RC_Raid10NLogicalToPhysical): no message, and it is written
++		 * once a member holds [0][0] again.
++		 */
++		if (amd_bitmap_write(super, v, v->mon.bitmap_want, v->mon.bitmap_from) == 0) {
++			v->mon.bitmap_dirty = v->mon.bitmap_want;
++			v->mon.bitmap_dirty_from = v->mon.bitmap_from;
++		} else if (amd_bitmap_disk(super, v)) {
++			amd_kmsg("cannot write the bitmap of subarray-%d", vol);
++		}
++	}
++}
++
++/* The monitor calls us after every pass. */
++static void amd_sync_metadata(struct supertype *st)
++{
++	struct amd_super *super = st->sb;
++
++	if (!super)
++		return;
++	amd_sync_progress(st);
++	amd_sync_transforms(super);
++	amd_flush_config(st);
++	amd_sync_ended_logs(super);
++	amd_catch_up(super);
++	amd_sync_bitmaps(super);
++}
++
++/* the size of an update of each type */
++static const unsigned int amd_update_size[] = {
++	[AMD_UPDATE_REMOVE]	= sizeof(struct amd_update_disk),
++	[AMD_UPDATE_ATTACH]	= sizeof(struct amd_update_attach),
++};
++
++/*
++ * The type of @update, or 0 if it is none or the update is not of its
++ * size: each type is its structure exactly.
++ */
++static int amd_update_type(const struct metadata_update *update)
++{
++	int type;
++
++	if (update->len < (int)sizeof(type))
++		return 0;
++	type = *(int *)update->buf;
++	if (type <= 0 || type >= (int)ARRAY_SIZE(amd_update_size))
++		return 0;
++	if (update->len != (int)amd_update_size[type])
++		return 0;
++	return type;
++}
++
++static void amd_process_update(struct supertype *st,
++			       struct metadata_update *update)
++{
++	struct amd_super *super = st->sb;
++	void *buf = update->buf;
++	struct active_array *a;
++
++	if (!super)
++		return;
++	switch (amd_update_type(update)) {
++	case AMD_UPDATE_REMOVE:
++		amd_remove_disk(super, buf);
++		break;
++	case AMD_UPDATE_ATTACH:
++		amd_attach_update(st, buf);
++		break;
++		for (a = st->arrays; a; a = a->next)
++			a->check_degraded = 1;
++		break;
++	}
++}
++
+ static int amd_in_volume(const struct amd_vol *v, __u64 id)
+ {
+ 	int i;
+@@ -2895,6 +4675,82 @@ static int amd_in_volume(const struct amd_vol *v, __u64 id)
+ 	return 0;
+ }
+ 
++/*
++ * mdmon's two threads share the metadata.  The monitor changes the config
++ * packet on its own (a failure, a member marked missing, the end of an
++ * init or a rebuild - not only in process_update), its records move,
++ * while managemon may be walking it in activate_spare or filling a volume
++ * in open_new: one of them at a time.  Neither waits for the other with
++ * the lock held, and managemon holds it only briefly: it reads a sector or
++ * two (the AMD bitmap, a transform log) into mmbuf, what asks the disks
++ * themselves runs unlocked (amd_mm_open_new, amd_mm_activate_spare), and so
++ * does all it allocates - the monitor would wait for that (amd_mm_room).
++ * An atomic flag, not a pthread lock: without USE_PTHREADS the monitor is
++ * a clone() of managemon sharing its TLS.
++ */
++static void amd_lock(struct amd_super *super)
++{
++	while (__atomic_test_and_set(&super->busy, __ATOMIC_ACQUIRE))
++		sleep_for(0, USEC_TO_NSEC(50), true);
++}
++
++static void amd_unlock(struct amd_super *super)
++{
++	__atomic_clear(&super->busy, __ATOMIC_RELEASE);
++}
++
++static int amd_mm_open_new(struct supertype *c, struct active_array *a,
++			   int inst)
++{
++	struct amd_super *super = c->sb;
++	int rv;
++
++	amd_lock(super);
++	rv = amd_open_new(c, a, inst);
++	amd_unlock(super);
++	return rv;
++}
++
++/* rebuilds are not recorded for AMD yet: md runs a volume degraded */
++static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
++					    struct metadata_update **updates)
++{
++	return NULL;
++}
++
++/* the monitor */
++static int amd_mon_set_array_state(struct active_array *a, int consistent)
++{
++	int rv;
++
++	amd_lock(a->container->sb);
++	rv = amd_set_array_state(a, consistent);
++	amd_unlock(a->container->sb);
++	return rv;
++}
++
++static void amd_mon_set_disk(struct active_array *a, int n, int state)
++{
++	amd_lock(a->container->sb);
++	amd_set_disk(a, n, state);
++	amd_unlock(a->container->sb);
++}
++
++static void amd_mon_sync_metadata(struct supertype *st)
++{
++	amd_lock(st->sb);
++	amd_sync_metadata(st);
++	amd_unlock(st->sb);
++}
++
++static void amd_mon_process_update(struct supertype *st,
++				   struct metadata_update *update)
++{
++	amd_lock(st->sb);
++	amd_process_update(st, update);
++	amd_unlock(st->sb);
++}
++
+ struct superswitch super_amd = {
+ 	.examine_super	= examine_super_amd,
+ 	.brief_examine_super = brief_examine_super_amd,
+@@ -2923,5 +4779,10 @@ struct superswitch super_amd = {
+ 	.name		= "amd",
+ 
+ /* for mdmon */
+-	.open_new	= amd_open_new,
++	.open_new	= amd_mm_open_new,
++	.set_array_state = amd_mon_set_array_state,
++	.set_disk	= amd_mon_set_disk,
++	.sync_metadata	= amd_mon_sync_metadata,
++	.process_update	= amd_mon_process_update,
++	.activate_spare	= amd_mm_activate_spare,
+ };
+-- 
+2.47.3
+

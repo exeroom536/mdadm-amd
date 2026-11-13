@@ -1,0 +1,68 @@
+From 4a6c27b437c90a068b0b944eaa9b1910e6d237c3 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:27 +0500
+Subject: [PATCH 16/32] Assemble: look at every slotless device for the newest
+ superblock
+
+Assemble() bases the array on the superblock of the newest device and
+looks for it only at the even entries of best[]: the odd ones are the
+replacements of the active slots.  Devices without a slot (raid_disk -1)
+do not come in pairs, though: they get consecutive entries from
+raid_disks * 2 on.  When the members of a container report no slot, as
+AMD RAIDXpert2 disks do, and the newest one sits at an odd entry while
+the even ones hold older disks, no device is chosen and the container
+does not assemble: "No suitable drives found".
+
+That is the case after a degraded boot: the disk that was absent comes
+back with an older configuration, and with "mdadm --assemble --scan" it
+is found first when it comes first in /proc/partitions (a Debian
+initramfs: the root array does not assemble, the boot hangs in
+local-block).  With the disks named in the other order it assembles.
+
+Look at the even entries first, as before, then at the odd ones.  The
+choice changes only where none was found before: when no active slot
+holds an up-to-date device with the newest superblock.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Assemble.c | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/Assemble.c b/Assemble.c
+index cff24a59..08a3f92b 100644
+--- a/Assemble.c
++++ b/Assemble.c
+@@ -1380,7 +1380,7 @@ int Assemble(char *mddev, struct mddev_ident *ident,
+ 	int devcnt;
+ 	unsigned int okcnt, sparecnt, rebuilding_cnt, journalcnt;
+ 	int journal_clean = 0;
+-	int i;
++	int i, n, half;
+ 	int was_forced = 0;
+ 	int most_recent = 0;
+ 	int chosen_drive;
+@@ -1713,9 +1713,18 @@ try_again:
+ 	 */
+ 	chosen_drive = -1;
+ 	st->ss->free_super(st);
+-	for (i=0; chosen_drive < 0 && i<bestcnt; i+=2) {
+-		int j = best[i];
+-		int fd;
++	/*
++	 * The active slots (even entries) first, then the odd ones: devices
++	 * without a slot - the members of a container whose metadata gives
++	 * none - get consecutive entries, so the newest of them may be at an
++	 * odd one.
++	 */
++	half = (bestcnt + 1) / 2;
++	for (n = 0; chosen_drive < 0 && n < bestcnt; n++) {
++		int j, fd;
++
++		i = n < half ? n * 2 : (n - half) * 2 + 1;
++		j = best[i];
+ 
+ 		if (j<0)
+ 			continue;
+-- 
+2.47.3
+

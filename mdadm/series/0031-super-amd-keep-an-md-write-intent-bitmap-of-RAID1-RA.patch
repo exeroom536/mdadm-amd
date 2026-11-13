@@ -1,0 +1,1231 @@
+From af071d91baee8d988876cf604a68b773bd8f6dc6 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:57:14 +0500
+Subject: [PATCH 31/32] super-amd: keep an md write-intent bitmap of RAID1,
+ RAID10 and RAID5
+
+The AMD write-intent bitmap is coarse - 4096 bits for the volume, 8 GiB
+a bit on a 20 TB one - and mdmon marks it all while md has the volume
+active, so that the AMD driver checks the volume after a crash under
+Linux.  md then resyncs it from the first bit set: all of it.
+
+Give RAID1, RAID10 and RAID5 volumes under mdmon md's own bitmap, as
+IMSM does (not RAIDABLE: a raid1 of one member has nothing to resync):
+md keeps only the bits (bitmap/metadata=external), at one LBA on every
+member.
+
+- mdadm --create --bitmap=internal (and --bitmap-chunk) gives a new
+  volume one; --update-subarray --update=bitmap or no-bitmap adds or
+  removes it on a stopped volume.  It is off by default, as for IMSM.
+- It lies in sectors 0x100-0x5ff of each member's service area (from
+  its AllocatedSpace offset, not from the data, which a migration of
+  the AMD driver moves): a header page, then 636 KiB of bits - 64 MiB a
+  bit up to 318 TiB, larger chunks beyond.  The AMD firmware and drivers
+  use +0 (transform log), +2 (array scan log), +0x80 (their bitmap) and
+  +0x600 on (the data-move log of a migration) and nothing else there; a
+  pattern written there outlived the AMD Linux and Windows drivers and
+  the firmware in emulation.  A volume whose members do not all start at
+  one LBA, or have no room for it in front of their data, has no bitmap.
+- AMD's metadata has no field for it: the header says the volume has
+  one, and mdmon keeps in it the AMD configuration and AMD bitmap it
+  wrote last.  If they differ at assembly, the AMD driver ran the
+  volume since (it writes a configuration as it starts and sets its
+  bits before it writes): md's bits are not trusted, and those under
+  the AMD bitmap's bits are set, or all of them.
+- md writes the bits at the same LBA on a new member: a spare's extent
+  goes there if it has room (the AMD driver takes any extent the
+  configuration gives); if not, md drops the bitmap before the rebuild
+  and the volume goes on without one.
+- --examine shows the bitmap: chunk, bits set, what mdmon last wrote.
+
+From 6.18 md cannot set up a bitmap for external metadata (an inactive
+array has no md/bitmap/; IMSM is hit the same way) until md is fixed
+("md/md-bitmap: fix write-intent bitmap setup for external metadata").
+On such a kernel set_bitmap() warns and the volume runs without the
+bitmap, as it did before this patch: a crash resyncs it whole.
+
+An mdadm without this patch leaves the md bits of a volume as they are,
+and the next mdadm with it would trust them; mdadm.8 says to give such
+a volume --update=no-bitmap and --update=bitmap (every bit set) before
+it runs again.
+
+Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
+---
+ super-amd.c | 1000 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 996 insertions(+), 4 deletions(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index 98d8c3e6..133b896b 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -479,6 +479,12 @@ struct amd_vol_mon {
+ 	unsigned long long md_writes;	/* sectors md had written at open_new */
+ 	unsigned long long init_ckpt;	/* volume sectors md has initialized */
+ 	int init_tlog;		/* 1: write init_ckpt to the log, 2: clear it */
++	unsigned int md_bitmap;	/* md runs its md bitmap: sectors a bit, or 0 */
++	int mdbm_drop;		/* ... no room for a spare at its LBA: md is to stop it */
++	int mdbm_wipe;		/* ... stopped so: clear its headers */
++	__u64 mdbm_gen;		/* generation the headers say, 0: to be written */
++	__u64 mdbm_sum;		/* ... and config checksum */
++	__u32 mdbm_amd;		/* ... and AMD bitmap */
+ 	unsigned int trim_gran;	/* TRIM capped (amd_limit_trim): discard_granularity before */
+ };
+ 
+@@ -537,6 +543,8 @@ struct amd_super {
+ 	int npick;		/* of them, given on the command line */
+ 	int fill;		/* no size asked: a Volume takes all the room of each disk */
+ 	int whole;		/* it is a RAIDABLE: one whole disk free of volumes */
++	unsigned int new_mdbm;	/* --bitmap=internal: its md bitmap, sectors a bit */
++	bool new_mdbm_clean;	/* ... --assume-clean: no bit set */
+ };
+ 
+ static int amd_open_new(struct supertype *c, struct active_array *a, int inst);
+@@ -2853,6 +2861,8 @@ static void amd_getinfo_new_volume(struct supertype *st, struct mdinfo *info)
+ 		info->array.state &= ~(1 << MD_SB_CLEAN);
+ 		info->resync_start = 0;
+ 	}
++	if (super->new_mdbm)
++		info->consistency_policy = CONSISTENCY_POLICY_BITMAP;
+ 	if (super->add_slot >= 0 && super->add_slot < v->nel) {
+ 		struct amd_element *el = &v->el[super->add_slot];
+ 		struct amd_disk *d = amd_find_disk(super,
+@@ -3988,6 +3998,580 @@ static void amd_volume_devs(struct amd_super *super, struct amd_vol *v,
+ 	}
+ }
+ 
++/*
++ * md's own write-intent bitmap ("md bitmap") for a RAID1, RAID10 or RAID5
++ * under mdmon: after a crash md resyncs only what it was writing, not the
++ * whole volume.  The AMD bitmap is far coarser (4096 bits for the volume,
++ * 8 GiB a bit on a 20 TB one) and only on element [0][0].  As for IMSM, md
++ * keeps the bits alone (bitmap/metadata=external: no md superblock, the
++ * kernel reads and writes nothing but the bits) at one LBA on every member
++ * (bitmap/location is added to rdev->sb_start, 0 for a member of external
++ * metadata): the elements must all start at one AllocatedSpace.SectorOffset.
++ *
++ * Its area is AllocatedSpace + 0x100 .. + 0x600 of each element.  The AMD
++ * firmware and drivers use +0 (transform log), +2 (array scan log), +0x80
++ * (their bitmap) and +0x600 (the data-move log of a migration) of the
++ * service area, nothing else (rcblob, rcraid.sys 9.3.3.218, RAIDCoreDxe;
++ * a pattern there outlived rcraid, the Windows driver and the firmware -
++ * notes/agent-bitmap-space.md).  Counted from AllocatedSpace, not from the
++ * user data: a migration of the AMD driver moves that to +0x800.  Our
++ * header takes the first page, the bits the rest.  The header alone says
++ * that the volume has an md bitmap - AMD's metadata has no field for it -
++ * and it has to be checked on each member: the AMD drivers neither copy
++ * nor clear the area, a rebuild leaves on the new element what the disk
++ * had there.
++ */
++#define AMD_MDBM_OFFSET		0x100	/* from AllocatedSpace.SectorOffset */
++#define AMD_MDBM_SECTORS	0x500
++#define AMD_MDBM_HEADER		8	/* sectors: a page, the kernel writes the bits in pages */
++#define AMD_MDBM_ROOM		((AMD_MDBM_SECTORS - AMD_MDBM_HEADER) * AMD_SECTOR)
++#define AMD_MDBM_CHUNK		(64 << 20)	/* bytes per bit, at least (as IMSM) */
++#define AMD_MDBM_CHUNK_MAX	(1U << 21)	/* sectors: 1 GiB a bit, 5 PiB in all */
++#define AMD_MDBM_DAEMON		5	/* bitmap/time_base, seconds (as IMSM) */
++#define AMD_MDBM_VERSION	1
++/*
++ * amd_mdbm.amd_bitmap: the AMD bitmap as mdmon writes it in this session -
++ * k: clean, or dirty from bit k to the end (one header for both, so that a
++ * write to an idle volume costs the headers nothing); AMD_MDBM_AMD_CLEAN:
++ * clean only, as mdmon left it when md stopped the array (or as set_bitmap
++ * found it).
++ */
++#define AMD_MDBM_AMD_CLEAN	0xffffffffU
++#define AMD_MDBM_AMD_UNKNOWN	0xfffffffeU	/* not read (no element [0][0]), or not mdmon's */
++#define AMD_MDBM_UNKEPT		0xfffffffdU	/* md keeps no bits: trust none */
++
++#define AMD_MDBM_MAGIC	"mdadmWIB"	/* amd_mdbm.magic, without the NUL */
++
++struct amd_mdbm {
++	__u64 checksum;		/* amd_sector_sum */
++	char magic[8];
++	__u32 version;
++	__u32 chunk;		/* sectors a bit covers */
++	__u64 volume_id;	/* the LD's: no header of a volume deleted before */
++	__u64 bits_lba;		/* bitmap/location */
++	__u64 sync_sectors;	/* what the bits cover: md's resync_max_sectors */
++	/*
++	 * The AMD configuration and bitmap as mdmon last wrote them: still
++	 * so, and no one else has written the volume since (amd_mdbm_own).
++	 */
++	__u64 generation;
++	__u64 config_checksum;
++	__u32 amd_bitmap;
++	__u32 reserved[111];
++} __attribute__((packed));
++
++_Static_assert(sizeof(struct amd_mdbm) == AMD_SECTOR, "md bitmap header");
++
++/*
++ * The md bitmap area of @el ends where its user data begins, or before: the
++ * AMD drivers put the data 0x5000 or 0x800 sectors into the element (rcblob
++ * IsElementSnapDown, IsElementSnapUp), but the offsets are read from the
++ * disk - an element laid out otherwise has no room for the area.
++ */
++static int amd_mdbm_room(const struct amd_element *el)
++{
++	unsigned long long at = __le64_to_cpu(el->allocated.offset);
++	unsigned long long data = __le64_to_cpu(el->user_data.offset);
++
++	return data >= at && data - at >= AMD_MDBM_OFFSET + AMD_MDBM_SECTORS;
++}
++
++/* LBA of the md bitmap area of @v (its header), or 0 if it can have none */
++static unsigned long long amd_mdbm_lba(const struct amd_vol *v)
++{
++	unsigned long long base = 0;
++	int i, slot = amd_rebuild_slot(v);
++
++	if (!v->managed || v->single || v->grow ||
++	    (v->level != 1 && v->level != 10 && v->level != 5))
++		return 0;
++	for (i = 0; i < v->nel; i++) {
++		unsigned long long at = __le64_to_cpu(v->el[i].allocated.offset);
++
++		if (!amd_slot_usable(v, i))
++			continue;
++		if ((base && at != base) || !amd_mdbm_room(&v->el[i]))
++			return 0;
++		base = at;
++	}
++	/* the target of a rebuild the AMD driver started joins them */
++	if (slot >= 0 &&
++	    (__le64_to_cpu(amd_link_elements(v)[slot].allocated.offset) != base ||
++	     !amd_mdbm_room(&amd_link_elements(v)[slot])))
++		return 0;
++	if (!base || base % AMD_MDBM_HEADER)
++		return 0;
++	return base + AMD_MDBM_OFFSET;
++}
++
++/* sectors the bits cover: md's resync_max_sectors (amd_sync_to_volume) */
++static unsigned long long amd_mdbm_sync(const struct amd_vol *v)
++{
++	return amd_volume_to_sync(v, __le64_to_cpu(v->ld->capacity));
++}
++
++static unsigned long long amd_mdbm_nbits(const struct amd_vol *v,
++					 unsigned int chunk)
++{
++	return (amd_mdbm_sync(v) + chunk - 1) / chunk;
++}
++
++/*
++ * Bytes of bits at @chunk sectors a bit, in whole pages as md writes them.
++ * Not a size_t: where that has 32 bits, the bits of a large volume at a
++ * small @chunk (a header's, --bitmap-chunk) would seem to fit the area.
++ */
++static unsigned long long amd_mdbm_bytes(const struct amd_vol *v,
++					 unsigned int chunk)
++{
++	return ROUND_UP((amd_mdbm_nbits(v, chunk) + 7) / 8, 4096ULL);
++}
++
++/*
++ * Sectors a bit covers: @want (--bitmap-chunk), or the least power of two
++ * from 64 MiB up whose bits fit the area - 64 MiB a bit covers 318 TiB.
++ * 0 if @want does not fit.
++ */
++static unsigned int amd_mdbm_chunk(const struct amd_vol *v, unsigned int want)
++{
++	unsigned int chunk = want ? want : AMD_MDBM_CHUNK / AMD_SECTOR;
++
++	while (amd_mdbm_bytes(v, chunk) > AMD_MDBM_ROOM) {
++		if (want || chunk >= AMD_MDBM_CHUNK_MAX)
++			return 0;
++		chunk <<= 1;
++	}
++	return chunk;
++}
++
++/* @h is a header of @v's md bitmap, of its geometry now */
++static int amd_mdbm_valid(const struct amd_vol *v, const struct amd_mdbm *h)
++{
++	unsigned int chunk = __le32_to_cpu(h->chunk);
++
++	return __le64_to_cpu(h->checksum) == amd_sector_sum(h) &&
++	       memcmp(h->magic, AMD_MDBM_MAGIC, sizeof(h->magic)) == 0 &&
++	       __le32_to_cpu(h->version) == AMD_MDBM_VERSION &&
++	       h->volume_id == v->ld->id.id &&
++	       __le64_to_cpu(h->bits_lba) == amd_mdbm_lba(v) + AMD_MDBM_HEADER &&
++	       __le64_to_cpu(h->sync_sectors) == amd_mdbm_sync(v) &&
++	       chunk && (chunk & (chunk - 1)) == 0 &&
++	       chunk <= AMD_MDBM_CHUNK_MAX &&
++	       amd_mdbm_bytes(v, chunk) <= AMD_MDBM_ROOM;
++}
++
++static void amd_mdbm_header(struct amd_super *super, const struct amd_vol *v,
++			    unsigned int chunk, __u32 amd, struct amd_mdbm *h)
++{
++	const struct amd_packet_header *p = super->packet;
++
++	memset(h, 0, sizeof(*h));
++	memcpy(h->magic, AMD_MDBM_MAGIC, sizeof(h->magic));
++	h->version = __cpu_to_le32(AMD_MDBM_VERSION);
++	h->chunk = __cpu_to_le32(chunk);
++	h->volume_id = v->ld->id.id;
++	h->bits_lba = __cpu_to_le64(amd_mdbm_lba(v) + AMD_MDBM_HEADER);
++	h->sync_sectors = __cpu_to_le64(amd_mdbm_sync(v));
++	h->generation = __cpu_to_le64(super->generation);
++	h->config_checksum = p->checksum;
++	h->amd_bitmap = __cpu_to_le32(amd);
++	h->checksum = __cpu_to_le64(amd_sector_sum(h));
++}
++
++/*
++ * The disks of @v's members in service that are here and up to date, and
++ * where the md bitmap area of each is (if @lba).  With @every, the disks of
++ * all its elements that are here: one out of service keeps what its area
++ * has, and a rebuild in place (amd_spare_own) would bring a header back -
++ * unless its extent is another volume's by now (amd_extent_given_away).
++ */
++static int amd_mdbm_disks(struct amd_super *super, const struct amd_vol *v,
++			  int every, struct amd_disk **disks,
++			  unsigned long long *lba)
++{
++	int i, n = 0;
++
++	for (i = 0; i < v->nel && n < AMD_MAX_PD; i++) {
++		__u64 id = __le64_to_cpu(v->el[i].id.id);
++		struct amd_disk *d;
++
++		if (!amd_slot_usable(v, i) &&
++		    (!every || amd_extent_given_away(super, v, i)))
++			continue;
++		d = every ? amd_find_disk(super, id) : amd_member_disk(super, id);
++		if (!d || (!d->major && !d->minor) || d->removed ||
++		    d->spare_failed)
++			continue;
++		if (lba)
++			lba[n] = __le64_to_cpu(v->el[i].allocated.offset) +
++				 AMD_MDBM_OFFSET;
++		disks[n++] = d;
++	}
++	return n;
++}
++
++/* Read the area past the page cache: md writes the bits so. */
++static int amd_mdbm_pread(const struct amd_disk *d, unsigned long long lba,
++			  void *buf, size_t len)
++{
++	int fd = amd_dev_open(d->major, d->minor, O_RDONLY | O_DIRECT);
++	int rv;
++
++	if (!is_fd_valid(fd))
++		return -1;
++	rv = amd_read(fd, lba, buf, len);
++	close(fd);
++	return rv;
++}
++
++/*
++ * Write header @h and, unless NULL, @len bytes of bits @bits to the area at
++ * LBA @lba of disk @d: through the container's descriptor if there is one
++ * (mdmon; mdadm with the container loaded), else past the page cache - and
++ * on the media either way (fsync).  Bits are only written before md runs
++ * the bitmap, md never writes the header's page, and the area is read past
++ * the page cache only (amd_mdbm_pread): what the page cache keeps of it is
++ * never read back nor written over md's.  The bits first: a header names
++ * bits that are there.
++ */
++static int amd_mdbm_write(struct amd_disk *d, unsigned long long lba,
++			  const struct amd_mdbm *h, const void *bits,
++			  size_t len)
++{
++	off_t at = (off_t)lba * AMD_SECTOR;
++	int fd = d->fd >= 0 ? d->fd :
++		 amd_dev_open(d->major, d->minor, O_RDWR | O_DIRECT);
++	int rv = -1;
++
++	if (!is_fd_valid(fd))
++		return -1;
++	if (bits && pwrite(fd, bits, len, at + AMD_MDBM_HEADER * AMD_SECTOR) !=
++		    (ssize_t)len)
++		goto out;
++	if (pwrite(fd, h, AMD_SECTOR, at) == AMD_SECTOR && fsync(fd) == 0)
++		rv = 0;
++out:
++	if (fd != d->fd)
++		close(fd);
++	return rv;
++}
++
++/*
++ * ... on the members of @v here (amd_mdbm_disks), @every: on all its
++ * elements.  0, or -1 if some write failed.
++ */
++static int amd_mdbm_put(struct amd_super *super, const struct amd_vol *v,
++			int every, const struct amd_mdbm *h, const void *bits,
++			size_t len)
++{
++	struct amd_disk *disks[AMD_MAX_PD];
++	unsigned long long lba[AMD_MAX_PD];
++	int i, n = amd_mdbm_disks(super, v, every, disks, lba), rv = 0;
++
++	for (i = 0; i < n; i++)
++		if (amd_mdbm_write(disks[i], lba[i], h, bits, len) != 0)
++			rv = -1;
++	return n ? rv : -1;
++}
++
++/*
++ * @v has no md bitmap any more: no header on any of its elements - else
++ * the next assembly would see one and take the bitmap up again.  The zero
++ * sector is iobuf: the monitor allocates nothing (amd_mm_room).
++ */
++static int amd_mdbm_clear(struct amd_super *super, const struct amd_vol *v)
++{
++	if (!super->iobuf)
++		return -1;
++	memset(super->iobuf, 0, AMD_SECTOR);
++	return amd_mdbm_put(super, v, 1, super->iobuf, NULL, 0);
++}
++
++/* the first header of @v's md bitmap on a member here, into @h (a sector) */
++static int amd_mdbm_find(struct amd_super *super, const struct amd_vol *v,
++			 struct amd_mdbm *h)
++{
++	unsigned long long lba = amd_mdbm_lba(v);
++	struct amd_disk *disks[AMD_MAX_PD];
++	int i, n = amd_mdbm_disks(super, v, 0, disks, NULL);
++
++	for (i = 0; lba && i < n; i++)
++		if (amd_mdbm_pread(disks[i], lba, h, AMD_SECTOR) == 0 &&
++		    amd_mdbm_valid(v, h))
++			return 1;
++	return 0;
++}
++
++/* some member of @v here has a header of its md bitmap */
++static int amd_mdbm_present(struct amd_super *super, const struct amd_vol *v)
++{
++	struct amd_mdbm *h = amd_alloc(AMD_SECTOR);
++	int found = h && amd_mdbm_find(super, v, h);
++
++	free(h);
++	return found;
++}
++
++/*
++ * The headers of @v's md bitmap (@chunk sectors a bit) trust no bits
++ * (AMD_MDBM_UNKEPT): md does not keep them, or is about to stop.  0, or -1
++ * if some write failed.
++ */
++static int amd_mdbm_unkept(struct amd_super *super, const struct amd_vol *v,
++			   unsigned int chunk)
++{
++	struct amd_mdbm *h = super->mmbuf;	/* managemon's: amd_mdbm_stop */
++
++	if (!h)
++		return -1;
++	amd_mdbm_header(super, v, chunk, AMD_MDBM_UNKEPT, h);
++	return amd_mdbm_put(super, v, 0, h, NULL, 0);
++}
++
++/*
++ * A new md bitmap of @v: @chunk sectors a bit, every bit @fill (0 or 0xff).
++ * md keeps none of them yet: set_bitmap takes them up.
++ */
++static int amd_mdbm_init(struct amd_super *super, struct amd_vol *v,
++			 unsigned int chunk, int fill)
++{
++	size_t len = amd_mdbm_bytes(v, chunk);
++	struct amd_mdbm *h = amd_alloc(AMD_SECTOR);
++	void *bits = amd_alloc(len);
++	int rv = -1;
++
++	if (h && bits) {
++		memset(bits, fill, len);
++		amd_mdbm_header(super, v, chunk, AMD_MDBM_UNKEPT, h);
++		rv = amd_mdbm_put(super, v, 0, h, bits, len);
++	}
++	free(h);
++	free(bits);
++	return rv;
++}
++
++/*
++ * AMD bitmap @buf of @v as mdmon writes it: AMD_MDBM_AMD_CLEAN, the bit it is
++ * dirty from - or AMD_MDBM_AMD_UNKNOWN, not so (the AMD driver's own bits).
++ */
++static __u32 amd_bitmap_pattern(const struct amd_vol *v, const __u8 *buf)
++{
++	__u8 want[AMD_BITMAP_BYTES];
++	int first = amd_bitmap_first(v, buf);
++
++	if (first < 0)
++		return AMD_MDBM_AMD_CLEAN;
++	amd_bitmap_fill(v, want, 1, first);
++	return memcmp(want, buf, sizeof(want)) ? AMD_MDBM_AMD_UNKNOWN : (__u32)first;
++}
++
++/*
++ * Header @h is mdmon's last word, and no one has written the volume since:
++ * the AMD configuration is still the one it wrote or found (the AMD drivers
++ * write theirs as they start, rcraid.sys 9.3.3.218 RC_ConfigInit; the BIOS
++ * writes none at POST) and the AMD bitmap is as it left it (the AMD driver
++ * sets its bits before each write, rcblob RC_SetLogicalBitmap): clean, or
++ * dirty from the bit the header names.  Without element [0][0] (@amd
++ * unreadable, < 0) the configuration has to do.  Never bits md did not
++ * keep (AMD_MDBM_UNKEPT).
++ */
++static int amd_mdbm_own(struct amd_super *super, const struct amd_mdbm *h,
++			long long amd)
++{
++	const struct amd_packet_header *p = super->packet;
++	__u32 was = __le32_to_cpu(h->amd_bitmap);
++
++	if (was == AMD_MDBM_UNKEPT ||
++	    __le64_to_cpu(h->generation) != super->generation ||
++	    h->config_checksum != p->checksum)
++		return 0;
++	if (amd < 0)
++		return 1;
++	if (amd == AMD_MDBM_AMD_UNKNOWN || was == AMD_MDBM_AMD_UNKNOWN)
++		return 0;
++	return amd == was || amd == AMD_MDBM_AMD_CLEAN;
++}
++
++/* Set the bits of md bitmap @bits of @v for volume sectors @start to @end. */
++static void amd_mdbm_mark(const struct amd_vol *v, __u8 *bits,
++			  unsigned int chunk, unsigned long long start,
++			  unsigned long long end)
++{
++	unsigned long long i = amd_volume_to_sync(v, start) / chunk;
++	unsigned long long last = (amd_volume_to_sync(v, end) + chunk - 1) / chunk;
++
++	if (last > amd_mdbm_nbits(v, chunk))
++		last = amd_mdbm_nbits(v, chunk);
++	for (; i < last; i++)
++		bits[i >> 3] |= 1 << (i & 7);
++}
++
++/* ... where AMD bitmap @amd of @v has bits: Cover sectors each */
++static void amd_mdbm_from_amd(const struct amd_vol *v, __u8 *bits,
++			      unsigned int chunk, const __u8 *amd)
++{
++	unsigned long long cover = amd_bitmap_cover(v);
++	unsigned long long cap = __le64_to_cpu(v->ld->capacity);
++	unsigned int i, n = amd_bitmap_bits(v);
++
++	for (i = 0; i < n; i++)
++		if (amd[i >> 3] & (1 << (i & 7)))
++			amd_mdbm_mark(v, bits, chunk, i * cover,
++				      (i + 1) * cover < cap ? (i + 1) * cover : cap);
++}
++
++/* sectors a bit: the headers' (--bitmap-chunk at -C) while it fits the volume */
++static unsigned int amd_mdbm_chunk_of(struct amd_super *super,
++				      const struct amd_vol *v, struct amd_mdbm *h)
++{
++	return amd_mdbm_find(super, v, h) ? __le32_to_cpu(h->chunk) :
++					    amd_mdbm_chunk(v, 0);
++}
++
++/*
++ * OR the bits of every member of @v here with a header of @chunk into @bits
++ * (@len bytes; @b: a buffer as large, @h: a sector).  1 if one of them is
++ * mdmon's last word (amd_mdbm_own, @amd: the AMD bitmap's pattern or -1).
++ * Any member's bits count: one may be another's, all of them are a crash's
++ * at worst.
++ */
++static int amd_mdbm_union(struct amd_super *super, const struct amd_vol *v,
++			  unsigned int chunk, __u8 *bits, __u8 *b, size_t len,
++			  struct amd_mdbm *h, long long amd)
++{
++	unsigned long long lba = amd_mdbm_lba(v);
++	struct amd_disk *disks[AMD_MAX_PD];
++	int i, n = amd_mdbm_disks(super, v, 0, disks, NULL), own = 0;
++	size_t j;
++
++	for (i = 0; i < n; i++) {
++		if (amd_mdbm_pread(disks[i], lba, h, AMD_SECTOR) != 0 ||
++		    !amd_mdbm_valid(v, h) || __le32_to_cpu(h->chunk) != chunk ||
++		    amd_mdbm_pread(disks[i], lba + AMD_MDBM_HEADER, b, len) != 0)
++			continue;
++		for (j = 0; j < len; j++)
++			bits[j] |= b[j];
++		own |= amd_mdbm_own(super, h, amd);
++	}
++	return own;
++}
++
++/*
++ * The bits md is to start @v with (@len bytes, @chunk sectors a bit; @amd:
++ * the AMD bitmap's pattern now).  The members' own if mdmon with this
++ * bitmap was the last to write the volume - else theirs and where the AMD
++ * bitmap has bits, or all if it cannot be read: the AMD driver may have
++ * written anywhere.  And all of an initialization left (md resyncs only the
++ * bits from resync_start on).
++ */
++static __u8 *amd_mdbm_merge(struct amd_super *super, struct amd_vol *v,
++			    unsigned int *chunk, size_t *len, __u32 *amd)
++{
++	struct amd_mdbm *h = amd_alloc(AMD_SECTOR);
++	__u8 *amdbuf = amd_alloc(AMD_BITMAP_BYTES);
++	__u8 *bits = NULL, *b = NULL;
++	long long state = -1;
++	int own;
++
++	if (!h || !amdbuf)
++		goto out;
++	*chunk = amd_mdbm_chunk_of(super, v, h);
++	if (!*chunk)
++		goto out;	/* too large for one, and no header says otherwise */
++	*len = amd_mdbm_bytes(v, *chunk);
++	bits = amd_alloc(*len);
++	b = amd_alloc(*len);
++	if (!bits || !b) {
++		free(bits);
++		bits = NULL;
++		goto out;
++	}
++	if (amd_bitmap_load(super, v, amdbuf) == 0)
++		state = amd_bitmap_pattern(v, amdbuf);
++	*amd = state < 0 ? AMD_MDBM_AMD_UNKNOWN : state;
++	own = amd_mdbm_union(super, v, *chunk, bits, b, *len, h, state);
++	if (!own && state >= 0)
++		amd_mdbm_from_amd(v, bits, *chunk, amdbuf);
++	else if (!own)
++		memset(bits, 0xff, *len);
++	if (v->init_pending)
++		amd_mdbm_mark(v, bits, *chunk, amd_init_resume_point(super, v),
++			      __le64_to_cpu(v->ld->capacity));
++	dprintf("subarray-%d: md bitmap %s, chunk %u\n", (int)(v - super->vol),
++		own ? "own" : "rebuilt", *chunk);
++out:
++	free(h);
++	free(amdbuf);
++	free(b);
++	return bits;
++}
++
++/* md runs @v with its md bitmap: before it starts (Create, Assemble) */
++static int amd_mdbm_sysfs(struct mdinfo *info, const struct amd_vol *v,
++			  unsigned int chunk)
++{
++	char loc[32];
++
++	snprintf(loc, sizeof(loc), "+%llu", amd_mdbm_lba(v) + AMD_MDBM_HEADER);
++	if (sysfs_set_str(info, NULL, "bitmap/metadata", MD_EXT) ||
++	    sysfs_set_num(info, NULL, "bitmap/chunksize",
++			  (unsigned long long)chunk * AMD_SECTOR) ||
++	    sysfs_set_num(info, NULL, "bitmap/space",
++			  AMD_MDBM_SECTORS - AMD_MDBM_HEADER) ||
++	    sysfs_set_num(info, NULL, "bitmap/time_base", AMD_MDBM_DAEMON) ||
++	    sysfs_set_str(info, NULL, "bitmap/location", loc))
++		return -1;
++	return 0;
++}
++
++/*
++ * set_bitmap: md is to run volume @info with its md bitmap (Create,
++ * assemble_container_content).  The bits are made right on every member
++ * first - md reads them from any.  If md cannot take the bitmap (from 6.18
++ * md has no bitmap/ until an array runs, nor then the attributes for an
++ * external one), the volume runs with the resync policy: a crash then
++ * costs a whole resync, as without a bitmap, and the headers trust no bits
++ * (AMD_MDBM_UNKEPT) - md does not keep them meanwhile.  Never fails:
++ * the volume is not to stay down for its bitmap (Create would leave it so).
++ */
++static int set_bitmap_amd(struct supertype *st, struct mdinfo *info)
++{
++	struct amd_super *super = st->sb;
++	int vol = info->container_member;
++	struct amd_mdbm *h = amd_alloc(AMD_SECTOR);
++	unsigned int chunk;
++	struct amd_vol *v;
++	__u8 *bits = NULL;
++	__u32 amd;
++	size_t len;
++
++	if (!super || vol < 0 || vol >= super->nvol || !h)
++		goto out;
++	v = &super->vol[vol];
++	if (!amd_mdbm_lba(v))
++		goto out;
++	bits = amd_mdbm_merge(super, v, &chunk, &len, &amd);
++	if (!bits)
++		goto out;
++	amd_mdbm_header(super, v, chunk, amd, h);
++	if (amd_mdbm_put(super, v, 0, h, bits, len) != 0) {
++		pr_err("subarray-%d: cannot write its md bitmap: it runs without one, and a crash resyncs it whole\n",
++		       vol);
++	} else if (amd_mdbm_sysfs(info, v, chunk) != 0) {
++		pr_err("subarray-%d: this kernel cannot run an md bitmap for external metadata (md/bitmap/metadata): it runs without one, and a crash resyncs it whole\n",
++		       vol);
++	} else {
++		dprintf("subarray-%d: md bitmap at %llu, chunk %u\n", vol,
++			amd_mdbm_lba(v) + AMD_MDBM_HEADER, chunk);
++		goto out;
++	}
++	amd_mdbm_unkept(super, v, chunk);
++out:
++	free(h);
++	free(bits);
++	return 0;
++}
++
+ static struct mdinfo *container_content_amd(struct supertype *st,
+ 					    char *subarray)
+ {
+@@ -4020,11 +4604,56 @@ static struct mdinfo *container_content_amd(struct supertype *st,
+ 		if (v->blocked)
+ 			continue;
+ 		amd_resync_start(super, v, this);
++		if (amd_mdbm_present(super, v))
++			this->consistency_policy = CONSISTENCY_POLICY_BITMAP;
+ 		amd_volume_devs(super, v, this);
+ 	}
+ 	return rest;
+ }
+ 
++/* The md bitmap of @v as this disk (super->disks) has it, if it has one. */
++static void amd_print_mdbm(struct amd_super *super, const struct amd_vol *v)
++{
++	unsigned long long lba = amd_mdbm_lba(v), i, n, set = 0;
++	struct amd_disk *d = super->disks, *disks[AMD_MAX_PD];
++	struct amd_mdbm *h = amd_alloc(AMD_SECTOR);
++	int k = amd_mdbm_disks(super, v, 0, disks, NULL);
++	unsigned int chunk;
++	__u8 *bits = NULL;
++	__u32 amd;
++
++	/* only a member in service has bits md keeps */
++	while (k > 0 && disks[k - 1] != d)
++		k--;
++	if (!lba || !h || !k || amd_mdbm_pread(d, lba, h, AMD_SECTOR) != 0 ||
++	    !amd_mdbm_valid(v, h))
++		goto out;
++	chunk = __le32_to_cpu(h->chunk);
++	n = amd_mdbm_nbits(v, chunk);
++	bits = amd_alloc(amd_mdbm_bytes(v, chunk));
++	if (!bits || amd_mdbm_pread(d, lba + AMD_MDBM_HEADER, bits,
++				    amd_mdbm_bytes(v, chunk)) != 0)
++		goto out;
++	for (i = 0; i < n; i++)
++		set += (bits[i >> 3] >> (i & 7)) & 1;
++	printf("           md Bitmap : %u KiB a bit, %llu of %llu set (this disk), at %llu\n",
++	       chunk / 2, set, n, lba + AMD_MDBM_HEADER);
++	amd = __le32_to_cpu(h->amd_bitmap);
++	printf("     md Bitmap mdmon : AMD generation %llu, ",
++	       (unsigned long long)__le64_to_cpu(h->generation));
++	if (amd == AMD_MDBM_AMD_CLEAN)
++		printf("AMD bitmap clean\n");
++	else if (amd == AMD_MDBM_AMD_UNKNOWN)
++		printf("AMD bitmap not mdmon's or not read\n");
++	else if (amd == AMD_MDBM_UNKEPT)
++		printf("md kept no bits: bits not trusted\n");
++	else
++		printf("AMD bitmap clean or dirty from bit %u\n", amd);
++out:
++	free(h);
++	free(bits);
++}
++
+ /* why element @i of @v is out of service, for --examine; "" if it is not */
+ static const char *amd_element_note(const struct amd_vol *v, int i)
+ {
+@@ -4108,6 +4737,7 @@ static void amd_print_volume(struct amd_super *super, int vol)
+ 		       __le32_to_cpu(v->link->second_count), cap / AMD_MIB,
+ 		       cap ? done * 100 / cap : 0);
+ 	}
++	amd_print_mdbm(super, v);
+ 	for (i = 0; i < v->nel; i++) {
+ 		struct amd_element *el = &v->el[i];
+ 		__u64 id = __le64_to_cpu(el->id.id);
+@@ -5979,6 +6609,31 @@ static int amd_init_volume(struct amd_super *super, mdu_array_info_t *info,
+ 	return 1;
+ }
+ 
++/*
++ * --create --bitmap: can the new volume @v have an md bitmap?  Asked as it
++ * is laid out (its members' extents are known then), so that a refusal is
++ * one line: Create.c follows any refusal of add_internal_bitmap with
++ * "Given bitmap chunk size not supported.", which is not why.
++ */
++static int amd_mdbm_possible(const struct amd_vol *v, enum bitmap_type btype)
++{
++	/* a RAIDABLE (md raid1 of one) has nothing to resync, and AMD no bitmap */
++	if (v->single || (v->level != 1 && v->level != 10 && v->level != 5)) {
++		pr_err("an md bitmap is for AMD RAID1, RAID10 and RAID5 volumes\n");
++		return 0;
++	}
++	/* md keeps the bits alone (bitmap/metadata=external), as for IMSM */
++	if (btype != BitmapInternal) {
++		pr_err("an AMD volume takes --bitmap=internal only\n");
++		return 0;
++	}
++	if (!amd_mdbm_lba(v)) {
++		pr_err("no md bitmap for this volume: its members do not start at one LBA (another volume lies before it on only some of its disks); create it without --bitmap, or on disks that hold the same volumes\n");
++		return 0;
++	}
++	return 1;
++}
++
+ /*
+  * @name fits a volume's DevicePrivate - 1 to 31 characters and the NUL - and
+  * no volume but @vol (-1: a new one) has it: two of a name are assembled as
+@@ -6055,9 +6710,51 @@ static int init_super_amd(struct supertype *st, mdu_array_info_t *info,
+ 		pr_err("cannot lay out the new AMD RAID volume\n");
+ 		return 0;
+ 	}
++	if (s && s->btype != BitmapNone &&
++	    !amd_mdbm_possible(&super->vol[super->new_vol], s->btype))
++		return 0;
+ 	return 1;
+ }
+ 
++/*
++ * --bitmap=internal at --create: the new volume gets an md bitmap (written
++ * by write_init_super, run by set_bitmap) - off unless asked, as for IMSM.
++ * Whether it can have one, init_super_amd has checked (amd_mdbm_possible).
++ * @chunkp: --bitmap-chunk in bytes, or UnSet.
++ */
++static int add_internal_bitmap_amd(struct supertype *st, int *chunkp,
++				   int delay, int write_behind,
++				   unsigned long long size, int may_change,
++				   int major, bool assume_clean)
++{
++	struct amd_super *super = st->sb;
++	unsigned int want = 0, chunk;
++	struct amd_vol *v;
++
++	if (!super || super->new_vol < 0) {
++		pr_err("an AMD volume gets an md bitmap as it is created, or with --update-subarray=N --update=bitmap\n");
++		return -EINVAL;
++	}
++	v = &super->vol[super->new_vol];
++	if (*chunkp != UnSet && *chunkp > 0)
++		want = *chunkp / AMD_SECTOR;
++	chunk = amd_mdbm_chunk(v, want);
++	if (!chunk && !want) {
++		pr_err("the new volume is too large for an md bitmap: its bitmap chunk would be over %u KiB\n",
++		       AMD_MDBM_CHUNK_MAX / 2);
++		return -EINVAL;
++	}
++	if (!chunk) {
++		pr_err("a bitmap chunk of %u KiB gives the new volume more bits than the %u KiB AMD leaves for them: give a larger --bitmap-chunk\n",
++		       want / 2, AMD_MDBM_ROOM / 1024);
++		return -EINVAL;
++	}
++	super->new_mdbm = chunk;
++	super->new_mdbm_clean = assume_clean;
++	*chunkp = chunk * AMD_SECTOR;
++	return 0;
++}
++
+ /* end of the last section of the packet (PD, LD, 25BE, 25BF) */
+ static unsigned int amd_sections_end(const struct amd_packet_header *h)
+ {
+@@ -6939,6 +7636,15 @@ static int write_init_super_amd(struct supertype *st)
+ 		 */
+ 		if (rv == 0)
+ 			amd_label_members(super, v);
++		/*
++		 * All bits set: md initializes it all (none: --assume-clean).
++		 * Without it set_bitmap still tries, at the default chunk.
++		 */
++		if (rv == 0 && super->new_mdbm &&
++		    amd_mdbm_init(super, v, super->new_mdbm,
++				  super->new_mdbm_clean ? 0 : 0xff) != 0)
++			pr_err("cannot write the md bitmap of the new volume\n");
++		super->new_mdbm = 0;
+ 		super->new_vol = -1;
+ 		super->add_slot = -1;
+ 		super->npick = 0;
+@@ -7265,6 +7971,49 @@ static unsigned long long amd_md_writes(struct active_array *a)
+ 	return n[6] + n[13];
+ }
+ 
++/*
++ * Where md writes the bits of array @a: bitmap/location, sectors from the
++ * start of each member (rdev->sb_start + offset, 0 for external metadata)
++ * - or 0: no bitmap, or one in a file; -1: cannot tell.
++ */
++static long long amd_md_bitmap_at(struct active_array *a)
++{
++	char buf[SYSFS_MAX_BUF_SIZE];
++
++	/* a kernel without the attribute runs no bitmap of ours either */
++	if (sysfs_get_str(&a->info, NULL, "consistency_policy", buf,
++			  sizeof(buf)) <= 0 || strncmp(buf, "bitmap\n", 7) != 0)
++		return 0;
++	if (sysfs_get_str(&a->info, NULL, "bitmap/location", buf,
++			  sizeof(buf)) <= 0)
++		return -1;
++	if (buf[0] != '+' && buf[0] != '-')
++		return 0;
++	return strtoll(buf, NULL, 10);
++}
++
++/* @at is where md keeps the bits of @v's md bitmap (amd_mdbm_lba) */
++static int amd_mdbm_ours(const struct amd_vol *v, long long at)
++{
++	return amd_mdbm_lba(v) &&
++	       at == (long long)(amd_mdbm_lba(v) + AMD_MDBM_HEADER);
++}
++
++/*
++ * md runs @v with its md bitmap (set_bitmap): sectors a bit, or 0 - md
++ * without one (a kernel that cannot, or none on disk) keeps no bits.
++ */
++static unsigned int amd_mdbm_running(struct active_array *a,
++				     const struct amd_vol *v)
++{
++	unsigned long long chunk;
++
++	if (!amd_mdbm_ours(v, amd_md_bitmap_at(a)) ||
++	    sysfs_get_ll(&a->info, NULL, "bitmap/chunksize", &chunk) != 0)
++		return 0;
++	return chunk / AMD_SECTOR;
++}
++
+ /*
+  * The target of the transform recorded for @v (amd_rebuild_slot) is not in
+  * md: the volume was started without its disk (-I waits for it, -R and
+@@ -7316,6 +8065,11 @@ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
+ 	v->mon.members_checked = 0;
+ 	v->mon.trim_gran = 0;	/* md starts it with the kernel's limits */
+ 	v->mon.md_writes = amd_md_writes(a);
++	/* its headers say this session's AMD state from the first pass on */
++	v->mon.md_bitmap = amd_mdbm_running(a, v);
++	v->mon.mdbm_gen = 0;
++	v->mon.mdbm_drop = 0;
++	v->mon.mdbm_wipe = 0;
+ 	a->info.container_member = inst;
+ 
+ 	/* a recorded rebuild that container_content handed to md goes on */
+@@ -8117,6 +8871,53 @@ static int amd_subarray_recorded(struct amd_super *super, const void *arg)
+ 		memcmp(v->ld->name, u->name, sizeof(v->ld->name)) == 0);
+ }
+ 
++/*
++ * --update=bitmap / no-bitmap of stopped volume @vol (Update_subarray
++ * refuses a running one): a new md bitmap with every bit set - the next
++ * assembly resyncs it all if, and only if, the AMD bitmap says the volume
++ * is dirty - or none, its header cleared.  On disk only, in the service
++ * area mdmon leaves alone for a volume not running: no config.  Every
++ * member must be here: a header left on one would bring the bitmap back.
++ */
++static int amd_update_mdbm(struct amd_super *super, int vol, int on)
++{
++	struct amd_vol *v = &super->vol[vol];
++	struct amd_disk *disks[AMD_MAX_PD];
++	const char *why = NULL;
++	int i, n, in = 0, rv;
++
++	if (v->level != 1 && v->level != 10 && v->level != 5)
++		why = "only AMD RAID1, RAID10 and RAID5 can";
++	else if (!v->managed)
++		why = "mdmon does not manage it";
++	else if (!amd_mdbm_lba(v))
++		why = "its members do not start at one LBA, or have no room for it in front of their data";
++	else if (on && !amd_mdbm_chunk(v, 0))
++		why = "it is too large";
++	if (why) {
++		pr_err("subarray-%d can have no md bitmap: %s\n", vol, why);
++		return 2;
++	}
++	for (i = 0; i < v->nel; i++)
++		in += amd_slot_usable(v, i);
++	n = amd_mdbm_disks(super, v, 0, disks, NULL);
++	if (n != in) {
++		pr_err("subarray-%d: %d of its %d members are here, all must be\n",
++		       vol, n, in);
++		return 2;
++	}
++	if (on)
++		rv = amd_mdbm_init(super, v, amd_mdbm_chunk(v, 0), 0xff);
++	else
++		rv = amd_mdbm_clear(super, v);
++	if (rv != 0) {
++		pr_err("subarray-%d: cannot write its md bitmap\n", vol);
++		return 2;
++	}
++	super->legacy_checked = 1;	/* nothing else to write */
++	return 0;
++}
++
+ static int update_subarray_amd(struct supertype *st, char *subarray,
+ 			       enum update_opt update, struct mddev_ident *ident)
+ {
+@@ -8152,6 +8953,9 @@ static int update_subarray_amd(struct supertype *st, char *subarray,
+ 		u.rename = 1;
+ 		memcpy(u.name, ident->name, strlen(ident->name) + 1);
+ 		break;
++	case UOPT_BITMAP:
++	case UOPT_NO_BITMAP:
++		return amd_update_mdbm(super, vol, update == UOPT_BITMAP);
+ 	default:
+ 		pr_err("--update=%s is not supported for an AMD RAID volume\n",
+ 		       map_num_s(update_options, update));
+@@ -8776,6 +9580,86 @@ static int amd_sync_rebuilds(struct amd_super *super)
+ 	return again;
+ }
+ 
++/*
++ * What the headers of @v's md bitmap are to say of its AMD bitmap: one
++ * value for clean and dirty from the bit mdmon dirties it from, so that
++ * they change as seldom as the configuration does (a write to an idle
++ * volume would cost 1 + n writes with a flush each) - a crash leaves the
++ * AMD bitmap either way.  Clean only (AMD_MDBM_AMD_CLEAN) once md stops
++ * the array (@stops): the next session, if not ours (an mdadm without md
++ * bitmaps), then shows as one when it leaves the AMD bitmap dirty.
++ */
++static __u32 amd_mdbm_state(const struct amd_vol *v, int stops)
++{
++	if (v->mon.bitmap_dirty == 1)
++		return v->mon.bitmap_dirty_from;
++	if (v->mon.bitmap_dirty != 0)
++		return AMD_MDBM_AMD_UNKNOWN;	/* not read: no element [0][0] */
++	if (stops)
++		return AMD_MDBM_AMD_CLEAN;
++	/* what they say now holds for clean too: keep it */
++	if (v->mon.mdbm_gen && v->mon.mdbm_amd != AMD_MDBM_AMD_UNKNOWN)
++		return v->mon.mdbm_amd;
++	return v->mon.bitmap_dirty_from;
++}
++
++/*
++ * The headers of @v's md bitmap after its AMD configuration or bitmap
++ * changed: they say what mdmon wrote of them last (amd_mdbm_own) - after
++ * it, so that a crash between the two only costs a larger resync.  Cleared
++ * once md has stopped the bitmap (amd_mdbm_stop).
++ */
++static void amd_sync_mdbm(struct amd_super *super, struct amd_vol *v,
++			  int stops)
++{
++	const struct amd_packet_header *p = super->packet;
++	struct amd_mdbm *h = super->iobuf;
++	__u32 amd;
++
++	if (v->mon.mdbm_wipe && amd_mdbm_clear(super, v) == 0)
++		v->mon.mdbm_wipe = 0;
++	if (!v->mon.md_bitmap)
++		return;
++	amd = amd_mdbm_state(v, stops);
++	if (v->mon.mdbm_gen == super->generation &&
++	    v->mon.mdbm_sum == __le64_to_cpu(p->checksum) &&
++	    v->mon.mdbm_amd == amd)
++		return;
++	amd_mdbm_header(super, v, v->mon.md_bitmap, amd, h);
++	/* a member that failed to take it has its bits from md all the same */
++	if (amd_mdbm_put(super, v, 0, h, NULL, 0) != 0)
++		dprintf("subarray-%d: an md bitmap header not written\n",
++			(int)(v - super->vol));
++	v->mon.mdbm_gen = super->generation;
++	v->mon.mdbm_sum = __le64_to_cpu(p->checksum);
++	v->mon.mdbm_amd = amd;
++}
++
++/*
++ * The md bitmap headers of the volumes md runs: not of one stopped - its
++ * bitmap may have gone meanwhile (--update=no-bitmap clears the headers),
++ * and a new assembly sets it up anew (set_bitmap, amd_open_new).  md stops
++ * an array in the monitor's pass that hands it back (monitor.c
++ * read_and_act: array_state inactive or clear, the array clean then).
++ */
++static void amd_sync_mdbms(struct supertype *st)
++{
++	struct active_array *a;
++
++	for (a = st->arrays; a; a = a->next) {
++		struct amd_vol *v;
++
++		if (!a->container || a->to_remove)
++			continue;
++		v = amd_active_vol(a);
++		if (v)
++			amd_sync_mdbm(st->sb, v,
++				      (a->curr_state <= inactive ||
++				       a->curr_state == bad_word) &&
++				      a->prev_state > inactive);
++	}
++}
++
+ /* The write-intent bitmaps of the managed volumes, as md has them */
+ static void amd_sync_bitmaps(struct amd_super *super)
+ {
+@@ -8833,6 +9717,7 @@ static void amd_sync_metadata(struct supertype *st)
+ 	amd_flush_config(st);
+ 	amd_catch_up(super);
+ 	amd_sync_bitmaps(super);
++	amd_sync_mdbms(st);
+ 	if (again)
+ 		amd_sync_metadata(st);
+ }
+@@ -9921,13 +10806,44 @@ out:
+ 	return rv;
+ }
+ 
++/*
++ * The element of spare @d for @v at the LBA of the others: md writes the
++ * bits of an md bitmap there on every member (amd_mdbm_lba).  The AMD
++ * driver would take the disk's first free extent, but reads any from the
++ * configuration.  0, or -1 if that is not free on @d - or a @recorded
++ * rebuild keeps its extent.
++ */
++static int amd_mdbm_place(struct amd_super *super, const struct amd_vol *v,
++			  const struct amd_disk *d, struct amd_element *el,
++			  int recorded)
++{
++	unsigned long long lba = amd_mdbm_lba(v), base = lba - AMD_MDBM_OFFSET;
++	unsigned long long at = __le64_to_cpu(el->allocated.offset);
++	unsigned long long size = __le64_to_cpu(el->allocated.size), end;
++	int p = amd_pd_index(super, d->device_id);
++
++	if (!lba)
++		return -1;
++	if (at == base)
++		return 0;
++	if (recorded || p < 0 ||
++	    base + size > amd_pd_capacity(super->pd[p], d->sectors) ||
++	    amd_extent_overlap(super, d->device_id, base, size, &end))
++		return -1;
++	el->allocated.offset = __cpu_to_le64(base);
++	el->user_data.offset = __cpu_to_le64(base +
++		__le64_to_cpu(el->user_data.offset) - at);
++	return 0;
++}
++
+ /*
+  * A managed volume with a member out of service (recorded so in the
+  * config: flags 0x4030, or no disk) gets that member's own disk back if
+  * it is here again, else an AMD global spare.  Members missing when the
+  * volume went into use are out of service by then (amd_mark_missing).
+  * The start is recorded by amd_start_rebuild, the end by
+- * amd_finish_rebuild.
++ * amd_finish_rebuild.  @bitmap_at: where md writes the bits of its bitmap
++ * now (amd_md_bitmap_at).
+  * The target of a recorded rebuild too is copied from 0, as IMSM copies
+  * any disk it adds to a running array: md may write without it until the
+  * slot is set, and the mark of its log would skip that (amd_spare_update
+@@ -9937,7 +10853,7 @@ out:
+  * allocated before the lock (amd_mm_activate_spare).
+  */
+ static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
+-			      struct amd_update_spare *u)
++			      struct amd_update_spare *u, long long bitmap_at)
+ {
+ 	struct amd_super *super = a->container->sb;
+ 	struct amd_vol *v = amd_active_vol(a);
+@@ -9973,6 +10889,29 @@ static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
+ 	}
+ 	if (!d)
+ 		return 0;
++	/*
++	 * md writes the bits at one LBA of every member, the spare too: only
++	 * ours (amd_mdbm_place) is in the service area of the spare's element,
++	 * any other may be another volume's data.  As md has it now, not as at
++	 * open_new: it may have dropped the bitmap since (mdadm --grow
++	 * --bitmap=none) - then its headers go, as --update=no-bitmap clears
++	 * them - or taken another (bitmap/location written by hand).
++	 */
++	if (bitmap_at && !amd_mdbm_ours(v, bitmap_at)) {
++		if (bitmap_at < 0)
++			amd_kmsg("%s: cannot tell where md keeps its bitmap: no spare taken now",
++				 a->info.sys_name);
++		else
++			amd_kmsg("%s: md keeps its bitmap at %+lld, not where AMD leaves room for it: no spare taken",
++				 a->info.sys_name, bitmap_at);
++		return 0;
++	}
++	if (!bitmap_at && v->mon.md_bitmap) {
++		v->mon.md_bitmap = 0;
++		v->mon.mdbm_wipe = 1;
++	}
++	if (bitmap_at && amd_mdbm_place(super, v, d, &el, recorded) != 0)
++		v->mon.mdbm_drop = 1;
+ 
+ 	di->disk.number = slot;
+ 	di->disk.raid_disk = slot;
+@@ -10117,6 +11056,46 @@ static void amd_unlock(struct amd_super *super)
+ 	__atomic_clear(&super->busy, __ATOMIC_RELEASE);
+ }
+ 
++/*
++ * managemon, without the lock: md stops the md bitmap of @v (a running
++ * array may drop it, bitmap/location "none") and mdmon clears its headers;
++ * the volume goes on with the resync policy.  The headers trust no bits
++ * before md stops: from then on md sets none, while the AMD bitmap goes
++ * on as the headers say (dirty from bit k) - a crash before the monitor
++ * clears them would leave the writes of that time out of the resync.  The
++ * monitor leaves them alone meanwhile (md_bitmap 0), and writes them anew
++ * if md keeps its bitmap after all.
++ */
++static int amd_mdbm_stop(struct active_array *a, struct amd_vol *v)
++{
++	struct amd_super *super = a->container->sb;
++	unsigned int chunk;
++	int rv;
++
++	amd_lock(super);
++	v->mon.mdbm_drop = 0;
++	chunk = v->mon.md_bitmap;
++	v->mon.md_bitmap = 0;
++	amd_mdbm_unkept(super, v, chunk);
++	amd_unlock(super);
++	rv = sysfs_set_str(&a->info, NULL, "bitmap/location", "none");
++	amd_lock(super);
++	if (rv == 0) {
++		v->mon.mdbm_wipe = 1;
++	} else {
++		v->mon.md_bitmap = chunk;
++		v->mon.mdbm_gen = 0;
++	}
++	amd_unlock(super);
++	if (rv == 0)
++		amd_kmsg("md bitmap of %s off: the spare has no room at its LBA",
++			 a->info.sys_name);
++	else
++		amd_kmsg("cannot stop the md bitmap of %s: no rebuild onto the spare",
++			 a->info.sys_name);
++	return rv;
++}
++
+ /*
+  * managemon: the monitor allocates no memory.  Memory is managemon's to
+  * allocate ("things which might block such as memory allocation",
+@@ -10221,15 +11200,26 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
+ 	struct metadata_update *mu;
+ 	struct amd_vol *v;
+ 	unsigned int len;
+-	int fd, found;
++	int fd, found, drop;
++	/* md's sysfs before the lock: the monitor is not to wait on md */
++	long long bitmap_at = amd_md_bitmap_at(a);
+ 
+ 	amd_lock(super);
+-	found = amd_activate_spare(a, di, u);
++	found = amd_activate_spare(a, di, u, bitmap_at);
++	v = amd_active_vol(a);
++	drop = found && v && v->mon.mdbm_drop;
+ 	amd_unlock(super);
+ 	if (!found) {
+ 		amd_limit_trim(a, NULL);
+ 		goto none;
+ 	}
++	/*
++	 * The spare cannot lie at the md bitmap's LBA: md stops the bitmap
++	 * before it takes the disk - without the lock, md waits for the
++	 * monitor's writes to end (mddev_suspend).
++	 */
++	if (drop && amd_mdbm_stop(a, v) != 0)
++		goto none;
+ 	fd = amd_dev_open(di->disk.major, di->disk.minor, O_RDONLY);
+ 	u->features = amd_pd_features(fd, di->disk.major, di->disk.minor);
+ 	close_fd(&fd);
+@@ -10316,6 +11306,8 @@ struct superswitch super_amd = {
+ 	.container_content = container_content_amd,
+ 	.reshape_super	= reshape_super_amd,
+ 	.manage_reshape	= manage_reshape_amd,
++	.add_internal_bitmap = add_internal_bitmap_amd,
++	.set_bitmap	= set_bitmap_amd,
+ 	.external	= 1,
+ 	.subarray_raid_disks = 1,
+ 	.swapuuid	= 0,
+-- 
+2.47.3
+

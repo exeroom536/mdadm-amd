@@ -1,0 +1,103 @@
+# drivers/md part of kernel/0001 and kernel/0002 (md/md-bitmap: restore bitmap setup for external
+# metadata arrays; do not create a bitmap in location_store() before md_run()), for DKMS.
+diff --git a/drivers/md/md-bitmap.c b/drivers/md/md-bitmap.c
+index 8adf6dd..922e0c9 100644
+--- a/drivers/md/md-bitmap.c
++++ b/drivers/md/md-bitmap.c
+@@ -2696,6 +2696,10 @@ location_store(struct mddev *mddev, const char *buf, size_t len)
+ 			if (!mddev_set_bitmap_ops_nosysfs(mddev))
+ 				goto bitmap_err;
+ 
++			/* md_run() creates the bitmap of an inactive array */
++			if (!mddev->pers)
++				goto done;
++
+ 			rv = md_bitmap_create_nosysfs(mddev);
+ 			if (rv)
+ 				goto create_err;
+@@ -2712,6 +2716,7 @@ location_store(struct mddev *mddev, const char *buf, size_t len)
+ 				goto merge_err;
+ 		}
+ 	}
++done:
+ 	if (!mddev->external) {
+ 		/* Ensure new bitmap info is stored in
+ 		 * metadata promptly.
+@@ -3018,17 +3023,21 @@ static struct md_sysfs_entry max_backlog_used =
+ __ATTR(max_backlog_used, S_IRUGO | S_IWUSR,
+        behind_writes_used_show, behind_writes_used_reset);
+ 
++/*
++ * Shared with the none backend: these set up a bitmap before it is created,
++ * which is how userspace configures a bitmap for external metadata.
++ */
+ static struct attribute *md_bitmap_common_attrs[] = {
+ 	&bitmap_location.attr,
++	&bitmap_space.attr,
++	&bitmap_timeout.attr,
++	&bitmap_chunksize.attr,
++	&bitmap_metadata.attr,
+ 	NULL
+ };
+ 
+ static struct attribute *md_bitmap_internal_attrs[] = {
+-	&bitmap_space.attr,
+-	&bitmap_timeout.attr,
+ 	&bitmap_backlog.attr,
+-	&bitmap_chunksize.attr,
+-	&bitmap_metadata.attr,
+ 	&bitmap_can_clear.attr,
+ 	&max_backlog_used.attr,
+ 	NULL
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index 03e3538..4c31ce6 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -751,6 +751,16 @@ err:
+ 	return false;
+ }
+ 
++static void md_bitmap_set_none(struct mddev *mddev)
++{
++	mddev->bitmap_id = ID_BITMAP_NONE;
++	if (!mddev_set_bitmap_ops_nosysfs(mddev))
++		return;
++
++	if (!mddev_is_dm(mddev) && mddev->bitmap_ops->groups)
++		md_bitmap_sysfs_add(mddev);
++}
++
+ int mddev_init(struct mddev *mddev)
+ {
+ 	int err = 0;
+@@ -5043,6 +5053,13 @@ metadata_store(struct mddev *mddev, const char *buf, size_t len)
+ 		mddev->external = 1;
+ 		mddev->major_version = 0;
+ 		mddev->minor_version = 90;
++		/*
++		 * There is no bitmap superblock with external metadata:
++		 * userspace sets up the bitmap through bitmap/ before it
++		 * starts the array, so the attributes must exist by then.
++		 */
++		if (IS_ENABLED(CONFIG_MD_BITMAP) && !mddev->bitmap_ops)
++			md_bitmap_set_none(mddev);
+ 		goto out_unlock;
+ 	}
+ 	major = simple_strtoul(buf, &e, 10);
+@@ -6666,16 +6683,6 @@ static void md_bitmap_destroy(struct mddev *mddev)
+ 	md_bitmap_destroy_nosysfs(mddev);
+ }
+ 
+-static void md_bitmap_set_none(struct mddev *mddev)
+-{
+-	mddev->bitmap_id = ID_BITMAP_NONE;
+-	if (!mddev_set_bitmap_ops_nosysfs(mddev))
+-		return;
+-
+-	if (!mddev_is_dm(mddev) && mddev->bitmap_ops->groups)
+-		md_bitmap_sysfs_add(mddev);
+-}
+-
+ int md_run(struct mddev *mddev)
+ {
+ 	int err;

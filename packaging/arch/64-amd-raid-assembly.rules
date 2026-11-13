@@ -1,0 +1,31 @@
+# AMD RAIDCore (RAIDXpert2): libblkid does not know its label, so offer every
+# whole disk to mdadm --incremental; disks without it are left alone.
+SUBSYSTEM!="block", GOTO="amd_raid_end"
+ENV{DEVTYPE}!="disk", GOTO="amd_raid_end"
+ENV{SYSTEMD_READY}=="0", GOTO="amd_raid_end"
+KERNEL=="md*|dm-*|loop*|ram*|zram*|sr*|fd*", GOTO="amd_raid_end"
+ENV{ID_FS_TYPE}=="linux_raid_member|isw_raid_member|ddf_raid_member", GOTO="amd_raid_end"
+ACTION=="remove", GOTO="amd_raid_remove"
+ACTION!="add", GOTO="amd_raid_end"
+# --metadata=amd: only the AMD label is looked for.  A whole disk may also
+# show the md 0.90 superblock of its last partition, which libblkid ignores
+# there on purpose; mdadm -I would assemble the whole disk instead.
+IMPORT{program}="/usr/bin/mdadm --incremental --export --metadata=amd $devnode --offroot --udev"
+# A volume that lost a member is not started by -I: MD_STARTED is "no"
+# while no volume of the container has all its members, "unsafe" (as for
+# IMSM) once one has.  mdadm-last-resort runs it degraded if the rest do
+# not show up within 30 s.
+ENV{MD_STARTED}=="no|*unsafe*", ENV{MD_DEVICE}=="?*", ENV{SYSTEMD_WANTS}+="mdadm-last-resort@$env{MD_DEVICE}.timer"
+GOTO="amd_raid_end"
+
+# A disk that went away stays in its container until mdadm -If takes it out
+# (failing it in the volumes first, for mdmon to record), as
+# 64-md-raid-assembly.rules does for IMSM.  That rule knows its disks by
+# ID_FS_TYPE; ours have none, and what -I exported on "add" is dropped by the
+# next "change" event, so ask md: only a disk an md device still holds
+# ("/*/" is any md device).
+LABEL="amd_raid_remove"
+TEST!="/sys/devices/virtual/block/*/md/dev-$kernel", GOTO="amd_raid_end"
+ENV{ID_PATH}=="?*", RUN+="/usr/bin/mdadm -If $devnode --path $env{ID_PATH}"
+ENV{ID_PATH}!="?*", RUN+="/usr/bin/mdadm -If $devnode"
+LABEL="amd_raid_end"

@@ -1,0 +1,98 @@
+From 55602c6ff93ffcb688d68832d111da9ceaedaf93 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:44 +0500
+Subject: [PATCH 21/32] drive_encryption: let nvme_identify_ioctl() read any
+ Identify data
+
+nvme_identify_ioctl() reads only the Identify Controller data structure
+(CNS 01h).  Metadata handlers need other NVMe Identify data too: AMD
+RAIDXpert2 (later in this series) takes the serial number of the
+controller for the DeviceID the AMD BIOS knows a disk by, and the
+Deallocate Logical Block Features (DLFEAT) of the namespace to see whether
+the disk reads zeroes where it was trimmed.
+
+Give nvme_identify_ioctl() the namespace identifier and the CNS value and
+export it with NVME_IDENTIFY_NAMESPACE_DATA and
+NVME_IDENTIFY_CONTROLLER_DATA, so that they need no NVMe admin command of
+their own.  Its one caller asks for the controller data as before.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ drive_encryption.c | 16 +++++++++++-----
+ drive_encryption.h |  7 +++++++
+ 2 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/drive_encryption.c b/drive_encryption.c
+index 12dcfb6f..eaf9cdc7 100644
+--- a/drive_encryption.c
++++ b/drive_encryption.c
+@@ -36,7 +36,6 @@
+ #define NVME_IDENTIFY (0x06)
+ #define NVME_IDENTIFY_RESPONSE_LEN 4096
+ #define NVME_OACS_BYTE_POSITION (256)
+-#define NVME_IDENTIFY_CONTROLLER_DATA (1)
+ 
+ /*
+  * ATA defines
+@@ -249,6 +248,9 @@ nvme_security_recv_ioctl(int disk_fd, __u8 sec_protocol, __u16 comm_id, void *re
+ /**
+  * nvme_identify_ioctl() - NVMe identify ioctl.
+  * @disk_fd: a disk file descriptor.
++ * @nsid: namespace identifier, 0 if the data is not of a namespace.
++ * @cns: controller or namespace structure to return, e.g.
++ *	 %NVME_IDENTIFY_CONTROLLER_DATA.
+  * @response_buffer: response buffer to fill out.
+  * @buf_size: response buffer size.
+  * @verbose: verbose flag.
+@@ -260,14 +262,16 @@ nvme_security_recv_ioctl(int disk_fd, __u8 sec_protocol, __u16 comm_id, void *re
+  *
+  * Return: %MDADM_STATUS_SUCCESS on success, %MDADM_STATUS_ERROR otherwise.
+  */
+-static mdadm_status_t
+-nvme_identify_ioctl(int disk_fd, void *response_buffer, size_t buf_size, const int verbose)
++mdadm_status_t
++nvme_identify_ioctl(int disk_fd, __u32 nsid, __u8 cns, void *response_buffer,
++		    size_t buf_size, const int verbose)
+ {
+ 	struct nvme_admin_cmd nvme_cmd = {0};
+ 	int status;
+ 
+ 	nvme_cmd.opcode = NVME_IDENTIFY;
+-	nvme_cmd.cdw10 = NVME_IDENTIFY_CONTROLLER_DATA;
++	nvme_cmd.nsid = nsid;
++	nvme_cmd.cdw10 = cns;
+ 	nvme_cmd.data_len = buf_size;
+ 	nvme_cmd.addr = (__u64)(uintptr_t)response_buffer;
+ 
+@@ -340,7 +344,9 @@ static drive_feat_sup_st is_nvme_sec_send_recv_supported(int disk_fd, const int
+ 	nvme_identify_ctrl_t nvme_identify = {0};
+ 	int status = 0;
+ 
+-	status = nvme_identify_ioctl(disk_fd, &nvme_identify, sizeof(nvme_identify), verbose);
++	status = nvme_identify_ioctl(disk_fd, 0, NVME_IDENTIFY_CONTROLLER_DATA,
++				     &nvme_identify, sizeof(nvme_identify),
++				     verbose);
+ 	if (status)
+ 		return DRIVE_FEAT_CHECK_FAILED_ST;
+ 
+diff --git a/drive_encryption.h b/drive_encryption.h
+index 0cb8ff1b..87b455e5 100644
+--- a/drive_encryption.h
++++ b/drive_encryption.h
+@@ -27,6 +27,13 @@ typedef struct encryption_information {
+ 	encryption_status_t status;
+ } encryption_information_t;
+ 
++/* NVM ExpressTM Revision 1.4c, chapter 5: Identify, CNS values */
++#define NVME_IDENTIFY_NAMESPACE_DATA (0)
++#define NVME_IDENTIFY_CONTROLLER_DATA (1)
++
++mdadm_status_t
++nvme_identify_ioctl(int disk_fd, __u32 nsid, __u8 cns, void *response_buffer,
++		    size_t buf_size, const int verbose);
+ mdadm_status_t
+ get_nvme_opal_encryption_information(int disk_fd, struct encryption_information *information,
+ 				     const int verbose);
+-- 
+2.47.3
+

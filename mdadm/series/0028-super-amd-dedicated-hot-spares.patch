@@ -1,0 +1,671 @@
+From 9192bc9397dd732fd7a6600fc0f0165861be3d3e Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:57:04 +0500
+Subject: [PATCH 28/32] super-amd: dedicated hot spares
+
+AMD volumes can have up to four spares of their own, taken before the
+global ones.  With the subarray_spare method:
+
+- mdadm <volume> --add-spare <disk> assigns a disk of the container as a
+  dedicated hot spare of the volume (a global spare loses that role, in
+  the configuration and its label), --remove unassigns it;
+- --remove of a spare from the container unassigns its roles (mdmon
+  records it, or mdadm itself when mdmon does not run for the
+  container);
+- mdmon rebuilds onto a volume's own dedicated spares first, in the
+  order of its list (the AMD driver's order), from any controller; a
+  dedicated spare taken leaves the list.
+
+A disk is taken as the AMD core takes one: an online RAID disk, not in
+the volume, with room for a member's extent.
+
+Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
+---
+ super-amd.c | 534 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 528 insertions(+), 6 deletions(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index bd250f88..c11abad2 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -400,6 +400,15 @@ struct amd_disk {
+ #define AMD_UPDATE_ATTACH	5	/* amd_update_attach */
+ #define AMD_UPDATE_KILL		6	/* mdadm --kill-subarray: @major = volume, @id = its LD */
+ #define AMD_UPDATE_SUBARRAY	7	/* mdadm --update-subarray: struct amd_update_subarray */
++#define AMD_UPDATE_ROLE		8	/* a spare role: struct amd_update_role */
++struct amd_update_role {
++	int type;
++	int vol;		/* the volume, or -1: the global role */
++	__u64 vol_id;		/* LD ID of @vol */
++	__u64 id;		/* the disk */
++	int add;		/* 1: assign a dedicated spare, 0: unassign */
++	int pad;
++};
+ 
+ struct amd_update_disk {
+ 	int type;
+@@ -525,9 +534,12 @@ static int amd_extent_given_away(struct amd_super *super,
+ 				 const struct amd_vol *v, int slot);
+ static void amd_reparse(struct amd_super *super);
+ static void amd_reparse_without(struct amd_super *super, int gone);
++static int amd_drop_dedicated(struct amd_super *super, int vol, __u64 id);
+ static struct amd_disk *amd_find_spare(struct amd_super *super,
+ 				       struct amd_vol *v, int slot,
+ 				       struct amd_element *el, int *recorded);
++static void amd_apply_role(struct amd_super *super,
++			   const struct amd_update_role *u);
+ static int amd_label_spare(int fd, __u64 id, __u32 spare);
+ static int amd_pd_index(struct amd_super *super, __u64 id);
+ static int amd_disk_in_volumes(struct amd_super *super, __u64 id);
+@@ -7384,6 +7396,8 @@ static void amd_finish_rebuild(struct amd_super *super, int vol)
+ 	struct amd_disk *d;
+ 	__u32 state;
+ 
++	/* a dedicated spare whose start was not recorded leaves the list now */
++	amd_drop_dedicated(super, vol, __le64_to_cpu(v->mon.rebuild_el.id.id));
+ 	ld = v->ld;
+ 	/* a former member rebuilt in place may be stale yet: written from now on */
+ 	d = amd_find_disk(super, __le64_to_cpu(v->mon.rebuild_el.id.id));
+@@ -7428,6 +7442,42 @@ static int amd_insert_ld(struct amd_super *super, unsigned int at,
+ 	return 0;
+ }
+ 
++/* the place of disk @id in the dedicated spares of LD @ld, or -1 */
++static int amd_dedicated_index(const struct amd_ld *ld, __u64 id)
++{
++	const struct amd_dev_id *sp = amd_ld_spares(ld);
++	int i;
++
++	for (i = 0; i < (int)__le32_to_cpu(ld->spare_count); i++)
++		if (__le64_to_cpu(sp[i].id) == id)
++			return i;
++	return -1;
++}
++
++/*
++ * Take disk @id out of the dedicated spares of volume @vol: its entry
++ * leaves the first LD copy, SpareCount and the record size go down (as
++ * the menu unassigns one).  1 if it was one.
++ */
++static int amd_drop_dedicated(struct amd_super *super, int vol, __u64 id)
++{
++	struct amd_ld *ld = super->vol[vol].ld;
++	struct amd_dev_id *sp = amd_ld_spares(ld);
++	unsigned int n = __le32_to_cpu(ld->spare_count);
++	int i = amd_dedicated_index(ld, id);
++
++	if (i < 0)
++		return 0;
++	ld->spare_count = __cpu_to_le32(n - 1);
++	ld->packet_size = __cpu_to_le32(__le32_to_cpu(ld->packet_size) -
++					sizeof(*sp));
++	amd_cut_ld(super, (char *)&sp[i] - (char *)super->packet, sizeof(*sp));
++	amd_trim_packet(super);
++	amd_reparse(super);
++	super->config_dirty = 1;
++	return 1;
++}
++
+ /*
+  * The LD a rebuild of @v goes into, *@size bytes: a copy of its LD without
+  * the dedicated spares (as the menu writes the second copy), the spare in
+@@ -7526,6 +7576,8 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
+ 		amd_tlog_write(super, v, t, 1, 0, 0);
+ 		return -1;
+ 	}
++	/* a dedicated spare taken leaves the volume's list (RC_SetupTransform) */
++	amd_drop_dedicated(super, vol, __le64_to_cpu(v->mon.rebuild_el.id.id));
+ 	super->config_dirty = 1;
+ 	return 0;
+ }
+@@ -7796,6 +7848,7 @@ static const unsigned int amd_update_size[] = {
+ 	[AMD_UPDATE_ATTACH]	= sizeof(struct amd_update_attach),
+ 	[AMD_UPDATE_KILL]	= sizeof(struct amd_update_disk),
+ 	[AMD_UPDATE_SUBARRAY]	= sizeof(struct amd_update_subarray),
++	[AMD_UPDATE_ROLE]	= sizeof(struct amd_update_role),
+ };
+ 
+ /*
+@@ -7821,7 +7874,7 @@ static int amd_update_type(const struct metadata_update *update)
+ 
+ /*
+  * The updates mdadm sends (--create, --add, --kill-subarray,
+- * --update-subarray); mdmon makes the others itself.
++ * --update-subarray, spare roles); mdmon makes the others itself.
+  */
+ static int amd_prepare_update(struct supertype *st,
+ 			      struct metadata_update *update)
+@@ -7839,6 +7892,7 @@ static int amd_prepare_update(struct supertype *st,
+ 		break;
+ 	case AMD_UPDATE_KILL:
+ 	case AMD_UPDATE_SUBARRAY:
++	case AMD_UPDATE_ROLE:
+ 		break;
+ 	default:
+ 		return 0;
+@@ -8042,6 +8096,9 @@ static void amd_process_update(struct supertype *st,
+ 		if (amd_apply_subarray(super, buf))
+ 			amd_kmsg("cannot update the volume: it changed meanwhile");
+ 		break;
++	case AMD_UPDATE_ROLE:
++		amd_apply_role(super, buf);
++		/* a degraded volume given a dedicated spare: rebuild onto it */
+ 		for (a = st->arrays; a; a = a->next)
+ 			a->check_degraded = 1;
+ 		break;
+@@ -8289,6 +8346,7 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
+ 				       struct amd_vol *v, int slot,
+ 				       struct amd_element *el, int *recorded)
+ {
++	const struct amd_dev_id *sp = amd_ld_spares(v->ld);
+ 	const struct amd_element *model = NULL;
+ 	unsigned long long size, gap;
+ 	struct amd_disk *d = NULL;
+@@ -8309,14 +8367,28 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
+ 	gap = __le64_to_cpu(model->user_data.offset) -
+ 	      __le64_to_cpu(model->allocated.offset);
+ 
+-
+ 	/*
+-	 * A global spare is not held to the members' controller: the AMD
+-	 * driver checks the controller of one only when RC_GetFeatures() lacks
+-	 * 0x8 (arrays across controllers, rcblob RC_CreateTransformDevice) -
+-	 * the AND of the controllers' features, 0x4b or 0x6b on every platform
++	 * The volume's own dedicated spares first, in the order of its list,
++	 * then the global ones: the AMD driver's order (rcraid.sys 9.3.3.218
++	 * RC_SetupTransform: dedicated, distributed, global).  Neither is held
++	 * to the members' controller: the menu takes a dedicated spare from
++	 * any (an NVMe drive for a SATA RAID1), and the driver checks the
++	 * controller of a global one only when RC_GetFeatures() lacks 0x8
++	 * (arrays across controllers, rcblob RC_CreateTransformDevice) - the
++	 * AND of the controllers' features, 0x4b or 0x6b on every platform
+ 	 * seen, both with 0x8.
+ 	 */
++	for (i = 0; i < (int)__le32_to_cpu(v->ld->spare_count); i++) {
++		int p = amd_pd_index(super, __le64_to_cpu(sp[i].id));
++
++		if (p < 0)
++			continue;
++		d = amd_spare_disk(super, v, __le64_to_cpu(sp[i].id));
++		if (d && amd_spare_extent(super, super->pd[p], d, model,
++					  size, gap, el) == 0)
++			return d;
++	}
++
+ 	for (i = 0; i < super->npd; i++) {
+ 		struct amd_pd *pd = super->pd[i];
+ 		__u64 id = __le64_to_cpu(pd->id.id);
+@@ -8333,6 +8405,102 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
+ 	return NULL;
+ }
+ 
++/*
++ * Spare roles from mdadm (subarray_spare_amd): a dedicated hot spare of a
++ * volume assigned or unassigned (the menu's Manage Dedicated Hot Spares and
++ * Unassign Hot Spare, rcblob RC_AssignSpare/RC_DeassignSpare), or the global
++ * role of a disk unassigned (RC_DeassignPhysicalDeviceGlobalSpare).
++ */
++#define AMD_MAX_DEDICATED	4	/* RC_CoreLogicalDevice SpareListSize */
++
++/*
++ * ROLE (monitor).  A dedicated spare goes at the end of the volume's list
++ * in its first LD copy, ID and Handle as the disk's PD (as the menu writes
++ * it); it stops being a global spare - the menu offers only disks with
++ * SpareInfo 0, and the AMD driver would take a global one for any volume.
++ */
++static void amd_apply_role(struct amd_super *super,
++			   const struct amd_update_role *u)
++{
++	int p = amd_pd_index(super, u->id);
++
++	if (p < 0) {
++		amd_kmsg("cannot change the spare role of disk %016llx: it has no PD record",
++			 (unsigned long long)u->id);
++		return;
++	}
++	if (u->vol >= 0) {
++		struct amd_ld *ld;
++		struct amd_dev_id e, *sp;
++		unsigned int n, at;
++
++		if (u->vol >= super->nvol ||
++		    __le64_to_cpu(super->vol[u->vol].ld->id.id) != u->vol_id) {
++			amd_kmsg("cannot change the dedicated spares of subarray-%d: the volume changed meanwhile",
++				 u->vol);
++			return;
++		}
++		if (!u->add) {
++			if (!amd_drop_dedicated(super, u->vol, u->id))
++				amd_kmsg("disk %016llx is not a dedicated spare of subarray-%d",
++					 (unsigned long long)u->id, u->vol);
++			return;
++		}
++		ld = super->vol[u->vol].ld;
++		n = __le32_to_cpu(ld->spare_count);
++		sp = amd_ld_spares(ld);
++		if (amd_dedicated_index(ld, u->id) >= 0)
++			return;
++		if (n >= AMD_MAX_DEDICATED) {
++			amd_kmsg("cannot record disk %016llx as a dedicated spare of subarray-%d: it has %d already",
++				 (unsigned long long)u->id, u->vol, AMD_MAX_DEDICATED);
++			return;
++		}
++		e = super->pd[p]->id;
++		e.reserved = 0;
++		at = (char *)&sp[n] - (char *)super->packet;
++		ld->spare_count = __cpu_to_le32(n + 1);
++		ld->packet_size = __cpu_to_le32(__le32_to_cpu(ld->packet_size) +
++						sizeof(e));
++		if (amd_insert_ld(super, at, &e, sizeof(e)) != 0) {
++			ld->spare_count = __cpu_to_le32(n);
++			ld->packet_size = __cpu_to_le32(__le32_to_cpu(ld->packet_size) -
++							sizeof(e));
++			amd_kmsg("cannot record disk %016llx as a dedicated spare of subarray-%d",
++				 (unsigned long long)u->id, u->vol);
++			return;
++		}
++	}
++	amd_drop_global(super, u->id);
++	super->config_dirty = 1;
++	dprintf("disk %016llx: %s\n", (unsigned long long)u->id,
++		u->vol < 0 ? "no global spare" : u->add ? "a dedicated spare" :
++		"no dedicated spare");
++}
++
++/*
++ * The DeviceID in the AMD label of @devname, or 0 (no label of ours, or
++ * the disk is gone).  With @fdp, the disk is opened for writing and the
++ * descriptor kept there.
++ */
++static __u64 amd_label_id(const char *devname, int *fdp)
++{
++	struct amd_metadata *md = amd_alloc(AMD_SECTOR);
++	__u64 id = 0;
++	int fd;
++
++	fd = open(devname, (fdp ? O_RDWR : O_RDONLY) | O_DIRECT);
++	if (md && fd >= 0 && amd_read(fd, AMD_METADATA_LBA, md, AMD_SECTOR) == 0 &&
++	    amd_label_valid(md))
++		id = __le64_to_cpu(md->device_id);
++	free(md);
++	if (fdp && id)
++		*fdp = fd;
++	else if (fd >= 0)
++		close(fd);
++	return id;
++}
++
+ /*
+  * SpareInfo of the label of disk @id on @fd: the BIOS fills the PD's in from
+  * it at every start (RAIDCoreDxe FUN_0001d68c), and the AMD driver rewrites
+@@ -8361,6 +8529,359 @@ static int amd_label_spare(int fd, __u64 id, __u32 spare)
+ 	return rv;
+ }
+ 
++/*
++ * Can disk @d (PD @p) be a dedicated spare of @v?  NULL if so, else the
++ * reason why not.  As the AMD core takes one (rcblob RC_AssignSpare: an
++ * online RAIDCore disk, not in the volume, at most SpareListSize) and keeps
++ * it (RC_RemoveUnusableDedicatedSpares: no smaller than the smallest member,
++ * with room for a member's extent).  The menu offers only whole free disks;
++ * the core and the AMD driver for Windows take any disk with the room.
++ */
++static const char *amd_dedicated_refusal(struct amd_super *super,
++					 struct amd_vol *v, struct amd_disk *d,
++					 int p)
++{
++	static char why[96];
++	int spare_count = __le32_to_cpu(v->ld->spare_count);
++	const struct amd_element *model = NULL;
++	unsigned long long min = ~0ULL;
++	struct amd_element el;
++	int i;
++
++	if (v->blocked)
++		return v->blocked;
++	if (v->single || (v->level != 1 && v->level != 5 && v->level != 10))
++		return "it has no redundancy (AMD gives dedicated spares to RAID1, RAID5 and RAID10 only)";
++	if (amd_in_volume(v, d->device_id))
++		return "the disk is one of its members";
++	for (i = 0; i < amd_link_nel(v); i++)
++		if (__le64_to_cpu(amd_link_elements(v)[i].id.id) == d->device_id)
++			return "the disk is being rebuilt into it";
++	if (amd_dedicated_index(v->ld, d->device_id) >= 0)
++		return "the disk is a dedicated spare of it already";
++	if (spare_count >= AMD_MAX_DEDICATED)
++		return "it has 4 dedicated spares already, as many as AMD keeps";
++	if (!amd_pd_usable(super->pd[p], d))
++		return "the disk is not an online AMD RAID disk";
++	for (i = 0; i < v->nel; i++) {
++		int q = amd_pd_index(super, __le64_to_cpu(v->el[i].id.id));
++		struct amd_disk *m = amd_find_disk(super, __le64_to_cpu(v->el[i].id.id));
++
++		if (!model && amd_slot_usable(v, i) && v->el[i].allocated.size)
++			model = &v->el[i];
++		if (q >= 0 && m && amd_pd_capacity(super->pd[q], m->sectors) < min)
++			min = amd_pd_capacity(super->pd[q], m->sectors);
++	}
++	if (min != ~0ULL && amd_pd_capacity(super->pd[p], d->sectors) < min)
++		return "the disk is smaller than the members";
++	if (!model)
++		return "it has no member in service";
++	if (amd_spare_extent(super, super->pd[p], d, model,
++			     __le64_to_cpu(model->allocated.size),
++			     __le64_to_cpu(model->user_data.offset) -
++			     __le64_to_cpu(model->allocated.offset), &el) != 0) {
++		snprintf(why, sizeof(why), "the disk has no free extent of %llu MiB for a member",
++			 (unsigned long long)__le64_to_cpu(model->allocated.size) / AMD_MIB);
++		return why;
++	}
++	return NULL;
++}
++
++/*
++ * subarray_spare_amd of volume @vol: the role update @u for @devname (disk
++ * @d of the container, or NULL) - a dedicated spare of it, or no longer
++ * one.  0, or -1 if it cannot be.
++ */
++static int amd_dedicated_role(struct supertype *st, unsigned long vol,
++			      char *devname, struct amd_disk *d,
++			      struct amd_update_role *u)
++{
++	struct amd_super *super = st->sb;
++	struct amd_vol *v = &super->vol[vol];
++	const char *why;
++	int p;
++
++	u->vol = vol;
++	u->vol_id = __le64_to_cpu(v->ld->id.id);
++	if (u->add) {
++		if (!d) {
++			pr_err("%s is not in the container: add it there first (mdadm /dev/%s --add %s)\n",
++			       devname, st->container_devnm, devname);
++			return -1;
++		}
++		p = amd_pd_index(super, d->device_id);
++		why = p < 0 ? "the disk has no PD record" :
++			      amd_dedicated_refusal(super, v, d, p);
++		if (why) {
++			pr_err("%s cannot be a dedicated spare of subarray-%lu: %s\n",
++			       devname, vol, why);
++			return -1;
++		}
++		u->id = d->device_id;
++		return 0;
++	}
++	u->id = d ? d->device_id : amd_label_id(devname, NULL);
++	if (!u->id || amd_dedicated_index(v->ld, u->id) < 0) {
++		pr_err("%s is not a dedicated spare of subarray-%lu\n",
++		       devname, vol);
++		return -1;
++	}
++	return 0;
++}
++
++/*
++ * subarray_spare_amd of the container: @devname has left it already.  A
++ * spare that is here loses every spare role: global, and dedicated of any
++ * volume (each one an update, queued here).  Returns whether it was a
++ * global spare (that update, @u, is the caller's), or -1 if there is
++ * nothing to do.
++ */
++static int amd_drop_spare_roles(struct supertype *st, char *devname,
++				struct amd_update_role *u)
++{
++	struct amd_super *super = st->sb;
++	struct amd_update_role *m;
++	unsigned long vol;
++	int p, was_global;
++
++	u->id = amd_label_id(devname, NULL);
++	p = u->id ? amd_pd_index(super, u->id) : -1;
++	if (p < 0 || amd_disk_in_volumes(super, u->id))
++		return -1;
++	st->update_tail = &st->updates;
++	for (vol = 0; vol < (unsigned long)super->nvol; vol++) {
++		const struct amd_ld *ld = super->vol[vol].ld;
++
++		if (amd_dedicated_index(ld, u->id) < 0)
++			continue;
++		m = xmalloc(sizeof(*m));
++		*m = *u;
++		m->vol = vol;
++		m->vol_id = __le64_to_cpu(ld->id.id);
++		append_metadata_update(st, m, sizeof(*m));
++	}
++	was_global = (__le32_to_cpu(super->pd[p]->spare_info) &
++		      AMD_SPARE_GLOBAL) != 0;
++	if (!was_global && !st->updates)
++		return -1;
++	return was_global;
++}
++
++/*
++ * The updates of subarray_spare_amd that were not sent, and its update
++ * list: Manage goes on with @st, and with a list left add_to_super_amd
++ * would take the --add that follows on the command line for mdmon's.
++ */
++static void amd_drop_updates(struct supertype *st)
++{
++	struct metadata_update *mu;
++
++	while (st->updates) {
++		mu = st->updates;
++		st->updates = mu->next;
++		free(mu->buf);
++		free(mu);
++	}
++	st->update_tail = NULL;
++}
++
++/*
++ * subarray_spare_amd of the container with no mdmon to record the roles
++ * queued (no volume under it runs: only RAID0 or Volume, or all stopped):
++ * this process applies them and writes the configuration, as it does for
++ * --kill-subarray.  To a copy read afresh: the one loaded still says what
++ * the roles were (amd_say_dropped).  0, or -1 if it was not written.
++ */
++static int amd_drop_roles_here(struct supertype *st)
++{
++	struct supertype *tst = dup_super(st);
++	struct metadata_update *mu;
++	int fd, rv = -1;
++
++	/*
++	 * Read and written under the exclusive open of the container that
++	 * Create, Kill and Update_subarray write under: none of them
++	 * writes in between.
++	 */
++	fd = open_dev_excl(st->container_devnm);
++	if (is_fd_valid(fd) && tst->ss->load_container(tst, fd, NULL) == 0) {
++		for (mu = st->updates; mu; mu = mu->next)
++			amd_apply_role(tst->sb, (const void *)mu->buf);
++		rv = amd_write_changed(tst->sb) ? -1 : 0;
++		tst->ss->free_super(tst);
++	}
++	close_fd(&fd);
++	free(tst);
++	return rv;
++}
++
++/*
++ * subarray_spare_amd of the container, once the configuration has it: the
++ * roles @devname (disk @id) had in configuration @super are gone.
++ */
++static void amd_say_dropped(struct amd_super *super, const char *devname,
++			    __u64 id, int was_global)
++{
++	int vol;
++
++	for (vol = 0; vol < super->nvol; vol++)
++		if (amd_dedicated_index(super->vol[vol].ld, id) >= 0)
++			pr_err("%s: no longer a dedicated hot spare of subarray-%d\n",
++			       devname, vol);
++	if (was_global)
++		pr_err("%s: no longer an AMD global hot spare (still an AMD RAID disk: mdadm --zero-superblock clears it)\n",
++		       devname);
++}
++
++/*
++ * amd_mdmon_recorded of the spare roles of disk @u->id: a dedicated spare
++ * of volume @u->vol_id or not, as @u->add asks; from the container (@u->vol
++ * -1), no role left, global (SpareInfo of its PD) or dedicated.
++ */
++static int amd_role_recorded(struct amd_super *super, const void *arg)
++{
++	const struct amd_update_role *u = arg;
++	const struct amd_vol *v;
++	int p, vol;
++
++	if (u->vol >= 0) {
++		v = amd_vol_by_id(super, u->vol_id);
++		return (v && amd_dedicated_index(v->ld, u->id) >= 0) == u->add;
++	}
++	p = amd_pd_index(super, u->id);
++	if (p >= 0 && (__le32_to_cpu(super->pd[p]->spare_info) &
++		       AMD_SPARE_GLOBAL))
++		return 0;
++	for (vol = 0; vol < super->nvol; vol++)
++		if (amd_dedicated_index(super->vol[vol].ld, u->id) >= 0)
++			return 0;
++	return 1;
++}
++
++/*
++ * The device file of @devname as Manage names a device to --remove: a
++ * path, major:minor, or the kernel name of a container member ("sdb", the
++ * name md gives it).  NULL if there is none - the disk has gone.
++ */
++static char *amd_dev_file(char *devname)
++{
++	int mj, mn;
++	dev_t rdev;
++
++	if (strchr(devname, '/'))
++		return devname;
++	if (get_maj_min(devname, &mj, &mn))
++		rdev = makedev(mj, mn);
++	else
++		rdev = devnm2devid(devname);
++	return rdev ? map_dev(major(rdev), minor(rdev), 0) : NULL;
++}
++
++/*
++ * mdadm <volume> --add-spare <disk>: a disk of the container becomes a
++ * dedicated hot spare of the volume (a global one loses that role);
++ * mdadm <volume> --remove <disk>: it stops being a dedicated spare of it.
++ * mdadm <container> --remove <disk> (@subarray NULL, called once the disk
++ * has left the container): a global hot spare that is still here loses the
++ * role - it stays an initialized AMD RAID disk, as after Unassign Hot Spare
++ * in the menu; a disk that is gone keeps its role.  mdmon records it in the
++ * configuration (this process, if no mdmon runs: amd_drop_roles_here); the
++ * global role is in the disk's label too, which mdadm
++ * writes only once the configuration on the disks has the change: a label
++ * without the role the PD still has would have the BIOS drop it at the
++ * next start (amd_label_spare).
++ */
++static int subarray_spare_amd(struct supertype *st, char *subarray,
++			      char *devname, int add)
++{
++	struct amd_super *super;
++	struct amd_update_role u, *m;
++	struct amd_disk *d = NULL;
++	struct stat stb;
++	unsigned long vol = 0;
++	int cfd, p, rv = subarray ? 1 : 0, wfd = -1, was_global = 0;
++	char *ep, *name = devname;
++
++	devname = amd_dev_file(devname);
++	if (!devname || stat(devname, &stb) != 0 || !S_ISBLK(stb.st_mode)) {
++		if (subarray)
++			pr_err("%s is not a block device\n", name);
++		return rv;
++	}
++	cfd = open_dev(st->container_devnm[0] ? st->container_devnm : st->devnm);
++	if (cfd < 0 || st->ss->load_container(st, cfd, NULL) != 0) {
++		if (cfd >= 0)
++			close(cfd);
++		pr_err("cannot load the AMD RAID configuration\n");
++		return 1;
++	}
++	close(cfd);
++	super = st->sb;
++	memset(&u, 0, sizeof(u));
++	u.type = AMD_UPDATE_ROLE;
++	u.vol = -1;
++	u.add = add;
++	for (d = super->disks; d; d = d->next)
++		if (!d->removed && d->major == (int)major(stb.st_rdev) &&
++		    d->minor == (int)minor(stb.st_rdev))
++			break;
++
++	if (subarray) {
++		vol = strtoul(subarray, &ep, 10);
++		if (*ep || ep == subarray || vol >= (unsigned long)super->nvol ||
++		    amd_dedicated_role(st, vol, devname, d, &u) != 0)
++			goto out;
++	} else {
++		was_global = amd_drop_spare_roles(st, devname, &u);
++		if (was_global < 0)
++			goto out;
++	}
++	p = amd_pd_index(super, u.id);
++	if (subarray)
++		was_global = p >= 0 && (__le32_to_cpu(super->pd[p]->spare_info) &
++					AMD_SPARE_GLOBAL) && add;
++	if (subarray || was_global) {
++		m = xmalloc(sizeof(*m));
++		*m = u;
++		st->update_tail = &st->updates;
++		append_metadata_update(st, m, sizeof(*m));
++	}
++	if (subarray || mdmon_running(st->container_devnm)) {
++		rv = amd_mdmon_recorded(st, amd_role_recorded, &u);
++		if (rv > 0)
++			pr_err("%s: mdmon did not change its spare roles (see dmesg)\n",
++			       devname);
++	} else {
++		rv = amd_drop_roles_here(st);
++	}
++	if (rv) {
++		rv = 1;
++		goto out;
++	}
++	if (was_global && (amd_label_id(devname, &wfd) != u.id ||
++			   amd_label_spare(wfd, u.id, 0) != 0))
++		pr_err("%s: cannot write its label: the BIOS will take it for a global spare again\n",
++		       devname);
++	if (wfd >= 0)
++		close(wfd);
++	if (st->verbose >= 0) {
++		if (!subarray)
++			amd_say_dropped(super, devname, u.id, was_global);
++		else if (add)
++			pr_err("%s: a dedicated hot spare of subarray-%lu now%s\n",
++			       devname, vol,
++			       was_global ? " (no longer a global one)" : "");
++		else
++			pr_err("%s: no longer a dedicated hot spare of subarray-%lu\n",
++			       devname, vol);
++	}
++	rv = 0;
++out:
++	amd_drop_updates(st);
++	st->ss->free_super(st);
++	return rv;
++}
++
+ /*
+  * A managed volume with a member out of service (recorded so in the
+  * config: flags 0x4030, or no disk) gets that member's own disk back if
+@@ -8733,6 +9254,7 @@ struct superswitch super_amd = {
+ 	.remove_from_super	= remove_from_super_amd,
+ 	.kill_subarray	= kill_subarray_amd,
+ 	.update_subarray = update_subarray_amd,
++	.subarray_spare = subarray_spare_amd,
+ 	.load_container	= load_container_amd,
+ 	.match_home	= match_home_amd,
+ 	.uuid_from_super = uuid_from_super_amd,
+-- 
+2.47.3
+

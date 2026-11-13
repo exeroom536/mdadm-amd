@@ -1,0 +1,13 @@
+post_install() {
+	cat <<'EOF'
+==> AMD RAIDXpert2 volumes at boot: add the "amdraid" hook to HOOKS in /etc/mkinitcpio.conf
+    after "block" (the "systemd" hook is required), e.g.
+    HOOKS=(base systemd autodetect microcode modconf kms keyboard sd-vconsole block amdraid filesystems fsck)
+    then run: mkinitcpio -P
+EOF
+}
+
+post_upgrade() {
+	# the mkinitcpio hook rebuilds every initramfs after this package (usr/lib/initcpio/*) is updated
+	echo '==> mdadm-amd updated: the initramfs images are rebuilt by the mkinitcpio hook below; if it did not run, run mkinitcpio -P.'
+}

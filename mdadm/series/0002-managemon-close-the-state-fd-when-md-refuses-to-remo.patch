@@ -1,0 +1,49 @@
+From e47487c572bd41b2350851956586e3286ba18511 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:55:52 +0500
+Subject: [PATCH 02/32] managemon: close the state fd when md refuses to remove
+ a device
+
+managemon_disk_remove() opens a new fd for the "state" attribute of a
+faulty device and returns without closing it when the write of "remove"
+fails (EBUSY: md still has requests to the device).  manage_member()
+tries again on the manager's next wakeup, so every refusal leaks an fd
+of the long-lived mdmon, and once RLIMIT_NOFILE is reached it can open
+nothing more: not a new member array, not its control socket.  With the
+retry every 100 ms that a later patch of this series adds for a pending
+removal, that would be 10 fds a second.
+
+Close it on that path too.
+
+IMSM RAID1 with a spare on loop devices, the write of "remove" by mdmon
+failing with EBUSY (strace -e inject) for 5 s after "mdadm --fail": one
+or two fds of md/dev-loop0/state lost before, none with the change.
+With the retry of a later patch of this series, 44 before and none with
+the change.
+
+Written by Claude Fable 5.2, an AI model by Anthropic.
+
+Fixes: 07ad253044f5 ("mdmon: delegate removal to managemon")
+---
+ managemon.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/managemon.c b/managemon.c
+index cdeadf3a..41767954 100644
+--- a/managemon.c
++++ b/managemon.c
+@@ -462,8 +462,10 @@ static mdadm_status_t managemon_disk_remove(struct mdinfo *disk, char *array_dev
+ 	if (!is_fd_valid(new_state_fd))
+ 		return MDADM_STATUS_ERROR;
+ 
+-	if (write_attr("remove", new_state_fd) != MDADM_STATUS_SUCCESS)
++	if (write_attr("remove", new_state_fd) != MDADM_STATUS_SUCCESS) {
++		close_fd(&new_state_fd);
+ 		return MDADM_STATUS_ERROR;
++	}
+ 
+ 	close_fd(&new_state_fd);
+ 	close_fd(&disk->state_fd);
+-- 
+2.47.3
+

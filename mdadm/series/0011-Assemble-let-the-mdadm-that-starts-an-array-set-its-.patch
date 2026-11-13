@@ -1,0 +1,73 @@
+From 02bcf29af1ef9eb72e5ae35c9e086d077461153b Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:06 +0500
+Subject: [PATCH 11/32] Assemble: let the mdadm that starts an array set its
+ resync point
+
+With incremental assembly (mdadm -I per disk, run by udev in parallel at
+boot) the member array of a container is set up by the first mdadm that
+sees it, with the resync point its disks gave then, and started by the one
+that has enough disks.  assemble_container_content() calls
+sysfs_set_array() only when the array is not set up yet, so md starts it
+with what the first mdadm knew.
+
+That is fine when every member carries the same metadata (IMSM, DDF).  It
+is not when the metadata is not on every member: AMD RAIDXpert2 keeps its
+write-intent bitmap on one member only.  If that disk comes last, the
+first mdadm cannot read the bitmap and either takes a clean array for
+dirty (a needless full resync after every reboot, seen with RAID10 on real
+disks) or, worse, takes an array that crashed for clean, and its mirrors
+are never resynced.
+
+When the array was set up before, write the resync point of the starting
+mdadm (it has the fuller view) before starting the array.  --force still
+has the last word.  For formats with the metadata on every member the
+value written is the same as before.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Assemble.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/Assemble.c b/Assemble.c
+index 2deffbb5..cff24a59 100644
+--- a/Assemble.c
++++ b/Assemble.c
+@@ -2009,6 +2009,7 @@ int assemble_container_content(struct supertype *st, int mdfd,
+ 	int err;
+ 	int is_clean, all_disks;
+ 	bool is_raid456;
++	bool set_up_before = false;
+ 
+ 	if (sysfs_init(content, mdfd, NULL)) {
+ 		pr_err("Unable to initialize sysfs\n");
+@@ -2029,6 +2030,8 @@ int assemble_container_content(struct supertype *st, int mdfd,
+ 			sysfs_free(sra);
+ 			return 1;
+ 		}
++	} else {
++		set_up_before = true;
+ 	}
+ 
+ 	/* There are two types of reshape: container wide or sub-array specific
+@@ -2174,6 +2177,17 @@ int assemble_container_content(struct supertype *st, int mdfd,
+ 		return 1;
+ 	}
+ 
++	/*
++	 * Incremental assembly: the array was set up by the mdadm that saw
++	 * it first, with the resync point the disks it had then gave.  Where
++	 * the metadata is not on every member (AMD keeps its write-intent
++	 * bitmap on one), the mdadm that starts the array has the fuller
++	 * view: its resync point is the one md starts with.
++	 */
++	if (set_up_before &&
++	    sysfs_set_num(content, NULL, "resync_start", content->resync_start))
++		return 1;
++
+ 	if (is_raid456 && content->resync_start != MaxSector && c->force &&
+ 	    all_disks < content->array.raid_disks) {
+ 
+-- 
+2.47.3
+

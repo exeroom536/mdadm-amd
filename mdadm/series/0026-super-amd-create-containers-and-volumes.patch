@@ -1,0 +1,2078 @@
+From 510c11cee52b590a6c4b47b7440b5605dcd111eb Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:56:59 +0500
+Subject: [PATCH 26/32] super-amd: create containers and volumes
+
+- --create of a container: its disks are initialized as the BIOS menu
+  does - both ends zeroed, an MBR with AMD's one partition, the label
+  with the DeviceID RAIDCoreDxe gives the disk (from its serial number),
+  a configuration listing them.  All RAID disks of a system share one
+  configuration: a container is not created while another AMD RAID disk
+  is there.
+- --create of RAID0, RAID1, RAID10, RAID5 and Volume (linear) volumes in
+  it, as the menu writes them, so that the BIOS and Windows take them;
+  a redundant one gets the initialization md then runs (mdmon records
+  it), or is recorded as initialized with --assume-clean.  Written by
+  mdmon when it runs the container, by mdadm otherwise.
+- --create -l1 -n1 --force makes a RAIDABLE, as the menu does: one
+  whole disk no volume is on, no --size, laid out and recorded as the
+  menu's Volume of that disk but for the type; md runs it as raid1 of
+  one member.  The --force that -n1 needs does not go past the limit
+  of 12 arrays.
+- Of two --create run at once, the one that read the configuration
+  before the other wrote it is refused and its md array stopped; a name
+  another volume of the container has is refused, as by IMSM.
+- A new volume takes the AMD global hot spares of the container too, as
+  IMSM builds volumes of the spares of its container (a disk added to a
+  container becomes one); they are spares no more, as the members of a
+  volume the menu makes of Ready disks.  The AMD core would take them
+  as they are (RC_CreateRaidArray does not look at SpareInfo).  A spare
+  md is rebuilding onto, or one of a volume the monitor has not recorded
+  yet, is not taken.
+- --zero-superblock wipes the label, the commit block, the ring, and
+  LBA 0 if it still holds the MBR AMD wrote.
+
+The levels, numbers of disks and chunk sizes are those AMD allows.  A
+volume is made on all its disks: "missing" is refused, as by IMSM, and
+so are --write-zeroes and --data-offset.
+
+Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
+---
+ super-amd.c | 1773 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 1763 insertions(+), 10 deletions(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index 9136a29f..d6451543 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -10,7 +10,9 @@
+  * RAID1/RAID10/RAID5 managed by mdmon (clean/dirty in the AMD bitmap,
+  * member failures and missing members, initialization, rebuilds onto AMD
+  * global spares and of a returning member into its slot - both go on after
+- * a reboot from where md stopped).
++ * a reboot from where md stopped);
++ * --create of a container (the disks "initialized" as the BIOS menu does)
++ * and of Volume/RAID0/1/10/5 volumes in it.
+  *
+  * On-disk layout, little-endian, 512-byte sectors:
+  *   LBA 0x5000         RC_MetaData: per-disk label, "RAIDCore", DeviceId
+@@ -24,6 +26,7 @@
+  */
+ 
+ #include "mdadm.h"
++#include "drive_encryption.h"
+ #include "mapfile.h"
+ #include "mdmon.h"
+ #include "mdstat.h"
+@@ -48,6 +51,7 @@
+ #define AMD_MAX_PACKET		(1024 * 1024)
+ #define AMD_DEFAULT_ALLOC_LBA	0x100000	/* where volumes start */
+ #define AMD_SERVICE		0x5000	/* AllocatedSpace in front of user data */
++#define AMD_SERVICE_BYTES	(AMD_SERVICE * AMD_SECTOR)
+ #define AMD_MIB			0x800		/* sectors */
+ /*
+  * The controller serial number of the AMD BIOS and Windows driver alike: a
+@@ -386,6 +390,7 @@ struct amd_disk {
+  *  - ATTACH (struct amd_update_attach): it joined the container.
+  */
+ #define AMD_UPDATE_SPARE	1	/* struct amd_update_spare */
++#define AMD_UPDATE_CREATE	2	/* struct amd_update_create */
+ #define AMD_UPDATE_REMOVE	3
+ #define AMD_UPDATE_ATTACH	5	/* amd_update_attach */
+ 
+@@ -486,6 +491,14 @@ struct amd_super {
+ 	void *ldbuf;
+ 	unsigned int ldbuf_room;
+ 	bool busy;		/* mdmon: a thread works on it (amd_lock) */
++	/* --create */
++	int creating;		/* AMD_CREATE_CONTAINER: disks being initialized */
++	struct amd_disk *cur_disk;	/* the disk add_to_super took last */
++	int new_vol;		/* the volume being created, or -1 */
++	int add_slot;		/* its member add_to_super was given last, or -1 */
++	struct amd_disk *layout[AMD_MAX_PD];	/* its disks, by slot */
++	int npick;		/* of them, given on the command line */
++	int fill;		/* no size asked: a Volume takes all the room of each disk */
+ 	int whole;		/* it is a RAIDABLE: one whole disk free of volumes */
+ };
+ 
+@@ -506,6 +519,7 @@ static void amd_reparse_without(struct amd_super *super, int gone);
+ static struct amd_disk *amd_find_spare(struct amd_super *super,
+ 				       struct amd_vol *v, int slot,
+ 				       struct amd_element *el, int *recorded);
++static int amd_label_spare(int fd, __u64 id, __u32 spare);
+ static int amd_pd_index(struct amd_super *super, __u64 id);
+ static int amd_disk_in_volumes(struct amd_super *super, __u64 id);
+ static void amd_kmsg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+@@ -549,6 +563,13 @@ static __u64 amd_sector_sum(const void *sector)
+ 	return amd_checksum((const char *)sector + 8, AMD_SECTOR - 8);
+ }
+ 
++/* a RAIDCore label with a valid checksum */
++static int amd_label_valid(const struct amd_metadata *md)
++{
++	return __le64_to_cpu(md->ident) == AMD_RC_IDENT &&
++	       __le64_to_cpu(md->checksum) == amd_sector_sum(md);
++}
++
+ static int amd_read(int fd, unsigned long long lba, void *buf, size_t len)
+ {
+ 	ssize_t n;
+@@ -1840,6 +1861,8 @@ static struct amd_super *amd_new_super(void)
+ 	struct amd_super *super = xcalloc(1, sizeof(*super));
+ 
+ 	super->current_vol = -1;
++	super->new_vol = -1;
++	super->add_slot = -1;
+ 	super->iobuf = amd_alloc(AMD_SECTOR);
+ 	super->mmbuf = amd_alloc(AMD_SECTOR);
+ 	return super;
+@@ -2377,10 +2400,15 @@ static void amd_container_uuid(struct amd_super *super, int uuid[4])
+ 	struct amd_super *set = NULL;
+ 	__u64 id = super->container_id;
+ 
+-	if (!super->packet) {
++	if (!super->packet && !super->creating) {
+ 		amd_uuid("disk", 0, super->disks->device_id, uuid);
+ 		return;
+ 	}
++	/* --create: the lowest DeviceID of the disks given so far */
++	if (super->creating) {
++		amd_uuid("container", AMD_SERIAL, id, uuid);
++		return;
++	}
+ 	if (!super->from_md) {
+ 		set = amd_running_set(super, devnm);
+ 		if (set) {
+@@ -2607,6 +2635,35 @@ static int amd_container_disks(struct amd_super *super)
+ 	return n;
+ }
+ 
++/* getinfo_super_amd of the volume mdadm --create is making */
++static void amd_getinfo_new_volume(struct supertype *st, struct mdinfo *info)
++{
++	struct amd_super *super = st->sb;
++	struct amd_vol *v = &super->vol[super->current_vol];
++
++	/* --create: md initializes it (CREATE_REDUNDANCY) */
++	if (v->init_pending) {
++		info->array.state &= ~(1 << MD_SB_CLEAN);
++		info->resync_start = 0;
++	}
++	if (super->add_slot >= 0 && super->add_slot < v->nel) {
++		struct amd_element *el = &v->el[super->add_slot];
++		struct amd_disk *d = amd_find_disk(super,
++				__le64_to_cpu(el->id.id));
++
++		info->disk.number = super->add_slot;
++		info->disk.raid_disk = super->add_slot;
++		info->disk.major = d ? d->major : 0;
++		info->disk.minor = d ? d->minor : 0;
++		info->disk.state = (1 << MD_DISK_SYNC) | (1 << MD_DISK_ACTIVE);
++		info->data_offset = __le64_to_cpu(el->user_data.offset);
++		info->component_size = __le64_to_cpu(el->user_data.size);
++	}
++	/* a member array of the container, under mdmon */
++	snprintf(info->text_version, sizeof(info->text_version),
++		 "/%s/%d", st->container_devnm, super->current_vol);
++}
++
+ /* getinfo_super_amd of volume super->current_vol, as on disk @disk */
+ static void amd_getinfo_volume(struct supertype *st, struct mdinfo *info,
+ 			       struct amd_disk *disk)
+@@ -2616,6 +2673,10 @@ static void amd_getinfo_volume(struct supertype *st, struct mdinfo *info,
+ 	int i;
+ 
+ 	amd_fill_volume(super, super->current_vol, info);
++	if (super->current_vol == super->new_vol) {
++		amd_getinfo_new_volume(st, info);
++		return;
++	}
+ 	info->disk.raid_disk = -1;
+ 	for (i = 0; i < v->nel; i++)
+ 		if (__le64_to_cpu(v->el[i].id.id) == disk->device_id) {
+@@ -2650,6 +2711,8 @@ static void amd_getinfo_container(struct amd_super *super, struct mdinfo *info,
+ 	 * that came first would keep all the others out).
+ 	 */
+ 	info->array.raid_disks = 0;
++	if (super->cur_disk)
++		disk = super->cur_disk;	/* --create: the disk just added */
+ 
+ 	idx = amd_pd_index(super, disk->device_id);
+ 	info->disk.number = idx;
+@@ -2685,6 +2748,12 @@ static void getinfo_super_amd(struct supertype *st, struct mdinfo *info,
+ 	int map_disks = info->array.raid_disks;
+ 
+ 	memset(info, 0, sizeof(*info));
++	if (!disk && super->creating) {
++		/* --create, before the first disk */
++		amd_fill_container(super, info);
++		info->disk.raid_disk = -1;
++		return;
++	}
+ 	if (!disk)
+ 		return;
+ 	if (super->current_vol >= 0 && super->current_vol < super->nvol)
+@@ -2697,7 +2766,7 @@ static void getinfo_super_amd(struct supertype *st, struct mdinfo *info,
+  * Are @first and @second disks of one container?  Of the set @first
+  * belongs to (amd_find_set) - the configuration of @first alone may not
+  * list @second: a disk added while @first was away.  Disks without a
+- * configuration go by UUID.
++ * configuration, and those of --create, go by UUID, as before.
+  */
+ static int amd_same_set(struct amd_super *first, struct amd_super *second)
+ {
+@@ -2707,7 +2776,8 @@ static int amd_same_set(struct amd_super *first, struct amd_super *second)
+ 	int u1[4], u2[4];
+ 	int same;
+ 
+-	if (!first->packet || !second->packet) {
++	if (!first->packet || !second->packet || first->creating ||
++	    second->creating) {
+ 		amd_container_uuid(first, u1);
+ 		amd_container_uuid(second, u2);
+ 		return memcmp(u1, u2, sizeof(u1)) == 0;
+@@ -3960,14 +4030,68 @@ static int update_super_amd(struct supertype *st, struct mdinfo *info,
+ 	return update == UOPT_SPEC_ASSEMBLE ? 0 : -1;
+ }
+ 
++/*
++ * Creation, the way the RAIDXpert2 menu does it (RAIDCoreDxe 9.3.3):
++ *  - a container is a set of disks "initialized" (FUN_00016e28): the first
++ *    and last 0xA000 sectors zeroed, an MBR with one partition of type 0x82
++ *    from sector 0x3F over the capacity (its low 32 bits), the RAIDCore
++ *    label with a random 48-bit DeviceID and Features 0x1C, 0x7E sectors of
++ *    0xAF at 0x4F80 (written by the menu, FUN_0001d0e4), and a config packet
++ *    listing the controller and the disks, handles 1..n;
++ *  - a volume is an LD record and its second copy (TransformLink) in the
++ *    next packet: State 0, CREATE_REDUNDANCY not started, TransformFlags
++ *    0x211, Cache 0xC0000000, Attribute 1 (bitmap), TaskPriority 0x14, one
++ *    parent reference to the controller, its own handle (1, 2, ...) and a
++ *    random 48-bit ID.  Each member gets the first free extent from
++ *    0x100000: the size asked for in whole MiB plus 0x5000 sectors of
++ *    service area in front.  mdmon then initializes it (md resync).
++ * Levels: Volume (linear), RAID0, RAID1 (2 disks), RAID10 (2 x n) and
++ * RAID5 (3 to 8 disks), as amd_level_ok() checks.
++ */
++#define AMD_INIT_ZERO		0xa000	/* zeroed at each end by Initialize */
++#define AMD_FILL_LBA		0x4f80
++#define AMD_FILL_SECTORS	0x7e
++#define AMD_FILL_BYTE		0xaf
++#define AMD_FEATURES		0x1c
++#define AMD_CREATE_CONTAINER	1
++
+ static int amd_insert_ld(struct amd_super *super, unsigned int at,
+ 			 const void *rec, unsigned int size);
++static int amd_packet_reserve(struct amd_super *super, unsigned int size);
++static int amd_erase(int fd);
+ static int amd_in_volume(const struct amd_vol *v, __u64 id);
+ static int amd_vol_has_disk(const struct amd_vol *v, __u64 id);
++static struct amd_ld *amd_ld_by_id(struct amd_super *super, __u64 id);
++static int amd_rebuilt_into(struct amd_super *super, const struct amd_disk *d);
+ static int amd_extent_overlap(struct amd_super *super, __u64 id,
+ 			      unsigned long long start, unsigned long long len,
+ 			      unsigned long long *end);
+ 
++static int amd_id_used(struct amd_super *super, __u64 id)
++{
++	int i;
++
++	for (i = 0; i < super->npd; i++)
++		if (__le64_to_cpu(super->pd[i]->id.id) == id)
++			return 1;
++	for (i = 0; i < super->nvol; i++)
++		if (__le64_to_cpu(super->vol[i].ld->id.id) == id)
++			return 1;
++	return amd_find_disk(super, id) != NULL;
++}
++
++/* a random 48-bit ID (as RAIDCoreDxe FUN_00019aa4 makes), not 0, not in use */
++static __u64 amd_random_id(struct amd_super *super)
++{
++	for (;;) {
++		__u64 id = (((__u64)random32() << 16) ^ random32()) &
++			   0xffffffffffffULL;
++
++		if (id && !amd_id_used(super, id))
++			return id;
++	}
++}
++
+ /*
+  * ATA IDENTIFY DEVICE through SG_IO (ATA PASS-THROUGH(16)); 0 on success.
+  * Not drive_encryption.c's ata_pass_through12_ioctl(): it sets CK_COND and
+@@ -4001,6 +4125,78 @@ static int amd_ata_identify(int fd, __u16 *id)
+ 	return 0;
+ }
+ 
++/*
++ * The DeviceID RAIDCoreDxe gives a disk (FUN_00019904 with FUN_00006ae0;
++ * the menu's Initialize writes it): two 31-bit shift-register signatures,
++ * low and high half, of the 20-byte serial number field as the disk reports
++ * it (padding kept) followed by 12 't's.  The menu finds a member's disk by
++ * it alone (FUN_00019b58, FUN_00021bb0): with another ID the disk shows
++ * "New" and its volume no capacity.  Checked on 11 disks of the dumps.
++ */
++static __u64 amd_serial_hash(const unsigned char *sn)
++{
++	__u32 a = 0x7fffffff, b = 0x7fffffff;
++	int i, k;
++
++	for (i = 0; i < 32; i++) {
++		unsigned int c = i < 20 ? sn[i] : 't';
++
++		for (k = 0; k < 8; k++) {
++			unsigned int bit = c >> k & 1;
++
++			if (bit != ((a >> 28 ^ a) >> 2 & 1))
++				a |= 0x80000000;
++			a >>= 1;
++			if (bit != ((b >> 26 ^ b) >> 3 & 1))
++				b |= 0x80000000;
++			b >>= 1;
++		}
++	}
++	return a + ((__u64)b << 32);
++}
++
++/* the serial number field of the disk: NVMe Identify Controller, ATA IDENTIFY */
++static int amd_disk_serial(int fd, unsigned char *sn)
++{
++	unsigned char ctrl[4096];
++	__u16 id[256];
++	int i;
++
++	if (ioctl(fd, NVME_IOCTL_ID) > 0) {
++		if (nvme_identify_ioctl(fd, 0, NVME_IDENTIFY_CONTROLLER_DATA,
++					ctrl, sizeof(ctrl), 0) !=
++		    MDADM_STATUS_SUCCESS)
++			return -1;
++		memcpy(sn, ctrl + 4, 20);
++		return 0;
++	}
++	if (amd_ata_identify(fd, id) != 0)
++		return -1;
++	for (i = 0; i < 10; i++) {		/* words 10-19, high byte first */
++		sn[2 * i] = __le16_to_cpu(id[10 + i]) >> 8;
++		sn[2 * i + 1] = __le16_to_cpu(id[10 + i]) & 0xff;
++	}
++	return 0;
++}
++
++/*
++ * A new disk's DeviceID: the firmware's, from its serial number; if the
++ * disk does not tell (a loop device) or that ID is taken, a random one, as
++ * RAIDCoreDxe also falls back to (FUN_000199cc).
++ */
++static __u64 amd_disk_id(struct amd_super *super, int fd)
++{
++	unsigned char sn[20];
++	__u64 id;
++
++	if (amd_disk_serial(fd, sn) == 0) {
++		id = amd_serial_hash(sn);
++		if (id && !amd_id_used(super, id))
++			return id;
++	}
++	return amd_random_id(super);
++}
++
+ static int amd_is_nvme(int major, int minor)
+ {
+ 	char real[PATH_MAX];
+@@ -4068,6 +4264,609 @@ static void amd_fill_pd(struct amd_pd *pd, __u64 id, int handle,
+ 	pd->features = __cpu_to_le32(features);
+ }
+ 
++/*
++ * The packet of a container being created: the controller and the disks
++ * added so far, in that order (Handles 1, 2, ...), no LDs.  The container
++ * UUID follows the lowest DeviceID among them (amd_parse_packet), so it
++ * may change as disks come: amd_create_map puts the last one in the map.
++ */
++static int amd_build_packet(struct amd_super *super)
++{
++	unsigned int n = 1, len, i;
++	struct amd_packet_header *h;
++	struct amd_disk *d;
++	struct amd_pd *pd;
++
++	for (d = super->disks; d; d = d->next)
++		n++;
++	len = ROUND_UP(sizeof(*h) + n * sizeof(*pd), AMD_SECTOR);
++	h = amd_alloc(len);
++	if (!h)
++		return -1;
++	h->header_key = __cpu_to_le64(AMD_HEADER_KEY);
++	h->version = __cpu_to_le32(1);
++	h->packet_size = __cpu_to_le32(len);
++	h->modifier_sn = __cpu_to_le64(super->serial);
++	h->pd_offset = __cpu_to_le32(sizeof(*h));
++	h->pd_size = __cpu_to_le32(n * sizeof(*pd));
++	h->ld_offset = __cpu_to_le32(sizeof(*h) + n * sizeof(*pd));
++	pd = (struct amd_pd *)(h + 1);
++	pd[0].type = __cpu_to_le32(AMD_DST_PD);
++	pd[0].id.id = __cpu_to_le64(super->serial);
++	pd[0].id.handle = __cpu_to_le16(0xffff);
++	pd[0].device_type = __cpu_to_le32(AMD_DEV_RAIDCORE_CORE);
++	pd[0].device_state = __cpu_to_le32(AMD_DEV_STATE_ONLINE);
++	for (i = 1, d = super->disks; d; d = d->next, i++)
++		amd_fill_pd(&pd[i], d->device_id, i, d->sectors,
++			    amd_pd_features(d->fd, d->major, d->minor), 0);
++	h->checksum = __cpu_to_le64(amd_checksum((char *)h + 0x0c, len - 0x0c));
++	amd_take_packet(super, h, len, 0);
++	for (d = super->disks; d; d = d->next) {
++		/* a packet these disks have "seen": amd_write_config writes them */
++		d->commit_valid = 1;
++		d->last_online = super->serial;
++		d->generation = 0;
++		d->committed_checksum = __le64_to_cpu(h->checksum);
++		d->packet_lba = 0;
++		d->packet_size = 0;
++		d->packet_number = 0;
++	}
++	return 0;
++}
++
++/*
++ * Initialize one disk: zeroed ends, MBR, the 0xAF area, the label.  @spare is
++ * the label's SpareInfo (AMD_SPARE_GLOBAL for a global hot spare).  @keep_tail:
++ * a former member - an extent of another volume may reach the end.
++ */
++static int amd_init_disk(struct amd_disk *d, __u32 spare, int keep_tail)
++{
++	size_t zlen = AMD_INIT_ZERO * AMD_SECTOR;
++	char *buf = amd_alloc(zlen);
++	struct MBR *pt = (struct MBR *)buf;
++	struct amd_metadata *md;
++	__u32 sig;
++	__u64 mbr_sum;
++	int rv = 1;
++
++	if (!buf || d->sectors < 2 * AMD_INIT_ZERO + AMD_DEFAULT_ALLOC_LBA)
++		goto out;
++	if (pwrite(d->fd, buf, zlen, 0) != (ssize_t)zlen ||
++	    (!keep_tail &&
++	     pwrite(d->fd, buf, zlen,
++		    (off_t)(d->sectors - AMD_INIT_ZERO) * AMD_SECTOR) != (ssize_t)zlen))
++		goto out;
++
++	/* MBR, with a random disk signature */
++	pt->parts[0].part_type = AMD_MBR_TYPE;
++	pt->parts[0].first_sect_lba = __cpu_to_le32(AMD_MBR_START);
++	pt->parts[0].blocks_num = __cpu_to_le32((__u32)d->sectors);
++	sig = __cpu_to_le32(random32());
++	memcpy(pt->pad + 0x1b8, &sig, sizeof(sig));
++	pt->magic = MBR_SIGNATURE_MAGIC;
++	mbr_sum = amd_checksum(buf, AMD_SECTOR);
++	if (pwrite(d->fd, buf, AMD_SECTOR, 0) != AMD_SECTOR)
++		goto out;
++
++	memset(buf, AMD_FILL_BYTE, AMD_FILL_SECTORS * AMD_SECTOR);
++	if (pwrite(d->fd, buf, AMD_FILL_SECTORS * AMD_SECTOR,
++		   (off_t)AMD_FILL_LBA * AMD_SECTOR) !=
++	    AMD_FILL_SECTORS * AMD_SECTOR)
++		goto out;
++
++	memset(buf, 0, AMD_SECTOR);
++	md = (struct amd_metadata *)buf;
++	md->ident = __cpu_to_le64(AMD_RC_IDENT);
++	md->device_id = __cpu_to_le64(d->device_id);
++	md->commit_offset = __cpu_to_le64(AMD_COMMIT_LBA);
++	md->ring_offset = __cpu_to_le64(AMD_RING_LBA);
++	md->ring_size = __cpu_to_le32(AMD_RING_END - AMD_RING_LBA);
++	md->version = __cpu_to_le32(AMD_RC_VERSION);
++	md->features = __cpu_to_le32(AMD_FEATURES);
++	md->spare_info = __cpu_to_le32(spare);
++	md->mbr_checksum = __cpu_to_le64(mbr_sum);
++	md->checksum = __cpu_to_le64(amd_sector_sum(md));
++	if (pwrite(d->fd, buf, AMD_SECTOR, (off_t)AMD_METADATA_LBA * AMD_SECTOR) !=
++	    AMD_SECTOR || fsync(d->fd) != 0)
++		goto out;
++	d->features = AMD_FEATURES;
++	rv = 0;
++out:
++	free(buf);
++	return rv;
++}
++
++/* the new volume's members: free extent of @size sectors on each disk */
++static unsigned long long amd_free_extent(struct amd_super *super,
++					  struct amd_disk *d,
++					  unsigned long long size)
++{
++	unsigned long long start = AMD_DEFAULT_ALLOC_LBA, end;
++	int i = amd_pd_index(super, d->device_id);
++	unsigned long long cap = amd_pd_capacity(i >= 0 ? super->pd[i] : NULL,
++						 d->sectors);
++
++	while (amd_extent_overlap(super, d->device_id, start, size, &end))
++		start = end;
++	/* an element recorded past the disk may end near 2^64: no wrap */
++	return start <= cap && size <= cap - start ? start : 0;
++}
++
++/* largest extent (sectors) free on @d */
++static unsigned long long amd_max_extent(struct amd_super *super,
++					 struct amd_disk *d)
++{
++	unsigned long long lo = 0, hi = d->sectors;
++
++	/* first fit is monotone in the size asked for: bisect, in MiB */
++	while (hi - lo > AMD_MIB) {
++		unsigned long long mid = (lo + hi) / 2 / AMD_MIB * AMD_MIB;
++
++		if (mid <= lo)
++			break;
++		if (amd_free_extent(super, d, mid))
++			lo = mid;
++		else
++			hi = mid;
++	}
++	return lo;
++}
++
++/*
++ * -l1 -n1 (mdadm.c asks --force for one disk): a RAIDABLE, "RAID aware
++ * single disk for future redundancy" - md raid1 of one member, as it is
++ * assembled (amd_classify_level), and grown into a RAID1 with --grow -n2.
++ */
++static int amd_is_raidable(int level, int raiddisks)
++{
++	return level == 1 && raiddisks == 1;
++}
++
++static int amd_level_ok(int level, int raiddisks, int verbose)
++{
++	if (level == LEVEL_LINEAR && raiddisks >= 1)
++		return 1;	/* Volume (the menu: 1 to 8 disks) */
++	if (level == 0 && raiddisks >= 2)
++		return 1;
++	if (level == 1 && raiddisks == 2)
++		return 1;
++	if (amd_is_raidable(level, raiddisks))
++		return 1;
++	if (level == 10 && raiddisks >= 4 && raiddisks % 2 == 0)
++		return 1;
++	if (level == 5 && raiddisks >= 3 && raiddisks <= 8)
++		return 1;	/* rcadm: "three to eight disks" */
++	if (verbose)
++		pr_err("AMD RAID volumes can be created as RAID0 (2 or more disks), RAID1 (2 disks), RAID10 (2 x n disks), RAID5 (3 to 8 disks), linear (Volume, 1 or more disks) or RAIDABLE (RAID1 of 1 disk: -l1 -n1 --force)\n");
++	return 0;
++}
++
++/*
++ * Room for a new member on the disk of this PD: user data sectors in whole
++ * MiB of its largest free extent, after the service area.  0 if the disk
++ * cannot take one: missing, stale, failed, a dedicated spare (its volume's),
++ * being rebuilt onto, or full.  A global spare can, as IMSM builds new
++ * volumes of the spares of its container: --add makes every new disk one
++ * (amd_add_new), and it is no spare once a member (amd_take_spares).
++ * A RAIDABLE (super->whole) takes a disk no volume has an element on, and
++ * all of it, up to the end of the disk (amd_pd_capacity): the BIOS menu
++ * offers it only "Ready" disks (RAIDCoreDxe FUN_0000ed9c) and lays it out
++ * so (dumps/2026-11-06-qemu-spares-raidable, snapshot 04; MSI X870E 1 TB,
++ * dumps/2026-11-07-raidable-done).
++ */
++static unsigned long long amd_disk_room(struct amd_super *super,
++					struct amd_pd *pd, struct amd_disk **dp)
++{
++	struct amd_disk *d;
++	unsigned long long m;
++
++	if (__le32_to_cpu(pd->device_type) != AMD_DEV_RAIDCORE_DISK ||
++	    amd_dedicated_owner(super, __le64_to_cpu(pd->id.id)) >= 0)
++		return 0;
++	d = amd_member_disk(super, __le64_to_cpu(pd->id.id));
++	if (!d || amd_disk_failed(super, d->device_id) ||
++	    amd_rebuilt_into(super, d) >= 0)
++		return 0;
++	if (super->whole) {
++		if (amd_disk_in_volumes(super, d->device_id))
++			return 0;
++		m = amd_pd_capacity(pd, d->sectors);
++		m = m > AMD_DEFAULT_ALLOC_LBA ? m - AMD_DEFAULT_ALLOC_LBA : 0;
++	} else {
++		m = amd_max_extent(super, d);
++	}
++	if (m < AMD_SERVICE + AMD_MIB)
++		return 0;
++	*dp = d;
++	return (m - AMD_SERVICE) / AMD_MIB * AMD_MIB;
++}
++
++/* Why amd_disk_room() gave 0 for the disk of @pd, for messages. */
++static const char *amd_no_room(struct amd_super *super, struct amd_pd *pd)
++{
++	static char why[96];
++	__u64 id = __le64_to_cpu(pd->id.id);
++	struct amd_disk *d = amd_member_disk(super, id);
++	int vol;
++
++	if (__le32_to_cpu(pd->device_type) == AMD_DEV_LEGACY)
++		return "a Legacy disk";
++	if (__le32_to_cpu(pd->device_type) != AMD_DEV_RAIDCORE_DISK)
++		return "not a RAID disk";
++	vol = amd_dedicated_owner(super, id);
++	if (vol >= 0) {
++		snprintf(why, sizeof(why),
++			 "a dedicated spare of subarray-%d (mdadm <that volume> --remove unassigns it)",
++			 vol);
++		return why;
++	}
++	if (!d)
++		return "missing or stale";
++	if (amd_disk_failed(super, id))
++		return "failed";
++	vol = amd_rebuilt_into(super, d);
++	if (vol >= 0) {
++		snprintf(why, sizeof(why), "md is rebuilding subarray-%d onto it",
++			 vol);
++		return why;
++	}
++	if (super->whole && amd_disk_in_volumes(super, id))
++		return "a RAIDABLE volume takes a whole disk, and a volume is on this one";
++	return "no free space left";
++}
++
++static char *amd_disk_name(struct amd_disk *d)
++{
++	char *n = d->devname;
++
++	if (!n && (d->major || d->minor))
++		n = map_dev(d->major, d->minor, 0);
++	return n ? n : "?";
++}
++
++/*
++ * amd_autolayout() found no disks for the new volume: say how much room
++ * the container has, disk by disk.  @size: per member, sectors, or 0.
++ */
++static void amd_explain_room(struct amd_super *super, int raiddisks,
++			     unsigned long long size)
++{
++	unsigned long long room[AMD_MAX_PD];
++	int i, j, n = 0;
++
++	for (i = 0; i < super->npd; i++) {
++		struct amd_disk *d = NULL;
++		unsigned long long m = amd_disk_room(super, super->pd[i], &d);
++
++		if (!m)
++			continue;
++		for (j = n++; j > 0 && room[j - 1] < m; j--)
++			room[j] = room[j - 1];
++		room[j] = m;
++	}
++	if (n < raiddisks)
++		pr_err("%d disk%s of the container can take a member, %d needed:\n",
++		       n, n == 1 ? "" : "s", raiddisks);
++	else
++		pr_err("%llu MiB per member asked for, but no %d disks of the container have more than %llu MiB free each:\n",
++		       (size + AMD_MIB - 1) / AMD_MIB, raiddisks,
++		       room[raiddisks - 1] / AMD_MIB);
++	for (i = 0; i < super->npd; i++) {
++		struct amd_pd *pd = super->pd[i];
++		struct amd_disk *d = NULL;
++		unsigned long long m = amd_disk_room(super, pd, &d);
++		struct amd_disk *md = amd_member_disk(super,
++						      __le64_to_cpu(pd->id.id));
++
++		if (__le32_to_cpu(pd->device_type) == AMD_DEV_RAIDCORE_CORE)
++			continue;	/* the controller */
++		if (m)
++			cont_err("handle %u, %s: %llu MiB free\n",
++				 __le16_to_cpu(pd->id.handle), amd_disk_name(d),
++				 m / AMD_MIB);
++		else
++			cont_err("handle %u, %s: %s\n", __le16_to_cpu(pd->id.handle),
++				 md ? amd_disk_name(md) : "-",
++				 amd_no_room(super, pd));
++	}
++}
++
++/*
++ * The disks of the new volume, by slot, in super->layout: the ones given
++ * on the command line (amd_pick_disk), else the first disks in PD order
++ * with room for @size - global spares only after the others, as a disk
++ * kept for rebuilds is the last one to go.  *freesize: the room they all
++ * have.
++ */
++static int amd_autolayout(struct amd_super *super, int raiddisks,
++			  unsigned long long size, unsigned long long *freesize)
++{
++	unsigned long long common = ~0ULL;
++	int i, n = 0, spares;
++
++	if (super->npick) {
++		if (super->npick != raiddisks)
++			return 0;
++		for (i = 0; i < raiddisks; i++) {
++			struct amd_disk *d = NULL;
++			int p = amd_pd_index(super, super->layout[i]->device_id);
++			unsigned long long m = p < 0 ? 0 :
++				amd_disk_room(super, super->pd[p], &d);
++
++			if (m == 0 || (size && m < size))
++				return 0;
++			if (m < common)
++				common = m;
++		}
++		n = raiddisks;
++	}
++	for (spares = 0; spares < 2 && n < raiddisks; spares++)
++		for (i = 0; i < super->npd && n < raiddisks; i++) {
++			struct amd_pd *pd = super->pd[i];
++			int global = (__le32_to_cpu(pd->spare_info) &
++				      AMD_SPARE_GLOBAL) != 0;
++			struct amd_disk *d = NULL;
++			unsigned long long m;
++
++			if (global != spares)
++				continue;
++			m = amd_disk_room(super, pd, &d);
++			if (m == 0 || (size && m < size))
++				continue;
++			super->layout[n++] = d;
++			if (m < common)
++				common = m;
++		}
++	if (n < raiddisks)
++		return 0;
++	if (freesize)
++		*freesize = common;
++	return 1;
++}
++
++/*
++ * The size of the new volume, as validate_geometry is first asked with
++ * the container loaded: @size per member (sectors), 0 when no -z was given
++ * (or -z max); @whole: it is a RAIDABLE.  A RAIDABLE takes no size: the
++ * BIOS menu greys Array Size out for it and gives it the whole disk
++ * (dumps/2026-11-06-qemu-spares-raidable, snapshot 04).
++ */
++static int amd_new_size(struct amd_super *super, int whole,
++			unsigned long long size, int verbose)
++{
++	if (whole && size) {
++		if (verbose)
++			pr_err("an AMD RAIDABLE volume takes its whole disk: give no --size\n");
++		return 0;
++	}
++	super->fill = size == 0;
++	super->whole = whole;
++	return 1;
++}
++
++/*
++ * mdadm -C <name> -e amd -l<level> -n<n> <disk>...: the disks must be in
++ * the assembled AMD container; the first one loads it.  Each is checked
++ * and becomes the next slot of the new volume (RAID10: slots 0,1 are the
++ * first mirror pair, 2,3 the second).  @size: per member (sectors) or 0.
++ * @whole: the volume is a RAIDABLE.  *freesize: its room.
++ */
++static int amd_pick_disk(struct supertype *st, char *subdev, int whole,
++			 unsigned long long size,
++			 unsigned long long *freesize, int verbose)
++{
++	struct amd_super *super = st->sb;
++	struct amd_metadata *md;
++	struct amd_disk *d = NULL;
++	unsigned long long room;
++	int fd, cfd, p, i;
++	__u64 id = 0;
++
++	fd = open(subdev, O_RDONLY);
++	if (!is_fd_valid(fd)) {
++		if (verbose)
++			pr_err("cannot open %s\n", subdev);
++		return 0;
++	}
++	md = amd_alloc(AMD_SECTOR);
++	if (md && amd_read(fd, AMD_METADATA_LBA, md, AMD_SECTOR) == 0 &&
++	    __le64_to_cpu(md->ident) == AMD_RC_IDENT)
++		id = __le64_to_cpu(md->device_id);
++	free(md);
++	if (!super) {
++		cfd = open_container(fd);
++		if (!is_fd_valid(cfd) ||
++		    load_container_amd(st, cfd, NULL) != 0) {
++			if (verbose)
++				pr_err("%s is not in an assembled AMD RAID container: mdadm -A /dev/md/<name> <its disks> first\n",
++				       subdev);
++			close_fd(&cfd);
++			close(fd);
++			return 0;
++		}
++		close(cfd);
++		super = st->sb;
++	}
++	close(fd);
++	p = id ? amd_pd_index(super, id) : -1;
++	if (p < 0) {
++		if (verbose)
++			pr_err("%s is not a disk of this AMD RAID container\n",
++			       subdev);
++		return 0;
++	}
++	for (i = 0; i < super->npick; i++)
++		if (super->layout[i]->device_id == id) {
++			if (verbose)
++				pr_err("%s is given twice\n", subdev);
++			return 0;
++		}
++	if (super->npick >= AMD_MAX_PD)
++		return 0;
++	if (super->npick == 0 && !amd_new_size(super, whole, size, verbose))
++		return 0;
++	room = amd_disk_room(super, super->pd[p], &d);
++	if (room == 0) {
++		if (verbose)
++			pr_err("%s cannot take a member: %s\n", subdev,
++			       amd_no_room(super, super->pd[p]));
++		return 0;
++	}
++	if (size && room < size) {
++		if (verbose)
++			pr_err("%s has %llu MiB free for a member, %llu MiB asked\n",
++			       subdev, room / AMD_MIB,
++			       (size + AMD_MIB - 1) / AMD_MIB);
++		return 0;
++	}
++	super->layout[super->npick++] = d;
++	if (freesize)
++		*freesize = room;
++	return 1;
++}
++
++/* map_update() frees the entry's path before copying the new one */
++static void amd_map_set_uuid(struct map_ent **map, struct map_ent *me,
++			     int uuid[4])
++{
++	char devnm[sizeof(me->devnm)], meta[sizeof(me->metadata)];
++	char *path = me->path ? xstrdup(me->path) : NULL;
++
++	snprintf(devnm, sizeof(devnm), "%s", me->devnm);
++	snprintf(meta, sizeof(meta), "%s", me->metadata);
++	map_update(map, devnm, meta, uuid, path);	/* frees *map */
++	free(path);
++}
++
++/*
++ * Send the updates queued for mdmon and see that it has recorded them.  It
++ * sends no answer, and an update that no longer fits its configuration -
++ * another mdadm or the monitor itself changed it meanwhile - it turns down
++ * in the kernel log only (amd_kill_volume, amd_apply_role ...); one it
++ * cannot write stays in its memory (amd_flush_config).  But the
++ * configuration is on the disks by the time flush_metadata_updates() has
++ * its ack: managemon gives that once the queue is empty and the monitor
++ * has made another pass (managemon.c handle_message), and the monitor
++ * writes right after process_update (monitor.c wait_and_act).  So
++ * @recorded asks the configuration on the disks of @st's container, loaded
++ * afresh, whether the change is there.  IMSM does not check ("these
++ * routines do not report success/failure", Kill.c).  0 if it is there, 1
++ * if not, -1 if mdmon cannot be reached (said here).
++ */
++static int amd_mdmon_recorded(struct supertype *st,
++			      int (*recorded)(struct amd_super *, const void *),
++			      const void *arg)
++{
++	struct supertype *tst;
++	int fd, rv = 1;
++
++	if (flush_metadata_updates(st) != 0) {
++		pr_err("cannot reach mdmon\n");
++		return -1;
++	}
++	tst = dup_super(st);
++	fd = open_dev(st->container_devnm);
++	if (is_fd_valid(fd) && tst->ss->load_container(tst, fd, NULL) == 0) {
++		rv = !recorded(tst->sb, arg);
++		tst->ss->free_super(tst);
++	}
++	close_fd(&fd);
++	free(tst);
++	return rv;
++}
++
++/* the LD record with volume ID @id in the packet, any type; NULL if none */
++static struct amd_ld *amd_ld_by_id(struct amd_super *super, __u64 id)
++{
++	struct amd_packet_header *h = super->packet;
++	unsigned int off = __le32_to_cpu(h->ld_offset);
++	struct amd_ld *ld;
++
++	while ((ld = amd_next_ld(super, &off)))
++		if (__le64_to_cpu(ld->id.id) == id)
++			return ld;
++	return NULL;
++}
++
++/* @subdev can be a disk of the container: a whole disk, not in use */
++static int amd_validate_disk(struct supertype *st, char *subdev,
++			     unsigned long long *freesize, int verbose)
++{
++	struct amd_super *super = st->sb;
++	unsigned long long ldsize;
++	unsigned int sectsize;
++	int fd;
++
++	/* mdadm --add to a container we read: not yet (before it is wiped) */
++	if (super && super->packet && !super->creating) {
++		pr_err("--add to an AMD RAID container is not supported yet\n");
++		return 0;
++	}
++	fd = open(subdev, O_RDONLY | O_EXCL);
++	if (!is_fd_valid(fd)) {
++		if (verbose)
++			pr_err("%s is busy, cannot use it\n", subdev);
++		return 0;
++	}
++	if (test_partition(fd) || !get_dev_size(fd, subdev, &ldsize)) {
++		if (verbose)
++			pr_err("%s: AMD RAID needs a whole disk\n", subdev);
++		close(fd);
++		return 0;
++	}
++	/* volumes start at AMD_DEFAULT_ALLOC_LBA, Initialize zeroes both ends */
++	if (ldsize / AMD_SECTOR < 2 * AMD_INIT_ZERO + AMD_DEFAULT_ALLOC_LBA) {
++		if (verbose)
++			pr_err("%s is too small for AMD RAID: %llu MiB, at least %u MiB are needed\n",
++			       subdev, ldsize / AMD_SECTOR / AMD_MIB,
++			       (2 * AMD_INIT_ZERO + AMD_DEFAULT_ALLOC_LBA) / AMD_MIB);
++		close(fd);
++		return 0;
++	}
++	/*
++	 * The AMD format counts in 512-byte sectors and AMD has no 4Kn
++	 * variant (Dell's S150 RAIDCore has one, bcraid690.sys); we could not
++	 * read back what we wrote there (amd_read, O_DIRECT).
++	 */
++	if (!get_dev_sector_size(fd, subdev, &sectsize) ||
++	    sectsize != AMD_SECTOR) {
++		if (verbose)
++			pr_err("%s: AMD RAID takes disks with 512-byte logical sectors only\n",
++			       subdev);
++		close(fd);
++		return 0;
++	}
++	close(fd);
++	if (freesize)
++		*freesize = ldsize / AMD_SECTOR - AMD_DEFAULT_ALLOC_LBA;
++	return 1;
++}
++
++/* The chunk size of a new volume: as the BIOS menu offers them */
++static int amd_validate_chunk(int level, int *chunk, int verbose)
++{
++	if (!chunk)
++		return 1;
++	if (level == LEVEL_LINEAR) {
++		/* md linear would round the members down to it */
++		if (*chunk != UnSet && *chunk != 0) {
++			if (verbose)
++				pr_err("an AMD RAID Volume (linear) has no chunk size\n");
++			return 0;
++		}
++		*chunk = 0;
++		return 1;
++	}
++	if (*chunk == UnSet || *chunk == 0)
++		*chunk = level == 1 ? 0 : 64;
++	if (level != 1 && *chunk != 64 && *chunk != 128 && *chunk != 256) {
++		if (verbose)
++			pr_err("AMD RAID chunk size is 64, 128 or 256 KiB\n");
++		return 0;
++	}
++	return 1;
++}
++
+ static int validate_geometry_amd(struct supertype *st, int level, int layout,
+ 				 int raiddisks, int *chunk,
+ 				 unsigned long long size,
+@@ -4075,9 +4874,87 @@ static int validate_geometry_amd(struct supertype *st, int level, int layout,
+ 				 char *subdev, unsigned long long *freesize,
+ 				 int consistency_policy, int verbose)
+ {
+-	if (verbose)
+-		pr_err("writing AMD RAID metadata is not supported yet\n");
+-	return 0;
++	struct amd_super *super = st->sb;
++	int whole = amd_is_raidable(level, raiddisks);
++
++	if (is_container(level))
++		/* without a disk: the level is fine */
++		return !subdev ||
++		       amd_validate_disk(st, subdev, freesize, verbose);
++
++	if (!amd_level_ok(level, raiddisks, verbose))
++		return 0;
++	if (level == 5 && layout != UnSet &&
++	    layout != ALGORITHM_RIGHT_ASYMMETRIC) {
++		if (verbose)
++			pr_err("AMD RAID5 is right-asymmetric (--layout=ra)\n");
++		return 0;
++	}
++	/* the mirrors of a RAID10N are neighbours: md's near copies */
++	if (level == 10 && layout != UnSet && layout != 0x102) {
++		if (verbose)
++			pr_err("AMD RAID10 has two near copies (--layout=n2)\n");
++		return 0;
++	}
++	if (!amd_validate_chunk(level, chunk, verbose))
++		return 0;
++	/* a member is whole MiB (amd_init_volume): less would be none */
++	if (size && size < AMD_MIB) {
++		if (verbose)
++			pr_err("an AMD RAID member is sized in whole MiB: --size is 1M at least\n");
++		return 0;
++	}
++	if (subdev) {
++		if (!amd_pick_disk(st, subdev, whole, size, freesize, verbose))
++			return 0;
++		super = st->sb;		/* the first disk loaded it */
++		if (super->nvol >= AMD_MAX_VOL) {
++			if (verbose)
++				pr_err("the container has the maximum number of volumes\n");
++			return 0;
++		}
++		return 1;
++	}
++	/* -e amd and disks: the first of them loads the container */
++	if (!super)
++		return 1;
++	if (!super->packet) {
++		if (verbose)
++			pr_err("no AMD RAID container loaded\n");
++		return 0;
++	}
++	if (super->nvol >= AMD_MAX_VOL) {
++		if (verbose)
++			pr_err("the container has the maximum number of volumes\n");
++		return 0;
++	}
++	/* no disks given: the container's own (Create asks with size 0 first) */
++	if (!super->npick && !amd_new_size(super, whole, size, verbose))
++		return 0;
++	if (!amd_autolayout(super, raiddisks, size, freesize)) {
++		if (verbose && super->npick && super->npick != raiddisks)
++			pr_err("give all %d disks of the new volume (%d given)\n",
++			       raiddisks, super->npick);
++		else if (verbose && super->npick)
++			pr_err("the disks given have less free space than asked for\n");
++		else if (verbose)
++			amd_explain_room(super, raiddisks, size);
++		return 0;
++	}
++	return 1;
++}
++
++static void default_geometry_amd(struct supertype *st, int *level,
++				 int *layout, int *chunk)
++{
++	if (level && *level == UnSet)
++		*level = LEVEL_CONTAINER;
++	if (level && layout && *layout == UnSet)
++		*layout = *level == 10 ? 0x102 :	/* RAID10: near 2 */
++			  *level == 5 ? ALGORITHM_RIGHT_ASYMMETRIC : 0;
++	if (level && chunk && (*chunk == UnSet || *chunk == 0))
++		*chunk = *level == 1 || *level == LEVEL_LINEAR ||
++			 is_container(*level) ? 0 : 64; /* BIOS default */
+ }
+ 
+ static __u64 avail_size_amd(struct supertype *st, __u64 devsize,
+@@ -4089,6 +4966,290 @@ static __u64 avail_size_amd(struct supertype *st, __u64 devsize,
+ 	return (devsize - AMD_DEFAULT_ALLOC_LBA - AMD_SERVICE) / AMD_MIB * AMD_MIB;
+ }
+ 
++/* First x Second elements of a new volume of md @level on @n disks */
++static void amd_ld_shape(int level, int n, int *f, int *s)
++{
++	if (level == 0 || level == LEVEL_LINEAR) {
++		*f = n;		/* RAID10N with one copy, Volume (menu: First=n, Second=1) */
++		*s = 1;
++	} else if (level == 1) {
++		*f = 1;
++		*s = 2;
++	} else if (level == 5) {
++		*f = 1;		/* one parity set (the menu and rcadm: First=1) */
++		*s = n;
++	} else {
++		*f = n / 2;
++		*s = 2;
++	}
++}
++
++/* CacheTagSize for a chunk of @chunk_size bytes (see amd_chunk_sectors) */
++static __u32 amd_chunk_tag(int chunk_size)
++{
++	switch (chunk_size / 1024) {
++	case 128:
++		return 2;
++	case 256:
++		return 3;
++	default:
++		return 1;
++	}
++}
++
++/*
++ * The @nel elements @el of a new volume of md @level, on the disks
++ * autolayout picked, @member sectors of user data each; @capacity: their
++ * sum (a Volume's).  0 if a disk has no room.
++ */
++static int amd_new_elements(struct amd_super *super, int level, int nel,
++			    unsigned long long member, struct amd_element *el,
++			    unsigned long long *capacity)
++{
++	int i;
++
++	for (i = 0; i < nel; i++) {
++		struct amd_disk *d = super->layout[i];
++		int p = amd_pd_index(super, d->device_id);
++		unsigned long long start, msize = member;
++
++		/*
++		 * A Volume without -z takes the largest free extent of each
++		 * disk, as the menu at its maximum size does (rcblob
++		 * RC_CreateRaidArray: MaxVolumeSpace = sum of them less the
++		 * service area each; RC_AllocateSpace for a Volume falls back
++		 * to the disk's largest extent).  With -z: that much on each.
++		 */
++		if (level == LEVEL_LINEAR && super->fill && p >= 0) {
++			struct amd_disk *dd = NULL;
++
++			msize = amd_disk_room(super, super->pd[p], &dd);
++			if (msize < member)
++				msize = 0;
++		}
++		/* autolayout picked distinct disks: one member each */
++		start = msize ? amd_free_extent(super, d, msize + AMD_SERVICE) : 0;
++		if (!start || p < 0)
++			return 0;
++		el[i].id = super->pd[p]->id;
++		el[i].allocated.offset = __cpu_to_le64(start);
++		el[i].allocated.size = __cpu_to_le64(msize + AMD_SERVICE);
++		el[i].user_data.offset = __cpu_to_le64(start + AMD_SERVICE);
++		el[i].user_data.size = __cpu_to_le64(msize);
++		if (level == LEVEL_LINEAR)
++			*capacity += msize;
++	}
++	return 1;
++}
++
++/*
++ * The state new volume @ld (its LD record, @size bytes, with room for a
++ * second copy after it) is created in, by md @level and --assume-clean
++ * (@assume_clean).  Returns the length of its LD records: one, or two if md
++ * initializes it (CREATE_REDUNDANCY, the second copy the transform's).
++ */
++static unsigned int amd_new_ld_state(struct amd_ld *ld, unsigned int size,
++				     int level, int assume_clean)
++{
++	if (level == 0 || level == LEVEL_LINEAR) {
++		/*
++		 * As the menu writes a RAID0, a Volume and a RAIDABLE (MSI
++		 * X870E; the same fields but type, size, counts): no transform,
++		 * LastOperation CREATE_REDUNDANCY, TransformState 0, no bitmap,
++		 * one LD record.  The menu leaves State 0, which its next
++		 * configuration write makes NORMAL (amd_classify_state): mdadm
++		 * writes the NORMAL at once.
++		 */
++		ld->state = __cpu_to_le32(AMD_LD_STATE_NORMAL);
++		ld->transform_type = 0;
++		ld->transform_flags = 0;
++		ld->attribute = 0;
++		return size;
++	}
++	if (assume_clean) {
++		/* --assume-clean: recorded as initialized, as mdmon would */
++		ld->state = __cpu_to_le32(AMD_LD_STATE_NORMAL);
++		ld->transform_type = 0;
++		ld->transform_state = __cpu_to_le32(AMD_TRANSFORM_COMPLETED);
++		ld->transform_flags = 0;
++		return size;
++	}
++	memcpy((char *)ld + size, ld, size);
++	ld->transform_link = __cpu_to_le32(1);
++	return 2 * size;
++}
++
++/*
++ * The LD record pair of a new volume, inserted at the end of the LD list;
++ * @kib KiB a member; @assume_clean: --assume-clean.
++ */
++static int amd_init_volume(struct amd_super *super, mdu_array_info_t *info,
++			   unsigned long long kib, char *name, int assume_clean)
++{
++	int f, s, n = info->raid_disks;
++	int raidable = amd_is_raidable(info->level, n);
++	/*
++	 * A RAIDABLE is laid out and recorded as the Volume of its one disk,
++	 * but for the type: so the menu writes the two (snapshots 04 and 14
++	 * of dumps/2026-11-06-qemu-spares-raidable); its disk is all its own
++	 * (amd_disk_room).
++	 */
++	int level = raidable ? LEVEL_LINEAR : info->level;
++	unsigned long long member = kib * 2;
++	unsigned long long capacity = 0;
++	struct amd_packet_header *h = super->packet;
++	unsigned int size, at, len;
++	struct amd_element *el;
++	struct amd_dev_id *ref;
++	struct amd_ld *ld;
++	__u32 cts;
++	char *rec;
++
++	member = member / AMD_MIB * AMD_MIB;
++	if (!amd_level_ok(info->level, n, 1) || member == 0 ||
++	    !amd_autolayout(super, n, member, NULL))
++		return 0;
++	amd_ld_shape(level, n, &f, &s);
++	cts = amd_chunk_tag(info->chunk_size);
++
++	size = sizeof(*ld) + (f * s) * sizeof(*el) + sizeof(struct amd_dev_id);
++	rec = xcalloc(2, size);
++	ld = (struct amd_ld *)rec;
++	ld->type = __cpu_to_le32(AMD_DST_LD);
++	ld->element_offset = __cpu_to_le32(sizeof(*ld));
++	ld->device_type = __cpu_to_le32(AMD_LDT_RAID10N);
++	ld->transform_type = __cpu_to_le32(AMD_TRANSFORM_CREATE_REDUNDANCY);
++	ld->last_operation = ld->transform_type;
++	ld->id.id = __cpu_to_le64(amd_random_id(super));
++	/* its Handle: the next one, given as the packet is written (amd_number_lds) */
++	ld->capacity = __cpu_to_le64(member * f *
++				     (level == 5 ? s - 1 : 1));
++	ld->generation = __cpu_to_le64(super->generation);
++	ld->devices = __cpu_to_le32(n);
++	ld->first_count = __cpu_to_le32(f);
++	ld->second_count = __cpu_to_le32(s);
++	ld->parent_count = __cpu_to_le32(1);
++	ld->transform_flags = __cpu_to_le32(AMD_TFLAGS_CREATE);
++	ld->cache = __cpu_to_le32(AMD_CACHE_READ | AMD_CACHE_WRITE_BACK); /* menu default */
++	ld->packet_size = __cpu_to_le32(size);
++	ld->attribute = __cpu_to_le32(AMD_ATTR_BITMAP);
++	ld->task_priority = __cpu_to_le32(0x14);
++	ld->cache_tag_size = __cpu_to_le32(cts);
++	if (name)
++		memcpy(ld->name, name, strnlen(name, sizeof(ld->name) - 1));
++	el = (struct amd_element *)(ld + 1);
++	if (!amd_new_elements(super, level, f * s, member, el,
++			      &capacity)) {
++		free(rec);
++		return 0;
++	}
++	if (level == 5)
++		ld->device_type = __cpu_to_le32(AMD_LDT_RAID50);
++	if (level == LEVEL_LINEAR) {
++		/* as the menu writes one (MSI X870E): like its RAID0 */
++		ld->device_type = __cpu_to_le32(AMD_LDT_VOLUME);
++		ld->capacity = __cpu_to_le64(capacity);
++		ld->cache_tag_size = __cpu_to_le32(1);
++	}
++	if (raidable)
++		ld->device_type = __cpu_to_le32(AMD_LDT_RAIDABLE);
++	/* the parent reference: the controller */
++	ref = (struct amd_dev_id *)(el + f * s);
++	ref->id = __cpu_to_le64(super->serial);
++	ref->handle = __cpu_to_le16(0xffff);
++	at = __le32_to_cpu(h->ld_offset) + __le32_to_cpu(h->ld_size);
++	len = amd_new_ld_state(ld, size, level, assume_clean);
++	if (amd_packet_reserve(super, len) != 0 ||
++	    amd_insert_ld(super, at, rec, len) != 0) {
++		free(rec);
++		return 0;
++	}
++	free(rec);
++	super->new_vol = super->nvol - 1;
++	super->current_vol = super->new_vol;
++	super->add_slot = -1;
++	return 1;
++}
++
++/*
++ * @name fits a volume's DevicePrivate - 1 to 31 characters and the NUL - and
++ * no volume but @vol (-1: a new one) has it: two of a name are assembled as
++ * <name>_0 and <name>_1, whichever comes first.  IMSM refuses the same
++ * (imsm_check_name).
++ */
++static int amd_name_ok(struct amd_super *super, const char *name, int vol)
++{
++	const size_t max = sizeof(((struct amd_ld *)NULL)->name) - 1;
++	size_t len = strlen(name);
++	int i;
++
++	if (len < 1 || len > max) {
++		pr_err("an AMD volume name is 1 to %zu characters\n", max);
++		return 0;
++	}
++	for (i = 0; i < super->nvol; i++)
++		if (i != vol &&
++		    strncmp((char *)super->vol[i].ld->name, name, max + 1) == 0) {
++			pr_err("subarray-%d of the container has the name %s already\n",
++			       i, name);
++			return 0;
++		}
++	return 1;
++}
++
++static int init_super_amd(struct supertype *st, mdu_array_info_t *info,
++			  struct shape *s, char *name, char *homehost,
++			  int *uuid, unsigned long long data_offset)
++{
++	struct amd_super *super;
++
++	/* info == NULL: --zero-superblock, store_super erases */
++	if (!info)
++		return 0;
++	if (data_offset != INVALID_SECTORS) {
++		pr_err("data-offset not supported by amd\n");
++		return 0;
++	}
++	if (info->level == LEVEL_CONTAINER) {
++		free_super_amd(st);
++		super = amd_new_super();
++		super->serial = AMD_SERIAL;
++		super->creating = AMD_CREATE_CONTAINER;
++		st->sb = super;
++		return 1;
++	}
++	super = st->sb;
++	if (!super || !super->packet || super->creating) {
++		pr_err("create the AMD RAID container first: mdadm -C /dev/md/<name> -e amd -n<disks> <disks>\n");
++		return 0;
++	}
++	if (super->npick && super->npick != info->raid_disks) {
++		pr_err("an AMD RAID volume is created on all its disks: give %d, not \"missing\"\n",
++		       info->raid_disks);
++		return 0;
++	}
++	/*
++	 * --write-zeroes: Create zeroes [st->data_offset, size) of the disks
++	 * it opened and sets --assume-clean.  A member's data starts where its
++	 * element says, and with the container given Create opens no disk:
++	 * the volume would be recorded as initialized with nothing zeroed.
++	 */
++	if (s && s->write_zeroes) {
++		pr_err("--write-zeroes is not supported for an AMD RAID volume: md initializes it\n");
++		return 0;
++	}
++	/* not cut short: the volume would come back under another name */
++	if (name && name[0] && !amd_name_ok(super, name, -1))
++		return 0;
++	/* the shape's size: info->size is an int of KiB, short from 2 TiB a member */
++	if (!amd_init_volume(super, info, s ? s->size : (unsigned int)info->size,
++			     name, s && s->assume_clean)) {
++		pr_err("cannot lay out the new AMD RAID volume\n");
++		return 0;
++	}
++	return 1;
++}
++
+ /* end of the last section of the packet (PD, LD, 25BE, 25BF) */
+ static unsigned int amd_sections_end(const struct amd_packet_header *h)
+ {
+@@ -4127,6 +5288,21 @@ static void amd_packet_move(struct amd_super *super, void *p,
+ 	super->packet_room = room;
+ }
+ 
++/* mdadm: room in the packet buffer to insert @size bytes (amd_packet_insert) */
++static int amd_packet_reserve(struct amd_super *super, unsigned int size)
++{
++	unsigned int len = ROUND_UP(super->packet_len + size, AMD_SECTOR);
++	void *p;
++
++	if (len <= super->packet_room)
++		return 0;
++	p = amd_alloc(len);
++	if (!p)
++		return -1;
++	amd_packet_move(super, p, len);
++	return 0;
++}
++
+ /*
+  * Insert @size bytes of @rec (not in the packet) at offset @at, within the
+  * sections; the packet grows to the sections rounded up to sectors and the
+@@ -4426,6 +5602,52 @@ refuse:
+ static int add_to_super_amd(struct supertype *st, mdu_disk_info_t *dinfo,
+ 			    int fd, char *devname, unsigned long long data_offset)
+ {
++	struct amd_super *super = st->sb;
++	struct amd_disk *d;
++	unsigned long long dsize;
++	struct stat stb;
++
++	if (super && super->creating == AMD_CREATE_CONTAINER) {
++		/* a disk of the container being created */
++		if (fd < 0 || !get_dev_size(fd, devname, &dsize) ||
++		    fstat(fd, &stb) != 0)
++			return 1;
++		d = xcalloc(1, sizeof(*d));
++		d->fd = fd;	/* ours now: Create does not close it (as IMSM) */
++		d->devname = devname ? xstrdup(devname) : NULL;
++		d->sectors = dsize / AMD_SECTOR;
++		d->major = major(stb.st_rdev);
++		d->minor = minor(stb.st_rdev);
++		d->device_id = amd_disk_id(super, fd);
++		amd_add_disk(super, d);
++		super->cur_disk = d;
++		return amd_build_packet(super);
++	}
++	if (super && super->new_vol >= 0) {
++		/* a member of the volume being created: laid out already */
++		struct amd_vol *v = &super->vol[super->new_vol];
++
++		if (dinfo->raid_disk < 0 || dinfo->raid_disk >= v->nel) {
++			pr_err("a new AMD RAID volume takes no spares: add them to the container (global hot spares) or to the volume with --add-spare (dedicated ones)\n");
++			return 1;
++		}
++		if (fd >= 0) {
++			/* a disk given on the command line: the one picked */
++			struct amd_disk *pick = super->layout[dinfo->raid_disk];
++			int ok = super->npick == v->nel && fstat(fd, &stb) == 0 &&
++				 pick->major == (int)major(stb.st_rdev) &&
++				 pick->minor == (int)minor(stb.st_rdev);
++
++			close(fd);	/* ours, as IMSM: Create does not close it */
++			if (!ok) {
++				pr_err("%s is not the disk laid out for member %d\n",
++				       devname ? devname : "?", dinfo->raid_disk);
++				return 1;
++			}
++		}
++		super->add_slot = dinfo->raid_disk;
++		return 0;
++	}
+ 	if (dinfo->raid_disk < 0)
+ 		return amd_attach_disk(st, fd, devname);	/* mdmon */
+ 	pr_err("writing AMD RAID metadata is not supported yet\n");
+@@ -4473,9 +5695,257 @@ static int remove_from_super_amd(struct supertype *st, mdu_disk_info_t *dk)
+ 	return 0;
+ }
+ 
++/*
++ * A RAIDCore disk of this system that is not one of the container's: all
++ * RAID disks of a machine share one configuration (one controller serial
++ * number), so a second container would make two that RAIDCoreDxe picks
++ * between by generation - the disks of the other would look stale.  Loop
++ * devices (images) are not disks of the controller: a container of them is
++ * checked against other images only, one of real disks against real ones.
++ */
++static char *amd_other_raidcore_disk(struct amd_super *super)
++{
++	static char name[300];
++	struct amd_metadata *md = amd_alloc(AMD_SECTOR);
++	DIR *dir = opendir("/sys/block");
++	int images = amd_images(super);
++	struct amd_disk *d;
++	char *found = NULL;
++	const char *nm;
++	int maj, min, fd;
++
++	while (md && dir && !found &&
++	       (nm = amd_next_disk(dir, images, &maj, &min)) != NULL) {
++		for (d = super->disks; d; d = d->next)
++			if (d->major == maj && d->minor == min)
++				break;
++		if (d)
++			continue;
++		fd = amd_dev_open(maj, min, O_RDONLY);
++		if (!is_fd_valid(fd))
++			continue;
++		if (amd_read(fd, AMD_METADATA_LBA, md, AMD_SECTOR) == 0 &&
++		    amd_label_valid(md)) {
++			snprintf(name, sizeof(name), "/dev/%s", nm);
++			found = name;
++		}
++		close(fd);
++	}
++	if (dir)
++		closedir(dir);
++	free(md);
++	return found;
++}
++
++/*
++ * The service area of the elements of new volume @ld: no stale log, scan
++ * or bitmap.  Before the configuration has the volume: a crash in between
++ * leaves zeroes in free space.  @zero: AMD_SERVICE_BYTES of zeroes - the
++ * monitor's from amd_prepare_update.
++ */
++static int amd_clear_service(struct amd_super *super, const struct amd_ld *ld,
++			     const void *zero)
++{
++	const struct amd_element *el = amd_ld_elements(ld);
++	unsigned int i, n = __le32_to_cpu(ld->first_count) *
++			    __le32_to_cpu(ld->second_count);
++
++	for (i = 0; i < n; i++) {
++		struct amd_disk *d = amd_find_disk(super,
++					__le64_to_cpu(el[i].id.id));
++
++		if (!d || d->fd < 0 ||
++		    pwrite(d->fd, zero, AMD_SERVICE_BYTES,
++			   (off_t)__le64_to_cpu(el[i].allocated.offset) *
++			   AMD_SECTOR) != AMD_SERVICE_BYTES || fsync(d->fd) != 0)
++			return -1;
++	}
++	return 0;
++}
++
++/* ... mdadm's, with zeroes of its own */
++static int amd_zero_service(struct amd_super *super, const struct amd_ld *ld)
++{
++	void *zero = amd_alloc(AMD_SERVICE_BYTES);
++	int rv = zero ? amd_clear_service(super, ld, zero) : -1;
++
++	free(zero);
++	return rv;
++}
++
++/* disk @id is a global spare no more: its PD, and its label as we know it */
++static void amd_drop_global(struct amd_super *super, __u64 id)
++{
++	struct amd_disk *d = amd_find_disk(super, id);
++	int p = amd_pd_index(super, id);
++
++	if (p >= 0)
++		super->pd[p]->spare_info &= ~__cpu_to_le32(AMD_SPARE_GLOBAL);
++	if (d)
++		d->label_spare &= ~AMD_SPARE_GLOBAL;
++}
++
++/*
++ * The global spares new volume @v is made of are spares no more: its
++ * members end up as those of a volume made of Ready disks.  The AMD core
++ * would leave SpareInfo as it is (rcblob RC_CreateRaidArray checks only
++ * that a disk is online and initialized) and would take the rest of such
++ * a disk for a rebuild of any volume; the menu builds volumes of Ready
++ * disks only - a global spare has a status of its own there (RAIDCoreDxe
++ * FUN_0000dc88) - and lists a member with SpareInfo 0x100 as a Global
++ * Spare (MSI X870E, after a migration onto one).
++ */
++static void amd_take_spares(struct amd_super *super, const struct amd_vol *v)
++{
++	int i;
++
++	for (i = 0; i < v->nel; i++)
++		amd_drop_global(super, __le64_to_cpu(v->el[i].id.id));
++}
++
++/*
++ * ... in their labels too: the BIOS fills the PD's SpareInfo in from the
++ * label at every start (amd_label_spare).  mdadm writes them, as for the
++ * other spare roles (subarray_spare_amd).
++ */
++static void amd_label_members(struct amd_super *super, const struct amd_vol *v)
++{
++	int i;
++
++	for (i = 0; i < v->nel; i++) {
++		struct amd_disk *d = amd_find_disk(super,
++					__le64_to_cpu(v->el[i].id.id));
++
++		if (d && d->fd >= 0 &&
++		    amd_label_spare(d->fd, d->device_id, 0) != 0)
++			pr_err("%s: cannot write its label: the BIOS will take it for a global spare again\n",
++			       amd_disk_name(d));
++	}
++}
++
++struct amd_update_create {
++	int type;
++	int vol;		/* the number mdadm gave the volume's md array */
++	unsigned int len;	/* of the LD records that follow */
++	char rec[];
++};
++
++/* amd_mdmon_recorded of --create: volume @id is in the configuration */
++static int amd_has_volume(struct amd_super *super, const void *id)
++{
++	return amd_ld_by_id(super, *(const __u64 *)id) != NULL;
++}
++
++/*
++ * --create while mdmon runs the container: mdmon records new volume @v -
++ * or not, if a rebuild it began meanwhile took an extent of it, as onto a
++ * global spare the volume is laid out on (amd_create_update) - and clears
++ * its service area first.  Until then mdadm writes nothing to the members:
++ * the extent may be that rebuild's target.  The update goes now, and the
++ * configuration on the disks says how it went (amd_mdmon_recorded).  Then
++ * Create has no update left to send.
++ */
++static int amd_create_by_mdmon(struct supertype *st, struct amd_vol *v)
++{
++	struct amd_super *super = st->sb;
++	unsigned int len = amd_ld_size(v->ld);
++	struct amd_update_create *u;
++	__u64 id = __le64_to_cpu(v->ld->id.id);
++	int rv;
++
++	if (v->link)
++		len += amd_ld_size(v->link);
++	u = xmalloc(sizeof(*u) + len);
++	u->type = AMD_UPDATE_CREATE;
++	u->vol = super->new_vol;
++	u->len = len;
++	memcpy(u->rec, v->ld, len);
++	append_metadata_update(st, u, sizeof(*u) + len);
++	rv = amd_mdmon_recorded(st, amd_has_volume, &id);
++	if (rv > 0)
++		pr_err("mdmon did not record the new volume: the configuration changed meanwhile, or md is rebuilding another volume onto its disks (see dmesg)\n");
++	return rv != 0;
++}
++
++/*
++ * Has a configuration been written since @super was read?  The commit block
++ * of each disk tells.  Create reads the container before it takes the map
++ * lock and the exclusive open that keep other writers out: a volume laid out
++ * on what was read may lie on the extent, and under the number, of one
++ * another mdadm --create has recorded meanwhile - writing it would drop that
++ * volume from the configuration while its md array runs.
++ */
++static int amd_config_changed(struct amd_super *super)
++{
++	struct amd_commit *c = amd_alloc(AMD_SECTOR);
++	struct amd_disk *d;
++	int changed = !c;
++
++	for (d = super->disks; d && !changed; d = d->next) {
++		if (d->fd < 0 || !d->commit_valid ||
++		    amd_read(d->fd, AMD_COMMIT_LBA, c, AMD_SECTOR) != 0 ||
++		    !amd_check_commit(c))
++			continue;
++		changed = __le64_to_cpu(c->generation) != d->generation ||
++			  __le64_to_cpu(c->committed_checksum) !=
++			  d->committed_checksum;
++	}
++	free(c);
++	return changed;
++}
++
++/*
++ * The new volume @vol did not go into the configuration: stop the md array
++ * Create has set up for it.  Create stops it only when a disk fails to go
++ * in (add_disk_to_super); after a failed write_init_super it would leave it
++ * inactive, under the subarray number of a volume that is not there - or is
++ * that of another mdadm --create that won.  The array has no disks yet
++ * (they go in after write_init_super), and the map has it under the
++ * volume's UUID: Create put it there, under the map lock it still holds.
++ */
++static void amd_stop_new_array(struct amd_super *super, int vol)
++{
++	struct map_ent *map = NULL, *me;
++	int uuid[4], fd;
++
++	amd_volume_uuid(super, vol, uuid);
++	me = map_by_uuid(&map, uuid);
++	if (me) {
++		fd = open_dev(me->devnm);
++		if (is_fd_valid(fd) && !md_array_active(fd))
++			ioctl(fd, STOP_ARRAY, NULL);
++		close_fd(&fd);
++	}
++	map_free(map);
++}
++
++/*
++ * Create maps the new container right after init_super, before any disk:
++ * with no DeviceID yet its UUID is that of container_id 0.  Now that the
++ * lowest one is known, put the real UUID in the map (as -A would).
++ */
++static void amd_create_map(struct amd_super *super)
++{
++	struct map_ent *map = NULL, *me;
++	int was[4], uuid[4];
++
++	amd_uuid("container", AMD_SERIAL, 0, was);
++	amd_uuid("container", AMD_SERIAL, super->container_id, uuid);
++	map_read(&map);
++	for (me = map; me; me = me->next)
++		if (strcmp(me->metadata, "amd") == 0 &&
++		    memcmp(me->uuid, was, sizeof(was)) == 0) {
++			amd_map_set_uuid(&map, me, uuid);
++			break;
++		}
++	map_free(map);
++}
++
+ static int write_init_super_amd(struct supertype *st)
+ {
+ 	struct amd_super *super = st->sb;
++	struct amd_disk *d;
++	int rv = 0;
+ 
+ 	if (!super)
+ 		return 1;
+@@ -4484,12 +5954,127 @@ static int write_init_super_amd(struct supertype *st)
+ 		super->attached = 0;
+ 		return 0;
+ 	}
++	if (super->creating == AMD_CREATE_CONTAINER) {
++		char *other = amd_other_raidcore_disk(super);
++
++		if (other) {
++			pr_err("%s is an AMD RAID disk already: all of them share one configuration\n",
++			       other);
++			cont_err("add disks to that container, or --zero-superblock %s first\n",
++				 other);
++			return 1;
++		}
++		for (d = super->disks; d; d = d->next)
++			if (amd_init_disk(d, 0, 0) != 0) {
++				pr_err("%s: cannot initialize the disk\n",
++				       amd_disk_name(d));
++				return 1;
++			}
++		if (amd_write_config(super) != 0) {
++			pr_err("cannot write the AMD RAID configuration\n");
++			return 1;
++		}
++		amd_create_map(super);
++		super->creating = 0;
++		super->cur_disk = NULL;
++		/* Create opened them exclusively: md must be able to claim them */
++		for (d = super->disks; d; d = d->next)
++			if (d->fd >= 0) {
++				close(d->fd);
++				d->fd = -1;
++			}
++		return 0;
++	}
++	if (super->new_vol >= 0) {
++		struct amd_vol *v = &super->vol[super->new_vol];
++
++		/* mdmon does the same in its packet (amd_create_update) */
++		amd_take_spares(super, v);
++		if (st->update_tail) {
++			rv = amd_create_by_mdmon(st, v);
++		} else if (amd_config_changed(super)) {
++			pr_err("the AMD RAID configuration changed since it was read (another mdadm?): nothing written, try again\n");
++			rv = 1;
++		} else if (amd_zero_service(super, v->ld) != 0) {
++			pr_err("cannot clear the service area of the new volume\n");
++			rv = 1;
++		} else {
++			if (amd_write_config(super) != 0) {
++				pr_err("cannot write the AMD RAID configuration\n");
++				rv = 1;
++			}
++		}
++		if (rv != 0)
++			amd_stop_new_array(super, super->new_vol);
++		/*
++		 * The volume is in the configuration: what follows does not
++		 * undo it - a volume left without its md array would be.
++		 */
++		if (rv == 0)
++			amd_label_members(super, v);
++		super->new_vol = -1;
++		super->add_slot = -1;
++		super->npick = 0;
++		super->current_vol = -1;
++		return rv;
++	}
+ 	pr_err("writing AMD metadata is supported only for --create and --add\n");
+ 	return 1;
+ }
+ 
++/*
++ * --zero-superblock: wipe the label, the commit block and the config
++ * ring, so that the AMD BIOS sees a new disk.  LBA 0 is wiped too, but
++ * only if it still holds the MBR that AMD wrote (its checksum is in the
++ * label); anything else there belongs to someone else.
++ */
++static int amd_erase(int fd)
++{
++	struct amd_metadata *md = amd_alloc(AMD_SECTOR);
++	void *sector = amd_alloc(AMD_SECTOR);
++	size_t zlen = (AMD_RING_END - AMD_COMMIT_LBA) * AMD_SECTOR;
++	void *zero = amd_alloc(zlen);
++	int wipe_mbr = 0, rv = 1;
++
++	if (!md || !sector || !zero)
++		goto out;
++	if (test_partition(fd))
++		goto out;
++	if (amd_read(fd, AMD_METADATA_LBA, md, AMD_SECTOR) != 0 ||
++	    !amd_label_valid(md)) {
++		pr_err("no valid RAIDCore label found, not erasing\n");
++		goto out;
++	}
++	if (md->mbr_checksum && amd_read(fd, 0, sector, AMD_SECTOR) == 0 &&
++	    amd_checksum(sector, AMD_SECTOR) == __le64_to_cpu(md->mbr_checksum))
++		wipe_mbr = 1;
++
++	/*
++	 * The commit block and the ring first: a label left without them is
++	 * a disk initialized, with no configuration.  The MBR after the label.
++	 */
++	if (pwrite(fd, zero, zlen, (off_t)AMD_COMMIT_LBA * AMD_SECTOR) !=
++	    (ssize_t)zlen ||
++	    pwrite(fd, zero, AMD_SECTOR, (off_t)AMD_METADATA_LBA * AMD_SECTOR) !=
++	    AMD_SECTOR)
++		goto out;
++	if (wipe_mbr && pwrite(fd, zero, AMD_SECTOR, 0) != AMD_SECTOR)
++		goto out;
++	if (fsync(fd) != 0)
++		goto out;
++	rv = 0;
++out:
++	free(md);
++	free(sector);
++	free(zero);
++	return rv;
++}
++
+ static int store_super_amd(struct supertype *st, int fd)
+ {
++	/* Kill() frees the loaded metadata before asking us to store it */
++	if (st->sb == NULL)
++		return amd_erase(fd);
+ 	pr_err("storing AMD metadata on a single disk is not supported\n");
+ 	return 1;
+ }
+@@ -5073,6 +6658,50 @@ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
+ 	amd_reparse(super);
+ }
+ 
++/* the volume number of member array @devnm (its metadata_version: "/md127/1"), or -1 */
++static int amd_devnm_volume(struct amd_super *super, char *devnm)
++{
++	struct mdinfo *sra = sysfs_read(-1, devnm, GET_VERSION);
++	char *sub = sra ? strchr(sra->text_version + 1, '/') : NULL;
++	char *ep = NULL;
++	long vol = sub ? strtol(sub + 1, &ep, 10) : -1;
++
++	if (!ep || *ep || vol < 0 || vol >= super->nvol)
++		vol = -1;
++	sysfs_free(sra);
++	return vol;
++}
++
++/*
++ * The volume md rebuilds onto disk @d that the configuration does not have
++ * the disk in yet, or -1.  managemon gives md a spare before the monitor
++ * records the rebuild (amd_start_rebuild: in that pass, or once the log of
++ * a transform that ended is cleared), and until then only mdmon knows the
++ * extent (amd_extent_overlap): a new volume must not take that disk.
++ * Every md array that runs a disk holds it.
++ */
++static int amd_rebuilt_into(struct amd_super *super, const struct amd_disk *d)
++{
++	struct dirent *de;
++	char path[64];
++	int vol = -1;
++	DIR *dir;
++
++	snprintf(path, sizeof(path), "/sys/dev/block/%d:%d/holders",
++		 d->major, d->minor);
++	dir = opendir(path);
++	while (dir && vol < 0 && (de = readdir(dir)) != NULL) {
++		int n = de->d_name[0] == '.' ? -1 :
++			amd_devnm_volume(super, de->d_name);
++
++		if (n >= 0 && !amd_vol_has_disk(&super->vol[n], d->device_id))
++			vol = n;
++	}
++	if (dir)
++		closedir(dir);
++	return vol;
++}
++
+ /* Cut @size bytes at offset @at out of the LD section of the packet. */
+ static void amd_cut_ld(struct amd_super *super, unsigned int at,
+ 		       unsigned int size)
+@@ -5522,16 +7151,18 @@ struct amd_update_spare {
+ 	struct amd_element el;
+ };
+ 
+-/* the size of an update of each type */
++/* the size of an update of each type; AMD_UPDATE_CREATE: the least */
+ static const unsigned int amd_update_size[] = {
+ 	[AMD_UPDATE_SPARE]	= sizeof(struct amd_update_spare),
++	[AMD_UPDATE_CREATE]	= sizeof(struct amd_update_create),
+ 	[AMD_UPDATE_REMOVE]	= sizeof(struct amd_update_disk),
+ 	[AMD_UPDATE_ATTACH]	= sizeof(struct amd_update_attach),
+ };
+ 
+ /*
+  * The type of @update, or 0 if it is none or the update is not of its
+- * size: each type is its structure exactly.
++ * size: the LD records of a new volume follow AMD_UPDATE_CREATE, the other
++ * types are their structure exactly.
+  */
+ static int amd_update_type(const struct metadata_update *update)
+ {
+@@ -5542,11 +7173,99 @@ static int amd_update_type(const struct metadata_update *update)
+ 	type = *(int *)update->buf;
+ 	if (type <= 0 || type >= (int)ARRAY_SIZE(amd_update_size))
+ 		return 0;
+-	if (update->len != (int)amd_update_size[type])
++	if (type == AMD_UPDATE_CREATE ?
++	    update->len < (int)amd_update_size[type] :
++	    update->len != (int)amd_update_size[type])
+ 		return 0;
+ 	return type;
+ }
+ 
++/* The updates mdadm sends (--create); mdmon makes the others itself. */
++static int amd_prepare_update(struct supertype *st,
++			      struct metadata_update *update)
++{
++	if (!st->sb)
++		return 0;
++	switch (amd_update_type(update)) {
++	case AMD_UPDATE_CREATE:
++		/* the monitor allocates nothing (amd_mm_room): zeroes to clear with */
++		update->space = amd_alloc(AMD_SERVICE_BYTES);
++		break;
++	default:
++		return 0;
++	}
++	/* ... room in the packet for what it records */
++	amd_mm_room(st->sb);
++	return 1;
++}
++
++/*
++ * Does new volume @ld (@len bytes of LD records) lie on an extent in use?
++ * mdadm laid it out on the configuration it read, so a rebuild mdmon began
++ * meanwhile onto a global spare may be in its way (amd_rebuilt_into looks
++ * before); as IMSM, a volume that overlaps another is not recorded.
++ */
++static int amd_new_overlaps(struct amd_super *super, const struct amd_ld *ld,
++			    unsigned int len)
++{
++	const struct amd_element *el = amd_ld_elements(ld);
++	unsigned int i, n, size = len < sizeof(*ld) ? 0 : amd_ld_size(ld);
++	unsigned long long end;
++
++	if (size == 0 || size > len ||
++	    __le32_to_cpu(ld->element_offset) != sizeof(*ld))
++		return 1;
++	n = __le32_to_cpu(ld->first_count) * __le32_to_cpu(ld->second_count);
++	for (i = 0; i < n; i++)
++		if (amd_extent_overlap(super, __le64_to_cpu(el[i].id.id),
++				       __le64_to_cpu(el[i].allocated.offset),
++				       __le64_to_cpu(el[i].allocated.size),
++				       &end))
++			return 1;
++	return 0;
++}
++
++/*
++ * mdadm --create: record the new volume, its LD records @c->rec, after its
++ * service area is cleared with @zero (amd_create_by_mdmon); the global
++ * spares it takes are spares no more.  managemon gives md no spare
++ * meanwhile: it looks for one only with no update queued (managemon.c
++ * manage_member).
++ */
++static void amd_create_update(struct supertype *st,
++			      const struct amd_update_create *c,
++			      unsigned int len, const void *zero)
++{
++	struct amd_super *super = st->sb;
++	struct amd_packet_header *h = super->packet;
++	const struct amd_ld *ld = (const struct amd_ld *)c->rec;
++
++	/*
++	 * mdadm read the configuration before it took the map lock: a volume
++	 * another mdadm created or deleted meanwhile moved this one's number,
++	 * and its md array is set up under the old one (external:/mdX/N).
++	 */
++	if (h && c->vol != super->nvol) {
++		amd_kmsg("the new volume is not subarray-%d any more: not recorded",
++			 c->vol);
++		return;
++	}
++	if (sizeof(*c) + c->len != len || !h ||
++	    amd_new_overlaps(super, ld, c->len)) {
++		amd_kmsg("the new volume overlaps an extent in use: not recorded");
++		return;
++	}
++	if (!zero || amd_clear_service(super, ld, zero) != 0 ||
++	    amd_insert_ld(super, __le32_to_cpu(h->ld_offset) +
++			  __le32_to_cpu(h->ld_size), c->rec, c->len) != 0) {
++		amd_kmsg("cannot record the new volume");
++		return;
++	}
++	amd_take_spares(super, &super->vol[super->nvol - 1]);
++	super->config_dirty = 1;
++	dprintf("volume %d created\n", super->nvol - 1);
++}
++
+ /*
+  * The monitor's array of volume @vol, or NULL - not one it let go of
+  * (amd_sync_progress): a volume started again may be another md array.
+@@ -5655,6 +7374,9 @@ static void amd_process_update(struct supertype *st,
+ 	case AMD_UPDATE_SPARE:
+ 		amd_spare_update(st, buf);
+ 		break;
++	case AMD_UPDATE_CREATE:
++		amd_create_update(st, buf, update->len, update->space);
++		break;
+ 	case AMD_UPDATE_REMOVE:
+ 		amd_remove_disk(super, buf);
+ 		break;
+@@ -5952,6 +7674,34 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
+ 	return NULL;
+ }
+ 
++/*
++ * SpareInfo of the label of disk @id on @fd: the BIOS fills the PD's in from
++ * it at every start (RAIDCoreDxe FUN_0001d68c), and the AMD driver rewrites
++ * it as it assigns or unassigns a global spare (rcblob RC_ManageGlobalSpare:
++ * RC_UpdateMetaData).  0 on success.
++ */
++static int amd_label_spare(int fd, __u64 id, __u32 spare)
++{
++	struct amd_metadata *md = amd_alloc(AMD_SECTOR);
++	int rv = -1;
++
++	if (md && amd_read(fd, AMD_METADATA_LBA, md, AMD_SECTOR) == 0 &&
++	    amd_label_valid(md) && __le64_to_cpu(md->device_id) == id) {
++		if (__le32_to_cpu(md->spare_info) == spare) {
++			rv = 0;
++		} else {
++			md->spare_info = __cpu_to_le32(spare);
++			md->checksum = __cpu_to_le64(amd_sector_sum(md));
++			if (pwrite(fd, md, AMD_SECTOR,
++				   (off_t)AMD_METADATA_LBA * AMD_SECTOR) == AMD_SECTOR &&
++			    fsync(fd) == 0)
++				rv = 0;
++		}
++	}
++	free(md);
++	return rv;
++}
++
+ /*
+  * A managed volume with a member out of service (recorded so in the
+  * config: flags 0x4030, or no disk) gets that member's own disk back if
+@@ -6318,6 +8068,7 @@ struct superswitch super_amd = {
+ 	.detail_super	= detail_super_amd,
+ 	.brief_detail_super = brief_detail_super_amd,
+ 	.validate_geometry = validate_geometry_amd,
++	.default_geometry = default_geometry_amd,
+ 	.write_init_super = write_init_super_amd,
+ 	.add_to_super	= add_to_super_amd,
+ 	.remove_from_super	= remove_from_super_amd,
+@@ -6329,6 +8080,7 @@ struct superswitch super_amd = {
+ 	.avail_size	= avail_size_amd,
+ 	.compare_super	= compare_super_amd,
+ 	.load_super	= load_super_amd,
++	.init_super	= init_super_amd,
+ 	.store_super	= store_super_amd,
+ 	.free_super	= free_super_amd,
+ 	.match_metadata_desc = match_metadata_desc_amd,
+@@ -6343,5 +8095,6 @@ struct superswitch super_amd = {
+ 	.set_disk	= amd_mon_set_disk,
+ 	.sync_metadata	= amd_mon_sync_metadata,
+ 	.process_update	= amd_mon_process_update,
++	.prepare_update	= amd_prepare_update,
+ 	.activate_spare	= amd_mm_activate_spare,
+ };
+-- 
+2.47.3
+

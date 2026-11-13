@@ -1,0 +1,66 @@
+From dac08bd8ab6b7f50f7acdc46a54459b8e7a849da Mon Sep 17 00:00:00 2001
+From: OWNER NAME <owner@example.org>
+Date: Sun, 8 Nov 2026 17:39:24 +0500
+Subject: [PATCH 2/2] md/md-bitmap: don't create a bitmap in location_store()
+ before md_run()
+To: Song Liu <song@kernel.org>,
+    Yu Kuai <yukuai@fygo.io>
+Cc: Li Nan <magiclinan@didiglobal.com>,
+    Xiao Ni <xiao@kernel.org>,
+    Su Yue <glass.su@suse.com>,
+    Mariusz Tkaczyk <mtkaczyk@kernel.org>,
+    linux-raid@vger.kernel.org,
+    linux-kernel@vger.kernel.org
+
+Commit 158d32af8710 ("md-bitmap: suspend array earlier in
+location_store()") dropped the mddev->pers check around the bitmap
+creation in location_store(). Writing bitmap/location before the array
+is started, which is how mdadm sets up the bitmap of an external
+metadata array, now creates and loads a bitmap sized for an empty array,
+and md_run() later creates the real one. bitmap_create() simply
+overwrites mddev->bitmap, so the first struct bitmap and its pages are
+leaked.
+
+While the array is inactive only record the location, as before that
+commit, and leave the creation to md_run(). An invalid setup, such as a
+missing bitmap/chunksize for an external bitmap, is then reported when
+the array is started, as it was before that commit.
+
+The leak was confirmed on v7.3.3 with a debug message in bitmap_create()
+reporting an already set mddev->bitmap: it fires from md_run() for every
+IMSM volume with a bitmap without this patch, and not with it. This
+patch was written by Claude Opus 5.5, an AI model by Anthropic; tested
+together with the previous patch as described there.
+
+Fixes: 158d32af8710 ("md-bitmap: suspend array earlier in location_store()")
+Cc: stable@vger.kernel.org # v6.7+
+---
+ drivers/md/md-bitmap.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/md/md-bitmap.c b/drivers/md/md-bitmap.c
+index 2d82c71..922e0c9 100644
+--- a/drivers/md/md-bitmap.c
++++ b/drivers/md/md-bitmap.c
+@@ -2696,6 +2696,10 @@ location_store(struct mddev *mddev, const char *buf, size_t len)
+ 			if (!mddev_set_bitmap_ops_nosysfs(mddev))
+ 				goto bitmap_err;
+ 
++			/* md_run() creates the bitmap of an inactive array */
++			if (!mddev->pers)
++				goto done;
++
+ 			rv = md_bitmap_create_nosysfs(mddev);
+ 			if (rv)
+ 				goto create_err;
+@@ -2712,6 +2716,7 @@ location_store(struct mddev *mddev, const char *buf, size_t len)
+ 				goto merge_err;
+ 		}
+ 	}
++done:
+ 	if (!mddev->external) {
+ 		/* Ensure new bitmap info is stored in
+ 		 * metadata promptly.
+-- 
+2.47.3
+

@@ -1,0 +1,113 @@
+#!/bin/bash
+# amdraid.shutdown — runs in the shutdown ramfs (/run/initramfs), as systemd-shutdown's last step before
+# reboot()/poweroff(): every md array with external metadata (AMD RAIDXpert2, also IMSM/DDF) is stopped,
+# or at least left clean, as recorded by mdmon.
+#
+# systemd-shutdown stops md arrays with a bare STOP_ARRAY, without waiting for mdmon, and it cannot stop
+# the array the root file system is on: mdmon, run from the root file system ('@' in argv[0], spared from
+# the killing), keeps the old root mounted (moved to /run/shutdown/mounts/).  Often even read-write: an
+# mdmon whose binary or ld.so.cache a package update has replaced holds deleted files of the root file
+# system, and the kernel refuses to remount it read-only (EBUSY) - its journal is committed later, after
+# the arrays were last seen clean.  So, as dracut does for IMSM (90mdraid/md-shutdown.sh):
+#   0. a resync or rebuild still running is frozen: md records the exact place, mdmon logs it;
+#   1. mdadm --wait-clean: each array goes clean (safe_mode_delay 1 ms, up to 5 s) and mdadm waits for
+#      mdmon to have recorded that (ping_monitor);
+#   2. mdmon from this ramfs takes the containers over (mdmon --takeover --all); the old mdmon records the
+#      arrays clean and exits, and lets go of the old root;
+#   3. the old root is unmounted (read-only at least): its last writes go through the new mdmon;
+#   4. mdadm --wait-clean, mdadm --stop, mdadm --wait-clean: mdadm has mdmon record each array before the
+#      kernel stops it; an array that cannot stop is left clean.
+# A container left without mdmon after step 2 gets a new one; if that fails as well, step 3 is skipped:
+# a write to an array with external metadata waits for mdmon, the shutdown would hang on it.
+PATH=/usr/bin:/usr/sbin:/bin:/sbin
+MDMON_DIR=/run/mdadm
+
+log() { echo "<5>amdraid.shutdown: $*" > /dev/kmsg; }
+external() { grep -q 'super external:' /proc/mdstat 2>/dev/null; }
+
+# containers of the member arrays still running: those need an mdmon
+# ("external:-mdX/N": a member mdadm froze against recovery, still run by mdmon)
+containers() {
+	local a version c seen=" "
+	for a in /sys/block/md*/md; do
+		read -r version 2>/dev/null < "$a/metadata_version" || continue
+		case "$version" in
+		external:[/-]*/*) c=${version#external:?}; c=${c%%/*} ;;
+		*) continue ;;
+		esac
+		case "$seen" in
+		*" $c "*) ;;
+		*) seen+="$c "; echo "$c" ;;
+		esac
+	done
+}
+
+# pid $1 runs: an exited mdmon nobody reaps stays a zombie
+running() {
+	[ -n "$1" ] && [ -r "/proc/$1/status" ] && ! grep -q '^State:[[:space:]]*Z' "/proc/$1/status"
+}
+
+mdmon_pid() { local pid; read -r pid 2>/dev/null < "$MDMON_DIR/$1.pid" && echo "$pid"; }
+
+# one of the pids $@ still runs
+any_running() {
+	local p
+	for p; do
+		running "$p" && return 0
+	done
+	return 1
+}
+
+# step 2; fails if a container is left without mdmon
+takeover() {
+	local c p old=() i rv=0
+	for c in $(containers); do
+		p=$(mdmon_pid "$c") && old+=("$p")
+	done
+	mdmon --takeover --all
+	# the new mdmon has the old one exit, and waits up to 5 s for that (try_kill_monitor)
+	for ((i = 0; i < 60; i++)); do
+		any_running "${old[@]}" || break
+		sleep 0.1
+	done
+	for c in $(containers); do
+		running "$(mdmon_pid "$c")" && continue
+		log "no mdmon for $c after the takeover, starting one"
+		mdmon "$c"
+		running "$(mdmon_pid "$c")" || { log "no mdmon for $c"; rv=1; }
+	done
+	return $rv
+}
+
+# step 3: what systemd-shutdown could not unmount, innermost first
+unmount_old_root() {
+	local m mounts=() i
+	while read -r _ m _; do
+		case "$m" in
+		/oldroot|/oldroot/*|/run/shutdown/mounts/*) mounts+=("$m") ;;
+		esac
+	done < /proc/self/mounts
+	for ((i = ${#mounts[@]} - 1; i >= 0; i--)); do
+		m=${mounts[i]}
+		umount "$m" 2>/dev/null || mount -o remount,ro "$m" 2>/dev/null ||
+			log "cannot unmount $m"
+	done
+}
+
+external || exit 0
+for a in /sys/block/md*/md; do
+	read -r version 2>/dev/null < "$a/metadata_version" || continue
+	read -r action 2>/dev/null < "$a/sync_action" || continue
+	case "$version:$action" in
+	external:/*:resync|external:/*:recover|external:/*:check|external:/*:repair)
+		echo frozen > "$a/sync_action" ;;
+	esac
+done
+mdadm --wait-clean --scan
+[ -n "$(containers)" ] && takeover && unmount_old_root
+mdadm --wait-clean --scan
+mdadm --stop --scan 2>/dev/null
+mdadm --wait-clean --scan
+left=$(grep -o '^md[0-9]*' /proc/mdstat | tr '\n' ' ')
+[ -n "$left" ] && log "left running, clean: $left"
+exit 0

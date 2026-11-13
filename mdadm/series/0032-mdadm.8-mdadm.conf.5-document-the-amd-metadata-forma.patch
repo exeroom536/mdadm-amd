@@ -1,0 +1,242 @@
+From 21559ea300ff2fe60a3bcb3c593db9b1b29692d3 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 06:57:18 +0500
+Subject: [PATCH 32/32] mdadm.8, mdadm.conf.5: document the amd metadata format
+
+Describe --metadata=amd: what it is, the levels it supports (a Volume
+needs md-linear), --create and --grow of a RAIDABLE volume (also under
+GROW MODE), a disk that missed the latest configuration, the platform
+check and --force, global hot spares, mdmon for --add, "missing"
+refused, TRIM, the repair of Legacy records, and the md write-intent
+bitmap of a volume: where it lies, the md fix it needs
+from Linux 6.18, and what to do after an mdadm without bitmap support
+ran the volume.  Describe the --update-subarray values that set the
+cache policy of an AMD volume and bitmap/no-bitmap of AMD volumes, and
+--add-spare/--remove on an AMD volume (its dedicated hot spares), and
+that an AMD volume name has at most 31 characters.  mdadm.conf(5)
+lists amd with the known metadata types (AUTO, POLICY metadata=).
+
+Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
+---
+ mdadm.8.in      | 141 ++++++++++++++++++++++++++++++++++++++++++++++--
+ mdadm.conf.5.in |   5 +-
+ 2 files changed, 139 insertions(+), 7 deletions(-)
+
+diff --git a/mdadm.8.in b/mdadm.8.in
+index 168e21f2..cab702e1 100644
+--- a/mdadm.8.in
++++ b/mdadm.8.in
+@@ -366,6 +366,107 @@ which is managed in a similar manner to DDF, and is supported by an
+ option-rom on some platforms:
+ .IP
+ .B https://docs.graidtech.com/vroc/
++.IP amd
++Use the AMD RAIDXpert2 ("RAIDCore") metadata of the RAID in AMD chipsets,
++as the platform firmware in RAID mode and the AMD Windows driver keep it.
++This creates a
++.B CONTAINER
++which is managed in a similar manner to IMSM.  Linear (AMD "Volume"),
++RAID0, RAID1, RAID10 and RAID5 arrays are supported; an AMD RAIDABLE
++volume ("RAIDAble" in the firmware menu: one disk kept for a future
++mirror) runs as a RAID1 of one member, and
++.B "\-\-level=1 \-\-raid\-devices=1 \-\-force"
++creates one, as the firmware menu does: on a whole disk that no volume
++uses, without
++.BR \-\-size ;
++.B "\-\-grow \-\-raid\-devices=2"
++of it makes it a RAID1 of two onto a spare of the container, as the AMD
++migration does.
++A Volume runs as an md linear array: it needs the md-linear module, which
++Linux 6.8 to 6.13 do not have and some distribution kernels do not build.
++.IP
++A RAID0, Volume or RAIDABLE array is started with a disk that missed the
++latest configuration update (after a power failure while it was being
++written, for example) if the disk's own configuration lists the same array
++in the same place: such an array cannot have been written without that
++disk.  A RAID1, RAID10 or RAID5 array treats such a disk as out of date:
++it is started without it only with
++.BR \-\-run ,
++and the disk is then rebuilt.
++.IP
++Disks are taken only behind controllers the firmware uses for
++RAID (EFI variable
++.BR AMD_RAID ),
++unless
++.B \-\-force
++is given: the firmware and Windows would not see the others.
++Disks must have 512-byte logical sectors (512n or 512e): AMD RAID has no
++format for 4Kn disks.
++.IP
++A disk added to the container with
++.B \-\-add
++becomes an AMD global hot spare, as with the firmware menu's Assign Global
++Hot Spare.  mdmon records the new disk, so it must be running for the
++container: it is started with a RAID1, RAID10, RAID5 or RAIDABLE volume,
++not with RAID0 and Volume ones.
++A volume is created on all its disks:
++.B missing
++is refused, as with IMSM.
++As with the firmware menu and the AMD Windows tools, a volume has 8 disks
++at most, and a system 12 arrays, each Legacy (non-RAID) disk counting as
++one;
++.B \-\-force
++goes past either limit.  The firmware and the Windows driver took
++volumes of up to 12 disks created so, but their tools do not create
++them, and the firmware menu creates no array past the 12.
++A volume created in the container takes global hot spares as
++members too (when no disks are named, only after the disks that are not
++spares), and they are spares no more; a dedicated hot spare of another
++volume is not taken.
++.IP
++TRIM reaches a RAID1 or RAID10 volume only while every member reads
++zeroes after it, and never a RAID5 volume, as with the AMD driver: mdmon
++sets the volume's
++.B queue/discard_max_bytes
++to 0 otherwise (the kernel log says so), and back when a new member
++allows TRIM again; from Linux 6.17 (and 6.12.42) the kernel does not take
++it back, and the volume has no TRIM until it is started again.
++A Legacy (non-RAID) record that the firmware menu broke, leaving that
++disk unbootable, is repaired with the next configuration mdadm or mdmon
++writes.
++.IP
++RAID1, RAID10 and RAID5 volumes can have an md write-intent bitmap, kept
++in the service area AMD leaves free on each member: give
++.B \-\-bitmap=internal
++to
++.BR \-\-create ,
++or
++.B \-\-update=bitmap
++(and
++.BR no\-bitmap )
++with
++.B \-\-update\-subarray
++for a stopped volume.  It is off by default.  All members of the volume
++must start at one LBA: md keeps the bits at one offset on every member.
++A volume placed after another volume on only some of its disks starts at
++different LBAs and cannot have one; create it on disks that hold the same
++volumes.  A spare that replaces a member is put at that LBA; if it has
++no room there, md drops the bitmap for good (the kernel log says so) and
++the volume goes on without it: its members no longer start at one LBA.
++Linux 6.18 and later cannot run an md bitmap for external metadata (IMSM
++too) until md is fixed ("md/md-bitmap: fix write-intent bitmap setup for
++external metadata"); without the fix mdadm says so, the volume runs
++without the bitmap, and a crash resyncs it whole.
++.IP
++A volume with an md bitmap should not be run by an mdadm that reads amd
++metadata but not its md bitmaps (an older build): such an mdadm leaves the
++bits as they are, and the next one would trust them.  If that happened,
++give
++.B \-\-update=no\-bitmap
++and then
++.B \-\-update=bitmap
++to the stopped volume before it runs again: a new bitmap has every bit
++set, so md resyncs the volume once.
+ .PP
+ .RE
+ 
+@@ -1373,6 +1474,11 @@ except that it does not attempt
+ first.  The device will be added as a spare even if it looks like it
+ could be a recent member of the array.
+ 
++For an AMD RAID volume (a member array of an AMD container) the device
++becomes a dedicated hot spare of that volume: it must be in the container
++already, and only RAID1, RAID10 and RAID5 volumes take them, up to four.
++A global hot spare given so is a dedicated one from then on.
++
+ .TP
+ .BR \-r ", " \-\-remove
+ remove listed devices.  They must not be active.  i.e. they should
+@@ -1396,6 +1502,11 @@ to be removed.
+ The third will remove a set as described below under
+ .BR \-\-fail .
+ 
++For AMD RAID, removing a device from a volume (a member array) unassigns it
++as a dedicated hot spare of that volume.  Removing from the container a hot
++spare that is still connected unassigns its spare roles too; the device stays
++an initialized AMD RAID disk.
++
+ .TP
+ .BR \-f ", " \-\-fail
+ Mark listed devices as faulty.
+@@ -2269,14 +2380,19 @@ option. The supported options are
+ .BR name ,
+ .BR ppl ,
+ .BR no\-ppl ,
+-.BR bitmap
++.BR bitmap ,
++.BR no\-bitmap ,
++.BR read\-cache ,
++.BR no\-read\-cache ,
++.B write\-back
+ and
+-.BR no\-bitmap .
++.BR no\-write\-back .
+ 
+ The
+ .B name
+ option updates the subarray name in the metadata. It cannot be longer than
+-32 chars. If successes, new value will be respected after next assembly.
++32 chars (31 for AMD). If successes, new value will be respected after next
++assembly.
+ 
+ The
+ .B ppl
+@@ -2290,7 +2406,17 @@ The
+ and
+ .B no\-bitmap
+ options enable and disable write-intent bitmap in the metadata. Currently supported only for
+-IMSM subarrays.
++IMSM and AMD subarrays.
++
++The
++.BR read\-cache ,
++.BR no\-read\-cache ,
++.B write\-back
++and
++.B no\-write\-back
++options set the cache policy the AMD drivers (for Windows and Linux) use
++for the volume; md does not cache.  Supported only for AMD subarrays,
++also while the array is running.
+ 
+ .TP
+ .B \-\-examine
+@@ -2660,7 +2786,12 @@ container format.  The number of devices in a container can be
+ increased - which affects all arrays in the container - or an array
+ in a container can be converted between levels where those levels are
+ supported by the container, and the conversion is on of those listed
+-above.
++above.  In an AMD RAID container the only change supported is
++.B "\-\-raid\-devices=2"
++of a RAIDABLE volume, which makes it a RAID1 (see
++.B amd
++under
++.BR \-\-metadata ).
+ 
+ .PP
+ Notes:
+diff --git a/mdadm.conf.5.in b/mdadm.conf.5.in
+index 69434e2c..28695805 100644
+--- a/mdadm.conf.5.in
++++ b/mdadm.conf.5.in
+@@ -447,7 +447,8 @@ The known metadata types are
+ .BR 0.90 ,
+ .BR 1.x ,
+ .BR ddf ,
+-.BR imsm .
++.BR imsm ,
++.BR amd .
+ 
+ .B AUTO
+ should be given at most once.  Subsequent lines are silently ignored.
+@@ -491,7 +492,7 @@ line and supported values are:
+ any arbitrary string
+ .TP
+ .B metadata=
+-0.9 1.x ddf or imsm
++0.9 1.x ddf imsm or amd
+ .TP
+ .B path=
+ file glob matching anything from
+-- 
+2.47.3
+
