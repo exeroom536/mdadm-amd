@@ -4,23 +4,25 @@
 # mdadm-amd.patch applies to.  Two packages from one build:
 #   mdadm-amd          - mdadm, mkinitcpio hooks, udev rule; replaces mdadm;
 #   md-bitmap-ext-dkms - optional: md_mod with the md fix for the write-intent bitmap of external
-#                        metadata (kernel/), for Linux 7.3.1-7.3.3, until it is upstream.
+#                        metadata (kernel/), for Linux 7.3.0-7.3.4, until it is upstream.
 # Build: cp ../../mdadm/mdadm-amd.patch ../dkms/* . && makepkg -s   (see docs/install.md)
 # (after changing a file here: updpkgsums)
 
 pkgbase=mdadm-amd
 pkgname=('mdadm-amd' 'md-bitmap-ext-dkms')
-_commit=cd27b828deb70abb3edb862ba8ddc8b905866a2e   # mdadm-4.6-96-gcd27b828, 2026-11-04 (GitHub main)
-pkgver=4.6.r96.gcd27b828
-pkgrel=29
+_commit=5542bf40fab20f09ce3be80ae1cb42584e9fa2f7   # mdadm-4.6-112-g5542bf40, 2026-11-12 (GitHub main)
+pkgver=4.6.r112.g5542bf40
+pkgrel=30
 arch=('x86_64')
 license=('GPL-2.0-or-later')
 url='https://github.com/md-raid-utilities/mdadm'
 makedepends=('git' 'man-db')
 
-# md-bitmap-ext-dkms: drivers/md of this stable tag, and the kernels whose drivers/md is identical to it
-_mdver=7.3.1
-_mdkvers_re='^7\.3\.[123]-'
+# md-bitmap-ext-dkms: drivers/md of these stable tags (the bases), and for each the kernel releases whose
+# drivers/md files are the same (checked on a clone of stable: packaging/dkms/md-bases.sh); a kernel of any
+# other release keeps its own md_mod
+_mdbases=(7.3.1 7.3.4)
+_mdkvers=('7\.3\.[0-3]' '7\.3\.4')	# per base: regex of the kernel version up to its first "-"
 _md="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/md"
 _mdfiles=(md.c md.h md-bitmap.c md-bitmap.h md-llbitmap.c md-cluster.h)
 
@@ -37,23 +39,31 @@ source=("mdadm::git+https://github.com/md-raid-utilities/mdadm.git#commit=${_com
         'dkms-pre-build.sh'
         'dkms-post-install.sh'
         'md-bitmap-ext.patch')
-for _f in "${_mdfiles[@]}"; do
-	source+=("${_f}::${_md}/${_f}?h=v${_mdver}")
+for _b in "${_mdbases[@]}"; do
+	for _f in "${_mdfiles[@]}"; do
+		source+=("v${_b}-${_f}::${_md}/${_f}?h=v${_b}")
+	done
 done
-sha256sums=('2004c3ba071d0daf850fdce5c65e8efded6c34625c8e30f64bec896be4c6cf3f'
-            'c9131a0f6d85930e547917a0e8f403924a9791bf6ce8c49f71edc40c747078bc'
+sha256sums=('684060921e12f301334e4c8d0ca8a529f7276e4f185e168246115e843dacb11e'
+            '348050e29d0386aa93755f0d8ee9e66654f00f2f5bf7a8ff02f88b302dba0080'
             '52b7a3e7f6d4785234c79fd394f2009a9aa389230fa742250058bd1f310330d1'
             'c3bceb429eebe148f2ad37c29cc1f1edb4dacc6495b251df558db5f2618e3671'
             '1dfff7905e6db439a38f19deede2535e405387bda6d6d7e8ef5e71661ada019f'
             '8ec8981de87c277e5010f11c34ded14a2d38e1fc8e8c2e65e4c970ed31c70177'
             '86b24552bc2cc2436e91698f20798129c3c60bfb406445e0ae76314377147d1d'
             '77d2cee69f9008318ddea60e253cd9416a3850e9e36d5bc55f51d9df4810544d'
-            '3324715df5bdce0de6cdd13c7b6e2f860722ce9b1af415d7ac49d46df2245f0d'
+            '02f8321b57857c698be3123ae625bccd07b8968ef40da49ed9610ae38d426504'
             'db4ca682da822c23eb06220035b02e2247d16a95eb1d359930535157260c5197'
-            '84863a9628e41d9ca43a582ec02143794e50a11e9d176810d1601f79c6328311'
+            'b34a3d38e107de70583c4c70d8bd47131eaf56f28f431aa8b763a287793c22a6'
             'c491893084e4f1f288319b99ffb273ae1db2ea7a9e29fef7b728ad5d66d67ceb'
             '64be305f29103acedc7df3798b0bed1497dc0e92a30a2d75b2c771cf871ee626'
             '5e9439bd8b4c42a721c992956b7c58cfbf13abf3414e5ac4cceb0c76a32f021a'
+            'be037a9c3f0b063c731436507993680a5c77153c6bfb327a31f6a2e08d7e501e'
+            'c732141180be5336afecd60e36290db60d2f4f1baf2395c7c4d9bcbb45ae0a23'
+            'c18843c92a4973c45d608985fb793b62dba2c1621125e35043c01fca288d73ec'
+            '023674e6282abaa6fde3b56738186f0e3c07f5ad09b531f0ec47ab12724bb3ad'
+            '1120a275736ab1d91931323e8a170380172bb71a98de48b998b36380edb1426a'
+            '337a633d8d77f959adcdea14d39bd9ec5be70a129a3f9e605a5decd45e762ab9'
             'be037a9c3f0b063c731436507993680a5c77153c6bfb327a31f6a2e08d7e501e'
             'c732141180be5336afecd60e36290db60d2f4f1baf2395c7c4d9bcbb45ae0a23'
             'c18843c92a4973c45d608985fb793b62dba2c1621125e35043c01fca288d73ec'
@@ -64,12 +74,17 @@ prepare() {
 	cd mdadm
 	git apply "$srcdir"/mdadm-amd.patch
 
-	# md-bitmap-ext-dkms: drivers/md with the fix
+	# md-bitmap-ext-dkms: drivers/md of each base, with the fix
 	cd "$srcdir"
 	rm -rf md-tree
-	mkdir -p md-tree/drivers/md
-	cp -L "${_mdfiles[@]}" md-tree/drivers/md/
-	patch -d md-tree -p1 --no-backup-if-mismatch -i "$srcdir/md-bitmap-ext.patch"
+	local _b _f
+	for _b in "${_mdbases[@]}"; do
+		mkdir -p "md-tree/v$_b/drivers/md"
+		for _f in "${_mdfiles[@]}"; do
+			cp -L "v${_b}-${_f}" "md-tree/v$_b/drivers/md/$_f"
+		done
+		patch -d "md-tree/v$_b" -p1 --no-backup-if-mismatch -i "$srcdir/md-bitmap-ext.patch"
+	done
 }
 
 build() {
@@ -82,10 +97,10 @@ build() {
 }
 
 package_mdadm-amd() {
-	pkgdesc='mdadm with AMD RAIDXpert2 (RAIDCore) metadata support (mdadm-amd 1.0), plus the amdraid mkinitcpio hook'
+	pkgdesc='mdadm with AMD RAIDXpert2 (RAIDCore) metadata support (mdadm-amd 1.1), plus the amdraid mkinitcpio hook'
 	depends=('glibc' 'systemd')
 	optdepends=('bash: mdcheck'
-	            'md-bitmap-ext-dkms: md write-intent bitmap of AMD volumes on Linux 7.3 (resync after a crash only where md was writing)')
+	            'md-bitmap-ext-dkms: md write-intent bitmap of AMD volumes on Linux 7.3.0-7.3.4 (resync after a crash only where md was writing)')
 	provides=("mdadm=${pkgver}")
 	# mkinitcpio 40: HOOKS of the shutdown ramfs come from /run/initramfs/mkinitcpio-shutdown.conf
 	# (tmpfiles 20-mkinitcpio.conf), which 60-amdraid-shutdown.conf appends to
@@ -114,22 +129,30 @@ package_mdadm-amd() {
 }
 
 package_md-bitmap-ext-dkms() {
-	pkgdesc='md_mod with the write-intent bitmap fix for external metadata (DKMS, Linux 7.3.1-7.3.3), until it is upstream'
+	pkgdesc='md_mod with the write-intent bitmap fix for external metadata (DKMS, Linux 7.3.0-7.3.4), until it is upstream'
 	arch=('any')
 	license=('GPL-2.0-only')
 	depends=('dkms')
-	url="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/md?h=v${_mdver}"
+	url='https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/drivers/md'
 
-	# DKMS names the module by the kernel it comes from, not by this package's version
-	local dest="$pkgdir/usr/src/md-bitmap-ext-${_mdver}"
+	# the DKMS version takes no "-": the dkms pacman hook splits /usr/src/<name>-<version> at the last one
+	local ver="${pkgver}.${pkgrel}" i kre=
+	local dest="$pkgdir/usr/src/md-bitmap-ext-$ver"
 
-	install -Dm644 -t "$dest" md-tree/drivers/md/* Kbuild
+	install -Dm644 -t "$dest" Kbuild
 	install -Dm755 -t "$dest" dkms-pre-build.sh dkms-post-install.sh
+	# one directory per base, and the table dkms-pre-build.sh picks it from
+	for i in "${!_mdbases[@]}"; do
+		install -Dm644 -t "$dest/v${_mdbases[i]}" "md-tree/v${_mdbases[i]}"/drivers/md/*
+		printf '%s v%s\n' "${_mdkvers[i]}" "${_mdbases[i]}" >> "$dest/bases"
+		kre+="${kre:+|}${_mdkvers[i]}"
+	done
+	chmod 644 "$dest/bases"
 	# in bash, not sed: the backslashes of the regex would need escaping twice over
 	local conf
 	conf=$(<dkms.conf)
-	conf=${conf//@PKGVER@/$_mdver}
-	conf=${conf//@KVER_RE@/$_mdkvers_re}
+	conf=${conf//@PKGVER@/$ver}
+	conf=${conf//@KVER_RE@/^($kre)-}
 	printf '%s\n' "$conf" > "$dest/dkms.conf"
 	chmod 644 "$dest/dkms.conf"
 }

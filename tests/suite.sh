@@ -3943,6 +3943,61 @@ rm -rf $WQ/q3j
 fi
 # --- end of stage 39 ---
 
+# --- stage 40: XFS, btrfs, LUKS, LVM on a whole disk: -C reports it and asks, --add refuses it ---
+# check_fs_magic() (util.c): Create calls it next to check_ext2(), super-amd's --add in amd_add_holds_data().
+# Needs mkfs.xfs, cryptsetup and pvcreate (xfsprogs, cryptsetup, lvm2); without them the stage is skipped.
+if want 40; then
+cd "$MDADM_DIR"
+stopall
+q40tools=1; for t in mkfs.xfs mkfs.btrfs cryptsetup pvcreate; do sudo sh -c "command -v $t" >/dev/null || q40tools=0; done
+if [ $q40tools = 0 ]; then skip "40" "needs mkfs.xfs, mkfs.btrfs, cryptsetup, pvcreate (xfsprogs, btrfs-progs, cryptsetup, lvm2)"; else
+q40drop() { stopall; sudo vgremove -q -ff q40vg >/dev/null 2>&1; for l in $(sudo losetup -a | grep $WQ/q4fs/ | cut -d: -f1); do sudo losetup -d $l; done; rm -f $WQ/q4fs/*.img; }
+mkdir -p $WQ/q4fs
+q40drop
+QL=""; for n in 0 1 2 3; do truncate -s 700M $WQ/q4fs/d$n.img; QL="$QL $(sudo losetup -f --show $WQ/q4fs/d$n.img)"; done
+read -r QA QB QC QD <<<"$QL"
+q40fs() {	# q40fs <xfs|btrfs|luks|lvm>: only that on the whole of $QA
+	sudo dd if=/dev/zero of=$QA bs=1M count=2 conv=fsync status=none
+	case $1 in
+	xfs)   sudo mkfs.xfs -q -f $QA ;;
+	btrfs) sudo mkfs.btrfs -q -f $QA >/dev/null ;;
+	luks)  printf q40 | sudo cryptsetup luksFormat -q --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 $QA - ;;
+	lvm)   sudo pvcreate -q -ff -y $QA >/dev/null && sudo vgcreate -q q40vg $QA >/dev/null && sudo vgchange -q -an q40vg >/dev/null ;;
+	esac
+}
+q40msg() { case $1 in xfs) echo 'appears to contain an XFS file system';; btrfs) echo 'appears to contain a btrfs file system';;
+	luks) echo 'appears to contain a LUKS encrypted volume';; lvm) echo 'appears to be an LVM physical volume';; esac; }
+for fs in xfs btrfs luks lvm; do
+	q40fs $fs
+	echo n | $M -C /dev/md/q40n -e1.2 -l1 -n2 $QA $QB >$TMPW/q40.log 2>&1
+	check "40: $fs on the whole disk: -C -e1.2 reports it and asks, nothing created" "grep -q '$(q40msg $fs)' $TMPW/q40.log && grep -q 'Continue creating array' $TMPW/q40.log && [ ! -e /dev/md/q40n ]"
+	echo n | $M -C /dev/md/q40c -e amd -n2 $QA $QB >$TMPW/q40.log 2>&1
+	check "40: $fs on the whole disk: -C -e amd reports it and asks, nothing created" "grep -q '$(q40msg $fs)' $TMPW/q40.log && grep -q 'Continue creating array' $TMPW/q40.log && [ ! -e /dev/md/q40c ]"
+	[ $fs = lvm ] && sudo vgremove -q -ff q40vg >/dev/null 2>&1
+done
+# --add to a container with a RAID1 (mdmon running)
+for d in $QB $QC $QD; do sudo dd if=/dev/zero of=$d bs=1M count=2 conv=fsync status=none; done
+$M -C /dev/md/q40c -e amd -n2 $QB $QC --run >/dev/null 2>&1; CN=$(cont1)
+$M -C /dev/md/q40v -l1 -n2 -z 64M /dev/$CN --run >/dev/null 2>&1; waitrec 60
+check "40: container with a RAID1 volume, mdmon runs" "grep -q 'active raid1' /proc/mdstat && pgrep -x mdmon >/dev/null"
+for fs in xfs btrfs luks lvm; do
+	q40fs $fs
+	$M --add /dev/$CN $QA >$TMPW/q40.log 2>&1
+	check "40: $fs on the whole disk: --add refused, the disk keeps it" "grep -q '$(q40msg $fs)' $TMPW/q40.log && grep -q 'not adding .*--force wipes it' $TMPW/q40.log && ! $M -E $QA 2>/dev/null | grep -q 'AMD' && sudo blkid -p -o value -s TYPE $QA | grep -qxE 'xfs|btrfs|crypto_LUKS|LVM2_member'"
+	[ $fs = lvm ] && sudo vgremove -q -ff q40vg >/dev/null 2>&1
+done
+q40fs xfs
+$M --add --force /dev/$CN $QA >$TMPW/q40.log 2>&1
+check "40: xfs: --add --force takes the disk" "$M -E $QA 2>/dev/null | grep -q 'AMD'"
+$M --add /dev/$CN $QD >$TMPW/q40.log 2>&1
+check "40: blank disk: --add takes it, nothing reported" "! grep -qE 'appears to (contain|be)' $TMPW/q40.log && $M -E $QD 2>/dev/null | grep -q 'AMD'"
+q40drop
+rm -f $TMPW/q40.log
+rmdir $WQ/q4fs 2>/dev/null
+fi
+fi
+# --- end of stage 40 ---
+
 # the ASRock and X399 snapshots are untouched: attached before stage 7, assembled only in stage 1
 if want 1; then
 # reg <image> <fixture> <LBA>: the image has the fixture (xz or raw) at that LBA

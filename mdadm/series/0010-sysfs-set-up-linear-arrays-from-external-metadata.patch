@@ -1,7 +1,7 @@
-From dd9b3b646a420f5d796fcc7c0a76e125c79dbb06 Mon Sep 17 00:00:00 2001
+From 2c759df851a239412b06f440e50dd11e4a2b1cb0 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:04 +0500
-Subject: [PATCH 10/32] sysfs: set up linear arrays from external metadata
+Date: Sat, 14 Nov 2026 01:33:55 +0500
+Subject: [PATCH 10/33] sysfs: set up linear arrays from external metadata
 
 sysfs_set_array() returns early for every level below 0, so for a linear
 member array of an external container (DDF CONCAT, AMD Volume) neither
@@ -22,10 +22,10 @@ Written by Claude Opus 5.5, an AI model by Anthropic.
  1 file changed, 2 insertions(+), 1 deletion(-)
 
 diff --git a/sysfs.c b/sysfs.c
-index 96bfd5a7..b10ff3f9 100644
+index 8fca3c01..2597fb02 100644
 --- a/sysfs.c
 +++ b/sysfs.c
-@@ -829,7 +829,8 @@ int sysfs_set_array(struct mdinfo *info)
+@@ -987,7 +987,8 @@ int sysfs_set_array(struct mdinfo *info)
  			return 1;
  		}
  	}

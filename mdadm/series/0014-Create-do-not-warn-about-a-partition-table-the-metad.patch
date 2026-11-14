@@ -1,7 +1,7 @@
-From 4c4fa4d97a0b1a2585b121bea75102362627ffd5 Mon Sep 17 00:00:00 2001
+From 53ae46d5d52283c9b9c6b0b1598666f52f98257b Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:19 +0500
-Subject: [PATCH 14/32] Create: do not warn about a partition table the
+Date: Sat, 14 Nov 2026 01:34:14 +0500
+Subject: [PATCH 14/33] Create: do not warn about a partition table the
  metadata keeps
 
 AMD RAIDXpert2 writes a partition of its own (type 0x82, over the whole
@@ -25,7 +25,7 @@ Written by Claude Opus 5.5, an AI model by Anthropic.
  1 file changed, 25 insertions(+), 5 deletions(-)
 
 diff --git a/Create.c b/Create.c
-index b20d1fe1..19e51774 100644
+index ab4ca211..faa5fe13 100644
 --- a/Create.c
 +++ b/Create.c
 @@ -49,6 +49,23 @@ static int round_size_and_verify(unsigned long long *size, int chunk)

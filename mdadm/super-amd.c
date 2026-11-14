@@ -5773,18 +5773,19 @@ static int amd_foreign_table(int fd, void *buf)
 /*
  * mdadm --add of a disk that is not of this configuration: Initialize zeroes
  * its first and last 20 MiB.  What mdadm can tell holds data is refused
- * unless --force, as Create asks before it goes on: a file system it knows
- * on the whole disk (check_ext2, check_reiser - they say what they found),
- * or a member of a volume of another AMD RAID configuration.  A volume of
- * @super is no reason: its member comes back (the AMD driver dropped the PD
- * of a disk it ran without).
+ * unless --force, as Create asks before it goes on: a file system or volume
+ * it knows on the whole disk (check_ext2, check_reiser, check_fs_magic -
+ * they say what they found), or a member of a volume of another AMD RAID
+ * configuration.  A volume of @super is no reason: its member comes back
+ * (the AMD driver dropped the PD of a disk it ran without).
  */
 static int amd_add_holds_data(struct amd_super *super, int fd, char *subdev)
 {
 	struct amd_super *other;
 	int vol, foreign = 0;
 
-	if (check_ext2(fd, subdev) | check_reiser(fd, subdev)) {
+	if (check_ext2(fd, subdev) | check_reiser(fd, subdev) |
+	    check_fs_magic(fd, subdev)) {
 		cont_err("not adding %s: --force wipes it\n", subdev);
 		return 1;
 	}

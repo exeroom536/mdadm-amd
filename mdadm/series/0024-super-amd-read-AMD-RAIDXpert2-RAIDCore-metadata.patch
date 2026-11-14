@@ -1,7 +1,7 @@
-From d0e64ac80c46def3be5c4c1d5206d8012b7347c1 Mon Sep 17 00:00:00 2001
+From 76fabe230a366c3d1bcb714fedfa8a19ccdd8896 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:47 +0500
-Subject: [PATCH 23/32] super-amd: read AMD RAIDXpert2 (RAIDCore) metadata
+Date: Sat, 14 Nov 2026 01:34:54 +0500
+Subject: [PATCH 24/33] super-amd: read AMD RAIDXpert2 (RAIDCore) metadata
 
 AMD RAIDXpert2 is the RAID of AMD chipsets (X399, X570, X670, X870...):
 the BIOS (RAIDCoreDxe) and the AMD Windows driver keep the arrays in
@@ -66,7 +66,7 @@ Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
  create mode 100644 super-amd.c
 
 diff --git a/Makefile b/Makefile
-index 8fe2d66d..67d9aeab 100644
+index 40fb3b9c..93f7716c 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -182,7 +182,7 @@ OBJS = mdadm.o config.o policy.o mdstat.o  ReadMe.o uuid.o util.o maps.o lib.o u
@@ -88,10 +88,10 @@ index 8fe2d66d..67d9aeab 100644
  
  MON_SRCS = $(patsubst %.o,%.c,$(MON_OBJS))
 diff --git a/mdadm.h b/mdadm.h
-index a8a7f2a1..05360106 100644
+index 69019ccd..544e450b 100644
 --- a/mdadm.h
 +++ b/mdadm.h
-@@ -1281,7 +1281,7 @@ extern struct superswitch {
+@@ -1283,7 +1283,7 @@ extern struct superswitch {
  } *superlist[];
  
  extern struct superswitch super0, super1;
@@ -3034,10 +3034,10 @@ index 00000000..394240db
 +	.open_new	= amd_open_new,
 +};
 diff --git a/util.c b/util.c
-index d5405548..19bb8cda 100644
+index b6b2dfb3..1b1a0e4f 100644
 --- a/util.c
 +++ b/util.c
-@@ -1225,7 +1225,7 @@ void wait_for(char *dev, int fd)
+@@ -1272,7 +1272,7 @@ void wait_for(char *dev, int fd)
  struct superswitch *superlist[] =
  {
  	&super0, &super1,

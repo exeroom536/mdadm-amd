@@ -1,7 +1,7 @@
-From 79c8ab8fdc13e54ec549a8982f856043f5f52271 Mon Sep 17 00:00:00 2001
+From ed3d0b805a94b58e90ddec083b23ace1529db5f5 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:56 +0500
-Subject: [PATCH 25/32] super-amd: rebuild volumes onto spares and returning
+Date: Sat, 14 Nov 2026 01:35:04 +0500
+Subject: [PATCH 26/33] super-amd: rebuild volumes onto spares and returning
  members
 
 When a slot of a managed volume is out of service, mdmon gives md a disk

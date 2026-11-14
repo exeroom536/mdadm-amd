@@ -1,7 +1,7 @@
-From 21559ea300ff2fe60a3bcb3c593db9b1b29692d3 Mon Sep 17 00:00:00 2001
+From 4b4ebdebfb46295def8f27fa24911cb87b3b20e2 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:57:18 +0500
-Subject: [PATCH 32/32] mdadm.8, mdadm.conf.5: document the amd metadata format
+Date: Sat, 14 Nov 2026 01:35:27 +0500
+Subject: [PATCH 33/33] mdadm.8, mdadm.conf.5: document the amd metadata format
 
 Describe --metadata=amd: what it is, the levels it supports (a Volume
 needs md-linear), --create and --grow of a RAIDABLE volume (also under

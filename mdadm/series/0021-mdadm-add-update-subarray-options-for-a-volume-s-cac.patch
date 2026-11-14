@@ -1,7 +1,7 @@
-From 05cc00680ef4d3aaab0327efe1678f450a3532f9 Mon Sep 17 00:00:00 2001
+From 5f58b50d51ef2b9374e0b82acd82704a9fb05d01 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:38 +0500
-Subject: [PATCH 20/32] mdadm: add --update-subarray options for a volume's
+Date: Sat, 14 Nov 2026 01:34:43 +0500
+Subject: [PATCH 21/33] mdadm: add --update-subarray options for a volume's
  cache policy
 
 AMD RAIDXpert2 keeps a cache policy in each volume's metadata: read
@@ -56,7 +56,7 @@ index 2181b4ac..2db5a8e0 100644
  	{ "super-minor", UOPT_SUPER_MINOR },
  	{ "summaries", UOPT_SUMMARIES },
 diff --git a/mdadm.h b/mdadm.h
-index 4cdc6a3a..a8a7f2a1 100644
+index b85e0f82..69019ccd 100644
 --- a/mdadm.h
 +++ b/mdadm.h
 @@ -496,6 +496,10 @@ enum update_opt {

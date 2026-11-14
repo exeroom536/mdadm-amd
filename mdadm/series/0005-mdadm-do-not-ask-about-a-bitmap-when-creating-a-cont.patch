@@ -1,7 +1,7 @@
-From e0646bd2a69f595e7aac145a1f6bb26788950086 Mon Sep 17 00:00:00 2001
+From 40440c33a7869a2c67aa509626f5abce82919356 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:55:56 +0500
-Subject: [PATCH 05/32] mdadm: do not ask about a bitmap when creating a
+Date: Sat, 14 Nov 2026 01:33:45 +0500
+Subject: [PATCH 05/33] mdadm: do not ask about a bitmap when creating a
  container
 
 mdadm --create of a container of external metadata gives no level, so

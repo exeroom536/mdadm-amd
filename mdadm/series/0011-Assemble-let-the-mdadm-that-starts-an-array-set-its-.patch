@@ -1,7 +1,7 @@
-From 02bcf29af1ef9eb72e5ae35c9e086d077461153b Mon Sep 17 00:00:00 2001
+From 15f382fe1005061aad6e2c7c1372303baa05bc94 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:06 +0500
-Subject: [PATCH 11/32] Assemble: let the mdadm that starts an array set its
+Date: Sat, 14 Nov 2026 01:33:56 +0500
+Subject: [PATCH 11/33] Assemble: let the mdadm that starts an array set its
  resync point
 
 With incremental assembly (mdadm -I per disk, run by udev in parallel at
@@ -30,7 +30,7 @@ Written by Claude Opus 5.5, an AI model by Anthropic.
  1 file changed, 14 insertions(+)
 
 diff --git a/Assemble.c b/Assemble.c
-index 2deffbb5..cff24a59 100644
+index 3829e984..fe6d1aad 100644
 --- a/Assemble.c
 +++ b/Assemble.c
 @@ -2009,6 +2009,7 @@ int assemble_container_content(struct supertype *st, int mdfd,

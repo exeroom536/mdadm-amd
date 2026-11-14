@@ -1,7 +1,7 @@
-From 4a6c27b437c90a068b0b944eaa9b1910e6d237c3 Mon Sep 17 00:00:00 2001
+From 7c24c9859478cf83c2e22f83b9f86710019c0539 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:27 +0500
-Subject: [PATCH 16/32] Assemble: look at every slotless device for the newest
+Date: Sat, 14 Nov 2026 01:34:30 +0500
+Subject: [PATCH 17/33] Assemble: look at every slotless device for the newest
  superblock
 
 Assemble() bases the array on the superblock of the newest device and
@@ -29,7 +29,7 @@ Written by Claude Opus 5.5, an AI model by Anthropic.
  1 file changed, 13 insertions(+), 4 deletions(-)
 
 diff --git a/Assemble.c b/Assemble.c
-index cff24a59..08a3f92b 100644
+index fe6d1aad..68b69a96 100644
 --- a/Assemble.c
 +++ b/Assemble.c
 @@ -1380,7 +1380,7 @@ int Assemble(char *mddev, struct mddev_ident *ident,

@@ -74,7 +74,8 @@ mdadm /dev/md/amd0 --remove /dev/sde            # takes all spare roles from a d
 ```
 
 When a member of a redundant volume fails, `mdmon` rebuilds onto the volume's dedicated spares first, then onto a
-global spare, as the AMD driver does. `--add` refuses a disk with an ext2/3/4 or ReiserFS file system or with another AMD set on it;
+global spare, as the AMD driver does. `--add` refuses a disk with an ext2/3/4, ReiserFS, XFS or btrfs file system, a LUKS volume, an LVM physical volume or
+another AMD set on it;
 `--force` wipes it.
 
 ## RAIDABLE → RAID1
@@ -122,8 +123,11 @@ use under Windows; md itself does not cache. Names are at most 31 characters, an
 
 - Volumes made or changed by mdadm are shown as Normal by the BIOS menu and taken by the Windows driver, and the
   other way round. A rebuild, an initialization or a migration started by one goes on under the other.
-- The AMD write-intent bitmap is kept as the AMD driver keeps it, so after a crash the BIOS and Windows check the
-  volume as usual.
+- The AMD write-intent bitmap is kept as the AMD driver keeps it. After Linux crashed while writing, start Linux
+  again before Windows if you can: md then resyncs the parts it was writing. The Windows driver does not do that
+  for you in every case: 9.5.0 clears the bitmap without checking the volume, and 9.3.3 checks mirrors but leaves
+  RAID5 parity as it was (both seen in a VM). If Windows ran first after such a crash, check the volume from
+  Linux and repair what differs: `echo repair | sudo tee /sys/block/mdX/md/sync_action`.
 - TRIM reaches a RAID1 or RAID10 only while every member reads zeroes after it, as the AMD driver decides, and never
   a RAID5. `mdmon` decides again on each new member. Kernels from 6.17 (and 6.12.42 on) do not take TRIM back once
   it was turned off (a fix: [kernel/blk-discard/](../kernel/blk-discard/)); the volume then keeps it

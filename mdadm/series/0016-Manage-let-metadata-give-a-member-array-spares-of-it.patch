@@ -1,7 +1,7 @@
-From 939d1eac3803a58ebd15364a1cce4245310a6ba2 Mon Sep 17 00:00:00 2001
+From 094b565814ad450b4bcdef768ae769576bee0443 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:21 +0500
-Subject: [PATCH 15/32] Manage: let metadata give a member array spares of its
+Date: Sat, 14 Nov 2026 01:34:23 +0500
+Subject: [PATCH 16/33] Manage: let metadata give a member array spares of its
  own
 
 Spares of an external container are the container's, for any of its
@@ -71,10 +71,10 @@ index 5e208cf7..c073742d 100644
  
  			if (rv < 0)
 diff --git a/mdadm.h b/mdadm.h
-index 4b2a46d2..b3c68104 100644
+index 73ce3ed7..d5179112 100644
 --- a/mdadm.h
 +++ b/mdadm.h
-@@ -1168,6 +1168,22 @@ extern struct superswitch {
+@@ -1170,6 +1170,22 @@ extern struct superswitch {
  	 */
  	int (*update_subarray)(struct supertype *st, char *subarray,
  			       enum update_opt update, struct mddev_ident *ident);

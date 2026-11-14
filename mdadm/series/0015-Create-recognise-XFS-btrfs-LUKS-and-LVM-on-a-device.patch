@@ -1,0 +1,109 @@
+From 327d8594cb2658ea18423368d467657f55c40883 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Sat, 14 Nov 2026 01:34:15 +0500
+Subject: [PATCH 15/33] Create: recognise XFS, btrfs, LUKS and LVM on a device
+
+Create warns about an ext2/3/4 or reiserfs file system on a device it is
+about to use, and asks before it goes on; it says nothing about the
+file systems and volumes most often found on a whole disk today.  So
+-C over an XFS or btrfs file system, a LUKS volume or an LVM2 physical
+volume asks nothing and wipes it.
+
+check_fs_magic() looks for the magic numbers of their on-disk formats,
+at the places libblkid looks: XFS and LUKS at the start, btrfs in its
+superblock at 64K, the LVM2 label in one of the first four sectors.
+Create calls it next to check_ext2() and check_reiser(); a metadata
+handler can call it for a disk it is about to take.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Create.c |  1 +
+ mdadm.h  |  1 +
+ util.c   | 47 +++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 49 insertions(+)
+
+diff --git a/Create.c b/Create.c
+index faa5fe13..70255dd2 100644
+--- a/Create.c
++++ b/Create.c
+@@ -903,6 +903,7 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
+ 			}
+ 			warn |= check_ext2(fd, dname);
+ 			warn |= check_reiser(fd, dname);
++			warn |= check_fs_magic(fd, dname);
+ 			warn |= check_raid(fd, dname);
+ 			if (own_partition_table(st, fd)) {
+ 				/* the metadata's own partition */
+diff --git a/mdadm.h b/mdadm.h
+index 0eb5260a..73ce3ed7 100644
+--- a/mdadm.h
++++ b/mdadm.h
+@@ -1541,6 +1541,7 @@ extern int parse_num(int *dest, const char *num);
+ extern int parse_cluster_confirm_arg(char *inp, char **devname, int *slot);
+ extern bool check_ext2(int fd, char *name);
+ extern int check_reiser(int fd, char *name);
++extern bool check_fs_magic(int fd, char *name);
+ extern int check_raid(int fd, char *name);
+ extern int check_partitions(int fd, char *dname,
+ 			    unsigned long long freesize,
+diff --git a/util.c b/util.c
+index d5405548..b6b2dfb3 100644
+--- a/util.c
++++ b/util.c
+@@ -662,6 +662,53 @@ int check_reiser(int fd, char *name)
+ 	return 1;
+ }
+ 
++/**
++ * check_fs_magic() - Check for a file system or volume mdadm would wipe.
++ * @fd: file descriptor of the device to check.
++ * @name: name of the device to check.
++ *
++ * What check_ext2() and check_reiser() do not see: XFS ("XFSB" at 0),
++ * btrfs ("_BHRfS_M" at 64K + 0x40), LUKS ("LUKS\xba\xbe" at 0) and an LVM2
++ * physical volume (label "LABELONE" of type "LVM2 001" at the start of one
++ * of the first four 512-byte sectors) - the magic numbers of their on-disk
++ * formats, as libblkid knows them.
++ *
++ * Return: true if one is found (and reported).
++ */
++bool check_fs_magic(int fd, char *name)
++{
++	static const struct {
++		const char *what;
++		off_t offset;
++		const char *magic;
++	} magics[] = {
++		{ "an XFS file system", 0, "XFSB" },
++		{ "a btrfs file system", 0x10040, "_BHRfS_M" },
++		{ "a LUKS encrypted volume", 0, "LUKS\xba\xbe" },
++	};
++	char buf[512];
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(magics); i++) {
++		size_t len = strlen(magics[i].magic);
++
++		if (pread(fd, buf, len, magics[i].offset) != (ssize_t)len ||
++		    memcmp(buf, magics[i].magic, len) != 0)
++			continue;
++		pr_info("%s appears to contain %s\n", name, magics[i].what);
++		return true;
++	}
++	for (i = 0; i < 4; i++) {
++		if (pread(fd, buf, sizeof(buf), i * 512) != sizeof(buf) ||
++		    memcmp(buf, "LABELONE", 8) != 0 ||
++		    memcmp(buf + 24, "LVM2 001", 8) != 0)
++			continue;
++		pr_info("%s appears to be an LVM physical volume\n", name);
++		return true;
++	}
++	return false;
++}
++
+ int check_raid(int fd, char *name)
+ {
+ 	struct mdinfo info;
+-- 
+2.47.3
+

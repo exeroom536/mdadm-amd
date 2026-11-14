@@ -1,7 +1,7 @@
-From 28020ce6046a30ce54d5583a6f9f6525d46ae7b3 Mon Sep 17 00:00:00 2001
+From 2f0d4093a1d30f2c5d9024a4ba5544ff85eb7b10 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:55:58 +0500
-Subject: [PATCH 06/32] Manage, Assemble: do not hand a member array to an
+Date: Sat, 14 Nov 2026 01:33:47 +0500
+Subject: [PATCH 06/33] Manage, Assemble: do not hand a member array to an
  mdmon that is leaving
 
 mdadm --stop of a container returns while its mdmon may still be alive:
@@ -55,7 +55,7 @@ Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
  3 files changed, 59 insertions(+), 7 deletions(-)
 
 diff --git a/Assemble.c b/Assemble.c
-index 03dc5f3f..30c3accc 100644
+index 65204dc6..fc84f572 100644
 --- a/Assemble.c
 +++ b/Assemble.c
 @@ -1969,6 +1969,34 @@ free_st:
@@ -124,7 +124,7 @@ index 03dc5f3f..30c3accc 100644
  			break;
  		}
 diff --git a/Incremental.c b/Incremental.c
-index dbcc1b8f..40c5cd09 100644
+index 5a1f8ebe..44eed2f1 100644
 --- a/Incremental.c
 +++ b/Incremental.c
 @@ -486,6 +486,13 @@ int Incremental(struct mddev_dev *devlist, struct context *c,

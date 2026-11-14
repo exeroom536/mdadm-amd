@@ -1,6 +1,6 @@
 # Test suite
 
-Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 530 checks in 52
+Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 545 checks in 53
 stages, on images of real AMD RAID disks, of disks made by the board's own RAID firmware in emulation, and of
 disks this mdadm makes. Everything runs on loop devices of sparse files (plus LIO SCSI disks backed by files for
 the udev stages); no real disk is touched unless you provide the optional AMD controller disks below.
@@ -16,7 +16,7 @@ array it finds, loads and unloads kernel modules, and puts udev rules and system
   of 26 `scsi_debug`; md `linear` is not needed;
 - systemd (stage 39 runs `mdmon@` and `mdadm-last-resort@` units from the tree);
 - `gcc`, `python3`, `xz`, `btrfs-progs`, `e2fsprogs`, `util-linux` (`losetup`, `sfdisk`, `blkdiscard`, `lsblk`),
-  `dmsetup`, `udev`;
+  `dmsetup`, `udev`; for stage 40 also `xfsprogs`, `cryptsetup` and `lvm2` (skipped without them);
 - about 20 GB free in the work directory (`WORKDIR`, default `/var/tmp/mdadm-amd-tests`): images of up to 10 TB
   are sparse, and the volumes md resyncs live on a compressed btrfs image (16 GB, a few GB used);
 - 2 CPUs and 2 GB of RAM are enough.
@@ -37,7 +37,7 @@ Build mdadm from upstream with the patch (as in [docs/install.md](../docs/instal
 
 ```sh
 git clone https://github.com/md-raid-utilities/mdadm.git && cd mdadm
-git checkout cd27b828
+git checkout 5542bf40
 git apply ../mdadm-amd/mdadm/mdadm-amd.patch
 make -j4 mdadm mdmon
 ```
@@ -56,9 +56,9 @@ images elsewhere; `ALLOW_MD=1` runs although md arrays are active. The output al
 and every check is written to the kernel log (`amd-test: ok …`), so `dmesg` shows which check the kernel
 messages belong to.
 
-The whole suite takes about 48 minutes in a VM with 2 vCPUs and 2 GB (Debian 13, kernel 6.12): `PART=1` 23
-minutes, `PART=2` 25; most of it is waiting for md (resync at chosen speeds, rebuilds stopped midway, the md
-bitmap daemon), not CPU. Without the AMD controller disks 504 checks run and three blocks (26 checks) are skipped.
+The whole suite takes about 48 minutes in a VM with 2 vCPUs and 2 GB (Debian 13, kernel 6.12), each of `PART=1`
+and `PART=2` about half of that; most of it is waiting for md (resync at chosen speeds, rebuilds stopped midway, the md
+bitmap daemon), not CPU. Without the AMD controller disks 519 checks run and three blocks (26 checks) are skipped.
 
 **After an interrupted run, reboot** (or stop the md arrays and detach the loop devices of `$WORKDIR` by hand):
 leftover arrays and loop devices of the suite's images make the next run fail or refuse to start.
@@ -108,6 +108,7 @@ about the X399 fixture (its dump has no LBA 0), printed by `-E` inside checks.
 | 34–36 | md bitmap placement, two broken Legacy records; rebuilds onto a late target; rebuilds mdmon did not record |
 | 37, 38 | the loser of two `-C` at once; `-C -l1 -n1 --force` makes a RAIDABLE as the BIOS menu |
 | 39 | the AMD udev rule: a disk with md 0.90 on its last partition, last-resort start on "unsafe" (LIO, systemd) |
+| 40 | XFS, btrfs, LUKS or LVM on a whole disk: `-C` reports it and asks, `--add` to a container refuses it (`xfsprogs`, `cryptsetup`, `lvm2`; skipped without them) |
 
 Fixtures and where they come from: [fixtures/README.md](fixtures/README.md). `helpers/` has the scripts that
 forge metadata with valid checksums for some stages; `../tools/amdraid_dump.py` parses it.

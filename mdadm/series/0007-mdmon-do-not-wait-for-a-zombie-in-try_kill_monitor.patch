@@ -1,7 +1,7 @@
-From d02f734839343caeb082275a888913cdb52a98c9 Mon Sep 17 00:00:00 2001
+From 6f6e3eafb46ffedae33f232a83df0de8c01ee615 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:00 +0500
-Subject: [PATCH 07/32] mdmon: do not wait for a zombie in try_kill_monitor()
+Date: Sat, 14 Nov 2026 01:33:49 +0500
+Subject: [PATCH 07/33] mdmon: do not wait for a zombie in try_kill_monitor()
 
 mdmon --takeover has the old mdmon exit, then pings it with SIGUSR1
 until kill() fails, for up to 5 s, before it starts its own manager.  In

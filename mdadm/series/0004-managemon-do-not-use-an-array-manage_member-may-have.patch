@@ -1,7 +1,7 @@
-From eb2caa9161afcbb1ffeecb30c24fcec6bd2b6634 Mon Sep 17 00:00:00 2001
+From 03b53780c65a95b0e2c70b7ca8f46f0a1370ccb6 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:55:55 +0500
-Subject: [PATCH 04/32] managemon: do not use an array manage_member() may have
+Date: Sat, 14 Nov 2026 01:33:44 +0500
+Subject: [PATCH 04/33] managemon: do not use an array manage_member() may have
  freed
 
 After manage_member(), manage() reads a->container to decide whether

@@ -1,7 +1,7 @@
-From 4a961527b851844254f8fbc52565194415f5f4b6 Mon Sep 17 00:00:00 2001
+From e27d4cf4d505872ceb51932cba32ef11abbae3f4 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:55:47 +0500
-Subject: [PATCH 01/32] Manage: pass force and verbose to Manage_remove() in
+Date: Sat, 14 Nov 2026 01:33:33 +0500
+Subject: [PATCH 01/33] Manage: pass force and verbose to Manage_remove() in
  their order
 
 Manage_remove() takes force before verbose, but Manage_subdevs() has
@@ -37,7 +37,7 @@ index 53eb1239..83ce1e1d 100644
  			close_fd(&sysfd);
  
 
-base-commit: cd27b828deb70abb3edb862ba8ddc8b905866a2e
+base-commit: 5542bf40fab20f09ce3be80ae1cb42584e9fa2f7
 -- 
 2.47.3
 

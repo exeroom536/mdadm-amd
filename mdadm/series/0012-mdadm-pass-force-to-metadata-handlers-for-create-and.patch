@@ -1,7 +1,7 @@
-From 7b7a118a8747083c213f8060009eaf4e4ee76056 Mon Sep 17 00:00:00 2001
+From 827445af24cbe40e0eba9400e9b9e006c6edc7e4 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:08 +0500
-Subject: [PATCH 12/32] mdadm: pass --force to metadata handlers for --create
+Date: Sat, 14 Nov 2026 01:33:58 +0500
+Subject: [PATCH 12/33] mdadm: pass --force to metadata handlers for --create
  and --add
 
 A metadata handler may refuse a disk it could use, e.g. one behind a
@@ -20,7 +20,7 @@ Written by Claude Opus 5.5, an AI model by Anthropic.
  3 files changed, 13 insertions(+)
 
 diff --git a/Create.c b/Create.c
-index 6bcdcccd..b20d1fe1 100644
+index 2dc27d0a..ab4ca211 100644
 --- a/Create.c
 +++ b/Create.c
 @@ -677,6 +677,13 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
@@ -58,10 +58,10 @@ index 55a1ecc2..f5df90b1 100644
  			goto unlock;
  	} else {
 diff --git a/mdadm.h b/mdadm.h
-index da05c8bd..ae162729 100644
+index 0f94fe2b..b6e6373c 100644
 --- a/mdadm.h
 +++ b/mdadm.h
-@@ -1302,6 +1302,10 @@ struct supertype {
+@@ -1304,6 +1304,10 @@ struct supertype {
  				 Used when examining metadata to display content of disk
  				 when user has no hw/firmare compatible system.
  			      */

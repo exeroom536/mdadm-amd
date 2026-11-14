@@ -1,7 +1,7 @@
-From af071d91baee8d988876cf604a68b773bd8f6dc6 Mon Sep 17 00:00:00 2001
+From a1e13b16b11bd37e51228fc3314e8860b6a93ac1 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:57:14 +0500
-Subject: [PATCH 31/32] super-amd: keep an md write-intent bitmap of RAID1,
+Date: Sat, 14 Nov 2026 01:35:23 +0500
+Subject: [PATCH 32/33] super-amd: keep an md write-intent bitmap of RAID1,
  RAID10 and RAID5
 
 The AMD write-intent bitmap is coarse - 4096 bits for the volume, 8 GiB
@@ -55,7 +55,7 @@ Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
  1 file changed, 996 insertions(+), 4 deletions(-)
 
 diff --git a/super-amd.c b/super-amd.c
-index 98d8c3e6..133b896b 100644
+index 5e437818..b0cb2764 100644
 --- a/super-amd.c
 +++ b/super-amd.c
 @@ -479,6 +479,12 @@ struct amd_vol_mon {
@@ -735,7 +735,7 @@ index 98d8c3e6..133b896b 100644
  	for (i = 0; i < v->nel; i++) {
  		struct amd_element *el = &v->el[i];
  		__u64 id = __le64_to_cpu(el->id.id);
-@@ -5979,6 +6609,31 @@ static int amd_init_volume(struct amd_super *super, mdu_array_info_t *info,
+@@ -5980,6 +6610,31 @@ static int amd_init_volume(struct amd_super *super, mdu_array_info_t *info,
  	return 1;
  }
  
@@ -767,7 +767,7 @@ index 98d8c3e6..133b896b 100644
  /*
   * @name fits a volume's DevicePrivate - 1 to 31 characters and the NUL - and
   * no volume but @vol (-1: a new one) has it: two of a name are assembled as
-@@ -6055,9 +6710,51 @@ static int init_super_amd(struct supertype *st, mdu_array_info_t *info,
+@@ -6056,9 +6711,51 @@ static int init_super_amd(struct supertype *st, mdu_array_info_t *info,
  		pr_err("cannot lay out the new AMD RAID volume\n");
  		return 0;
  	}
@@ -819,7 +819,7 @@ index 98d8c3e6..133b896b 100644
  /* end of the last section of the packet (PD, LD, 25BE, 25BF) */
  static unsigned int amd_sections_end(const struct amd_packet_header *h)
  {
-@@ -6939,6 +7636,15 @@ static int write_init_super_amd(struct supertype *st)
+@@ -6940,6 +7637,15 @@ static int write_init_super_amd(struct supertype *st)
  		 */
  		if (rv == 0)
  			amd_label_members(super, v);
@@ -835,7 +835,7 @@ index 98d8c3e6..133b896b 100644
  		super->new_vol = -1;
  		super->add_slot = -1;
  		super->npick = 0;
-@@ -7265,6 +7971,49 @@ static unsigned long long amd_md_writes(struct active_array *a)
+@@ -7266,6 +7972,49 @@ static unsigned long long amd_md_writes(struct active_array *a)
  	return n[6] + n[13];
  }
  
@@ -885,7 +885,7 @@ index 98d8c3e6..133b896b 100644
  /*
   * The target of the transform recorded for @v (amd_rebuild_slot) is not in
   * md: the volume was started without its disk (-I waits for it, -R and
-@@ -7316,6 +8065,11 @@ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
+@@ -7317,6 +8066,11 @@ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
  	v->mon.members_checked = 0;
  	v->mon.trim_gran = 0;	/* md starts it with the kernel's limits */
  	v->mon.md_writes = amd_md_writes(a);
@@ -897,7 +897,7 @@ index 98d8c3e6..133b896b 100644
  	a->info.container_member = inst;
  
  	/* a recorded rebuild that container_content handed to md goes on */
-@@ -8117,6 +8871,53 @@ static int amd_subarray_recorded(struct amd_super *super, const void *arg)
+@@ -8118,6 +8872,53 @@ static int amd_subarray_recorded(struct amd_super *super, const void *arg)
  		memcmp(v->ld->name, u->name, sizeof(v->ld->name)) == 0);
  }
  
@@ -951,7 +951,7 @@ index 98d8c3e6..133b896b 100644
  static int update_subarray_amd(struct supertype *st, char *subarray,
  			       enum update_opt update, struct mddev_ident *ident)
  {
-@@ -8152,6 +8953,9 @@ static int update_subarray_amd(struct supertype *st, char *subarray,
+@@ -8153,6 +8954,9 @@ static int update_subarray_amd(struct supertype *st, char *subarray,
  		u.rename = 1;
  		memcpy(u.name, ident->name, strlen(ident->name) + 1);
  		break;
@@ -961,7 +961,7 @@ index 98d8c3e6..133b896b 100644
  	default:
  		pr_err("--update=%s is not supported for an AMD RAID volume\n",
  		       map_num_s(update_options, update));
-@@ -8776,6 +9580,86 @@ static int amd_sync_rebuilds(struct amd_super *super)
+@@ -8777,6 +9581,86 @@ static int amd_sync_rebuilds(struct amd_super *super)
  	return again;
  }
  
@@ -1048,7 +1048,7 @@ index 98d8c3e6..133b896b 100644
  /* The write-intent bitmaps of the managed volumes, as md has them */
  static void amd_sync_bitmaps(struct amd_super *super)
  {
-@@ -8833,6 +9717,7 @@ static void amd_sync_metadata(struct supertype *st)
+@@ -8834,6 +9718,7 @@ static void amd_sync_metadata(struct supertype *st)
  	amd_flush_config(st);
  	amd_catch_up(super);
  	amd_sync_bitmaps(super);
@@ -1056,7 +1056,7 @@ index 98d8c3e6..133b896b 100644
  	if (again)
  		amd_sync_metadata(st);
  }
-@@ -9921,13 +10806,44 @@ out:
+@@ -9922,13 +10807,44 @@ out:
  	return rv;
  }
  
@@ -1102,7 +1102,7 @@ index 98d8c3e6..133b896b 100644
   * The target of a recorded rebuild too is copied from 0, as IMSM copies
   * any disk it adds to a running array: md may write without it until the
   * slot is set, and the mark of its log would skip that (amd_spare_update
-@@ -9937,7 +10853,7 @@ out:
+@@ -9938,7 +10854,7 @@ out:
   * allocated before the lock (amd_mm_activate_spare).
   */
  static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
@@ -1111,7 +1111,7 @@ index 98d8c3e6..133b896b 100644
  {
  	struct amd_super *super = a->container->sb;
  	struct amd_vol *v = amd_active_vol(a);
-@@ -9973,6 +10889,29 @@ static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
+@@ -9974,6 +10890,29 @@ static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
  	}
  	if (!d)
  		return 0;
@@ -1141,7 +1141,7 @@ index 98d8c3e6..133b896b 100644
  
  	di->disk.number = slot;
  	di->disk.raid_disk = slot;
-@@ -10117,6 +11056,46 @@ static void amd_unlock(struct amd_super *super)
+@@ -10118,6 +11057,46 @@ static void amd_unlock(struct amd_super *super)
  	__atomic_clear(&super->busy, __ATOMIC_RELEASE);
  }
  
@@ -1188,7 +1188,7 @@ index 98d8c3e6..133b896b 100644
  /*
   * managemon: the monitor allocates no memory.  Memory is managemon's to
   * allocate ("things which might block such as memory allocation",
-@@ -10221,15 +11200,26 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
+@@ -10222,15 +11201,26 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
  	struct metadata_update *mu;
  	struct amd_vol *v;
  	unsigned int len;
@@ -1217,7 +1217,7 @@ index 98d8c3e6..133b896b 100644
  	fd = amd_dev_open(di->disk.major, di->disk.minor, O_RDONLY);
  	u->features = amd_pd_features(fd, di->disk.major, di->disk.minor);
  	close_fd(&fd);
-@@ -10316,6 +11306,8 @@ struct superswitch super_amd = {
+@@ -10317,6 +11307,8 @@ struct superswitch super_amd = {
  	.container_content = container_content_amd,
  	.reshape_super	= reshape_super_amd,
  	.manage_reshape	= manage_reshape_amd,

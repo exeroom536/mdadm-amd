@@ -24,12 +24,15 @@ NVMe arrays on real hardware.
 | AlmaLinux 9 | — | builds without warnings; not run |
 | openSUSE Leap 15.6 | — | does not build: gcc 7 rejects upstream mdadm code (`platform-intel.h`) |
 
-Every row uses mdadm at commit `cd27b828` with `mdadm/mdadm-amd.patch` as it was on the day of the test. In
+Every row uses mdadm at commit `cd27b828` with `mdadm/mdadm-amd.patch` as it was on the day of the test (mdadm-amd
+1.0); for 1.1 (upstream `5542bf40`) only the CachyOS hardware and the test suites below were run again. In
 emulation each system booted from an NVMe RAID1 made by this mdadm, also with a disk missing and with the disk
 coming back (rebuilt into its slot), with no SELinux or AppArmor denials; boot loader systemd-boot.
 
 ## Hardware
 
+- 1.1, kernel 7.3.4: `md-bitmap-ext-dkms` built from its 7.3.4 base; RAID1 volumes on the SSDs and on the HDDs
+  run with the md bitmap.
 - Volumes made in the BIOS menu (Volume, RAID0, RAID1, RAID10, RAID5) read by this mdadm; RAID0, RAID1, RAID10 and
   RAID5 run under it.
 - Volumes made by this mdadm (Volume, RAID0, RAID1, RAID10, RAID5) shown as Normal by the BIOS menu; Linux boots
@@ -80,6 +83,11 @@ The board's RAIDCoreDxe in QEMU with emulated AMD SATA and NVMe controllers:
   Windows ran without them. Initialization, rebuild and the RAIDABLE → RAID1 migration go on from the other one's
   mark both ways. Volumes with an md bitmap: the driver leaves its area alone; after Windows wrote a volume, `mdmon`
   does not trust the md bits.
+- **Windows driver** 9.5.0-00201 (in a VM): takes RAID0, RAID1, RAID10 and RAID5 volumes made by this mdadm with the
+  data intact, and the other way round (a RAID5 it made, data it wrote); a rebuild it started is finished by
+  `mdmon`; a member that fell behind during its rebuild is not taken back. After Linux crashed while writing, it
+  clears the AMD bitmap without checking the volume ([usage.md](usage.md#working-with-the-bios-and-windows));
+  9.3.3 checks the mirrors then, but not RAID5 parity.
 - **Linux driver** rcraid (9.3.3-00302 and 9.3.2): takes the arrays made by this mdadm with the data intact; on a
   member failing, missing at start and coming back, it and `mdmon` pick the same spares and placements. A RAIDABLE →
   RAID1 migration started by one and interrupted is finished by the other. Interrupted rebuilds and
@@ -92,15 +100,17 @@ An ASRock X670E RAID0 of two NVMe drives (our dump) and an ASUS X399 RAID10 (pub
 ## Test suites
 
 - The test suite in [tests/](../tests/README.md), on loop devices with metadata of real disks and of the emulated
-  board: 530 checks, all pass — 504 on a plain VM, 26 more that need the emulated AMD controllers.
+  board: 545 checks, all pass on a VM with the emulated AMD controllers (1.1; for 1.0: 530 checks, 504 of them
+  also on a plain VM without the controllers).
 - The same suite with mdadm and mdmon built with AddressSanitizer and UBSan: no reports. A fuzzer on the metadata
-  parser: no crashes.
-- The upstream mdadm test suite (no regressions) and the upstream CI build matrix; no new compiler warnings on the distributions above
-  and on i686, s390x, powerpc and musl.
+  parser: no crashes. (Both for 1.0.)
+- The upstream mdadm test suite: no regressions (1.1: 67 pass, 0 fail, 1 skipped, the same as upstream `5542bf40`
+  alone). The upstream CI build matrix; no new compiler warnings on the distributions above and on i686, s390x,
+  powerpc and musl (for 1.0; for 1.1 each patch of the series builds with gcc and clang without new warnings).
 
 ## Not tested
 
-NVMe arrays on real hardware; booting from a degraded volume on real hardware; the md bitmap with the AMD drivers on real hardware; the
+NVMe arrays on real hardware; booting from a degraded volume on real hardware; the Windows driver 9.3.3-00329; the md bitmap with the AMD drivers on real hardware; the
 controller check refusing a disk on real hardware; distributions other than the test machine's on real hardware;
 GRUB with shim; openSUSE Leap and RHEL 9; other boards and BIOS versions.
 

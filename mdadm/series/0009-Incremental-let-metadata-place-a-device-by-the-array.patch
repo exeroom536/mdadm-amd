@@ -1,7 +1,7 @@
-From ba6efe679a21a00201d1ffae7f1d663f6d6bf0d8 Mon Sep 17 00:00:00 2001
+From 871e6d7a60332c79d31203dd3c76e92182233a7e Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:03 +0500
-Subject: [PATCH 09/32] Incremental: let metadata place a device by the arrays
+Date: Sat, 14 Nov 2026 01:33:53 +0500
+Subject: [PATCH 09/33] Incremental: let metadata place a device by the arrays
  assembled
 
 Incremental() picks the container for a device by the UUID that
@@ -32,7 +32,7 @@ Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
  1 file changed, 22 insertions(+)
 
 diff --git a/Incremental.c b/Incremental.c
-index 7a85cb90..b500b0bc 100644
+index 03adfa32..b669ad81 100644
 --- a/Incremental.c
 +++ b/Incremental.c
 @@ -281,6 +281,14 @@ int Incremental(struct mddev_dev *devlist, struct context *c,

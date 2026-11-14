@@ -1,7 +1,7 @@
-From 55602c6ff93ffcb688d68832d111da9ceaedaf93 Mon Sep 17 00:00:00 2001
+From c106e8f7144cffef151fa5265599205e48ee14e8 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:44 +0500
-Subject: [PATCH 21/32] drive_encryption: let nvme_identify_ioctl() read any
+Date: Sat, 14 Nov 2026 01:34:50 +0500
+Subject: [PATCH 22/33] drive_encryption: let nvme_identify_ioctl() read any
  Identify data
 
 nvme_identify_ioctl() reads only the Identify Controller data structure

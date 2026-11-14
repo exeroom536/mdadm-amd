@@ -1,7 +1,7 @@
-From 9718cdcfe9823e0e37ad88797f41728a03066f8e Mon Sep 17 00:00:00 2001
+From d74101a353e12b9737c4a5c8e447e6c7a5498763 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:56:30 +0500
-Subject: [PATCH 18/32] Grow: let metadata allow --raid-devices of a member
+Date: Sat, 14 Nov 2026 01:34:33 +0500
+Subject: [PATCH 19/33] Grow: let metadata allow --raid-devices of a member
  array
 
 Commit 20e114e334ed ("Grow: block -n on external volumes.") refused
@@ -29,10 +29,10 @@ Written by Claude Opus 5.5, an AI model by Anthropic.
  2 files changed, 31 insertions(+), 11 deletions(-)
 
 diff --git a/Grow.c b/Grow.c
-index d76dd1c9..51579021 100644
+index c49df9e5..a65a5e24 100644
 --- a/Grow.c
 +++ b/Grow.c
-@@ -1852,6 +1852,26 @@ error:
+@@ -1853,6 +1853,26 @@ error:
  	return 1;
  }
  
@@ -59,7 +59,7 @@ index d76dd1c9..51579021 100644
  int Grow_reshape(char *devname, int fd,
  		 struct mddev_dev *devlist,
  		 struct context *c, struct shape *s)
-@@ -1960,12 +1980,14 @@ int Grow_reshape(char *devname, int fd,
+@@ -1961,12 +1981,14 @@ int Grow_reshape(char *devname, int fd,
  			goto release;
  		}
  
@@ -75,7 +75,7 @@ index d76dd1c9..51579021 100644
  	}
  
  	added_disks = 0;
-@@ -2359,16 +2381,8 @@ size_change_error:
+@@ -2360,16 +2382,8 @@ size_change_error:
  	} else {
  		/* get spare devices from external metadata
  		 */
@@ -95,10 +95,10 @@ index d76dd1c9..51579021 100644
  		/* Impose these changes on a single array.  First
  		 * check that the metadata is OK with the change.
 diff --git a/mdadm.h b/mdadm.h
-index b3c68104..4cdc6a3a 100644
+index d5179112..b85e0f82 100644
 --- a/mdadm.h
 +++ b/mdadm.h
-@@ -1267,6 +1267,12 @@ extern struct superswitch {
+@@ -1269,6 +1269,12 @@ extern struct superswitch {
  
  	int swapuuid; /* true if uuid is bigending rather than hostendian */
  	int external;

@@ -1,20 +1,21 @@
-From 9e3dfd6a926846c98b09de5745e216946410d650 Mon Sep 17 00:00:00 2001
+From dfe89e1a9e9f75e1ba1c99caba934cccf1cf9f1f Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:57:02 +0500
-Subject: [PATCH 27/32] super-amd: add disks, delete and update volumes
+Date: Sat, 14 Nov 2026 01:35:09 +0500
+Subject: [PATCH 28/33] super-amd: add disks, delete and update volumes
 
 - --add to the container: a new disk becomes an AMD global hot spare,
   as the BIOS menu initializes and assigns one; a former member failed
   on errors is given back and rebuilt in its slot.  A disk with a
   partition table, a Legacy (non-RAID) disk, one the configuration has
   as a non-RAID disk, or a 64th disk (the packet has room for 64 device
-  records, the controller's among them) is refused; one with an ext2/3/4
-  or reiserfs file system or the volumes of another AMD configuration on
-  it is taken only with --force, as its ends are zeroed.  mdmon records
-  it, so it must run for the container: it does while a RAID1, RAID10,
-  RAID5 or RAIDABLE volume runs (not for RAID0 and Volume).  A disk with
-  a lower DeviceID than the others changes the container UUID: mdadm
-  says so and updates the map.
+  records, the controller's among them) is refused; one with a file
+  system or volume mdadm knows (ext2/3/4, reiserfs, XFS, btrfs, LUKS,
+  LVM2) or the volumes of another AMD configuration on it is taken only
+  with --force, as its ends are zeroed.  mdmon records it, so it must
+  run for the container: it does while a RAID1, RAID10, RAID5 or
+  RAIDABLE volume runs (not for RAID0 and Volume).  A disk with a lower
+  DeviceID than the others changes the container UUID: mdadm says so
+  and updates the map.
 - --kill-subarray: the volume is deleted as the AMD driver deletes one
   (its transform log cleared, its LD records gone, the data left on the
   disks); not while a later volume runs, which would be renumbered.
@@ -26,11 +27,11 @@ Subject: [PATCH 27/32] super-amd: add disks, delete and update volumes
 
 Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
 ---
- super-amd.c | 683 +++++++++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 672 insertions(+), 11 deletions(-)
+ super-amd.c | 684 +++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 673 insertions(+), 11 deletions(-)
 
 diff --git a/super-amd.c b/super-amd.c
-index d6451543..bd250f88 100644
+index d6451543..4fb12d04 100644
 --- a/super-amd.c
 +++ b/super-amd.c
 @@ -12,7 +12,9 @@
@@ -99,7 +100,7 @@ index d6451543..bd250f88 100644
  static int amd_erase(int fd);
  static int amd_in_volume(const struct amd_vol *v, __u64 id);
  static int amd_vol_has_disk(const struct amd_vol *v, __u64 id);
-@@ -4725,6 +4736,154 @@ static int amd_pick_disk(struct supertype *st, char *subdev, int whole,
+@@ -4725,6 +4736,155 @@ static int amd_pick_disk(struct supertype *st, char *subdev, int whole,
  	return 1;
  }
  
@@ -136,18 +137,19 @@ index d6451543..bd250f88 100644
 +/*
 + * mdadm --add of a disk that is not of this configuration: Initialize zeroes
 + * its first and last 20 MiB.  What mdadm can tell holds data is refused
-+ * unless --force, as Create asks before it goes on: a file system it knows
-+ * on the whole disk (check_ext2, check_reiser - they say what they found),
-+ * or a member of a volume of another AMD RAID configuration.  A volume of
-+ * @super is no reason: its member comes back (the AMD driver dropped the PD
-+ * of a disk it ran without).
++ * unless --force, as Create asks before it goes on: a file system or volume
++ * it knows on the whole disk (check_ext2, check_reiser, check_fs_magic -
++ * they say what they found), or a member of a volume of another AMD RAID
++ * configuration.  A volume of @super is no reason: its member comes back
++ * (the AMD driver dropped the PD of a disk it ran without).
 + */
 +static int amd_add_holds_data(struct amd_super *super, int fd, char *subdev)
 +{
 +	struct amd_super *other;
 +	int vol, foreign = 0;
 +
-+	if (check_ext2(fd, subdev) | check_reiser(fd, subdev)) {
++	if (check_ext2(fd, subdev) | check_reiser(fd, subdev) |
++	    check_fs_magic(fd, subdev)) {
 +		cont_err("not adding %s: --force wipes it\n", subdev);
 +		return 1;
 +	}
@@ -254,7 +256,7 @@ index d6451543..bd250f88 100644
  /* map_update() frees the entry's path before copying the new one */
  static void amd_map_set_uuid(struct map_ent **map, struct map_ent *me,
  			     int uuid[4])
-@@ -4738,6 +4897,31 @@ static void amd_map_set_uuid(struct map_ent **map, struct map_ent *me,
+@@ -4738,6 +4898,31 @@ static void amd_map_set_uuid(struct map_ent **map, struct map_ent *me,
  	free(path);
  }
  
@@ -286,7 +288,7 @@ index d6451543..bd250f88 100644
  /*
   * Send the updates queued for mdmon and see that it has recorded them.  It
   * sends no answer, and an update that no longer fits its configuration -
-@@ -4775,6 +4959,87 @@ static int amd_mdmon_recorded(struct supertype *st,
+@@ -4775,6 +4960,87 @@ static int amd_mdmon_recorded(struct supertype *st,
  	return rv;
  }
  
@@ -374,7 +376,7 @@ index d6451543..bd250f88 100644
  /* the LD record with volume ID @id in the packet, any type; NULL if none */
  static struct amd_ld *amd_ld_by_id(struct amd_super *super, __u64 id)
  {
-@@ -4788,6 +5053,17 @@ static struct amd_ld *amd_ld_by_id(struct amd_super *super, __u64 id)
+@@ -4788,6 +5054,17 @@ static struct amd_ld *amd_ld_by_id(struct amd_super *super, __u64 id)
  	return NULL;
  }
  
@@ -392,7 +394,7 @@ index d6451543..bd250f88 100644
  /* @subdev can be a disk of the container: a whole disk, not in use */
  static int amd_validate_disk(struct supertype *st, char *subdev,
  			     unsigned long long *freesize, int verbose)
-@@ -4797,11 +5073,10 @@ static int amd_validate_disk(struct supertype *st, char *subdev,
+@@ -4797,11 +5074,10 @@ static int amd_validate_disk(struct supertype *st, char *subdev,
  	unsigned int sectsize;
  	int fd;
  
@@ -407,7 +409,7 @@ index d6451543..bd250f88 100644
  	fd = open(subdev, O_RDONLY | O_EXCL);
  	if (!is_fd_valid(fd)) {
  		if (verbose)
-@@ -5454,6 +5729,98 @@ static void amd_rebuild_pd(struct amd_super *super, struct amd_element *el,
+@@ -5454,6 +5730,98 @@ static void amd_rebuild_pd(struct amd_super *super, struct amd_element *el,
  		el->id.handle = super->pd[i]->id.handle;
  }
  
@@ -506,7 +508,7 @@ index d6451543..bd250f88 100644
  /*
   * A disk joins the running container (udev adds disks one at a time, or
   * mdadm --add): managemon calls add_to_super.  It only reads the disk's
-@@ -5545,8 +5912,20 @@ static void amd_attach_update(struct supertype *st,
+@@ -5545,8 +5913,20 @@ static void amd_attach_update(struct supertype *st,
  			     !amd_disk_in_volumes(super, u->id)))
  		goto refuse;
  	d = amd_find_disk(super, u->id);
@@ -529,7 +531,7 @@ index d6451543..bd250f88 100644
  		if (!d) {
  			d = rec;
  			rec = NULL;
-@@ -5648,9 +6027,16 @@ static int add_to_super_amd(struct supertype *st, mdu_disk_info_t *dinfo,
+@@ -5648,9 +6028,16 @@ static int add_to_super_amd(struct supertype *st, mdu_disk_info_t *dinfo,
  		super->add_slot = dinfo->raid_disk;
  		return 0;
  	}
@@ -547,7 +549,7 @@ index d6451543..bd250f88 100644
  	return 1;
  }
  
-@@ -5836,6 +6222,12 @@ static int amd_has_volume(struct amd_super *super, const void *id)
+@@ -5836,6 +6223,12 @@ static int amd_has_volume(struct amd_super *super, const void *id)
  	return amd_ld_by_id(super, *(const __u64 *)id) != NULL;
  }
  
@@ -560,7 +562,7 @@ index d6451543..bd250f88 100644
  /*
   * --create while mdmon runs the container: mdmon records new volume @v -
   * or not, if a rebuild it began meanwhile took an extent of it, as onto a
-@@ -6075,7 +6467,7 @@ static int store_super_amd(struct supertype *st, int fd)
+@@ -6075,7 +6468,7 @@ static int store_super_amd(struct supertype *st, int fd)
  	/* Kill() frees the loaded metadata before asking us to store it */
  	if (st->sb == NULL)
  		return amd_erase(fd);
@@ -569,7 +571,7 @@ index d6451543..bd250f88 100644
  	return 1;
  }
  
-@@ -6658,6 +7050,126 @@ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
+@@ -6658,6 +7051,126 @@ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
  	amd_reparse(super);
  }
  
@@ -696,7 +698,7 @@ index d6451543..bd250f88 100644
  /* the volume number of member array @devnm (its metadata_version: "/md127/1"), or -1 */
  static int amd_devnm_volume(struct amd_super *super, char *devnm)
  {
-@@ -6702,6 +7214,120 @@ static int amd_rebuilt_into(struct amd_super *super, const struct amd_disk *d)
+@@ -6702,6 +7215,120 @@ static int amd_rebuilt_into(struct amd_super *super, const struct amd_disk *d)
  	return vol;
  }
  
@@ -817,7 +819,7 @@ index d6451543..bd250f88 100644
  /* Cut @size bytes at offset @at out of the LD section of the packet. */
  static void amd_cut_ld(struct amd_super *super, unsigned int at,
  		       unsigned int size)
-@@ -6908,6 +7534,7 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
+@@ -6908,6 +7535,7 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
  static void amd_flush_config(struct supertype *st)
  {
  	struct amd_super *super = st->sb;
@@ -825,7 +827,7 @@ index d6451543..bd250f88 100644
  
  	if (!super->config_dirty)
  		return;
-@@ -6916,6 +7543,15 @@ static void amd_flush_config(struct supertype *st)
+@@ -6916,6 +7544,15 @@ static void amd_flush_config(struct supertype *st)
  		return;
  	}
  	super->config_dirty = 0;
@@ -841,7 +843,7 @@ index d6451543..bd250f88 100644
  }
  
  /*
-@@ -7156,7 +7792,10 @@ static const unsigned int amd_update_size[] = {
+@@ -7156,7 +7793,10 @@ static const unsigned int amd_update_size[] = {
  	[AMD_UPDATE_SPARE]	= sizeof(struct amd_update_spare),
  	[AMD_UPDATE_CREATE]	= sizeof(struct amd_update_create),
  	[AMD_UPDATE_REMOVE]	= sizeof(struct amd_update_disk),
@@ -852,7 +854,7 @@ index d6451543..bd250f88 100644
  };
  
  /*
-@@ -7180,7 +7819,10 @@ static int amd_update_type(const struct metadata_update *update)
+@@ -7180,7 +7820,10 @@ static int amd_update_type(const struct metadata_update *update)
  	return type;
  }
  
@@ -864,7 +866,7 @@ index d6451543..bd250f88 100644
  static int amd_prepare_update(struct supertype *st,
  			      struct metadata_update *update)
  {
-@@ -7191,6 +7833,13 @@ static int amd_prepare_update(struct supertype *st,
+@@ -7191,6 +7834,13 @@ static int amd_prepare_update(struct supertype *st,
  		/* the monitor allocates nothing (amd_mm_room): zeroes to clear with */
  		update->space = amd_alloc(AMD_SERVICE_BYTES);
  		break;
@@ -878,7 +880,7 @@ index d6451543..bd250f88 100644
  	default:
  		return 0;
  	}
-@@ -7380,9 +8029,19 @@ static void amd_process_update(struct supertype *st,
+@@ -7380,9 +8030,19 @@ static void amd_process_update(struct supertype *st,
  	case AMD_UPDATE_REMOVE:
  		amd_remove_disk(super, buf);
  		break;
@@ -898,7 +900,7 @@ index d6451543..bd250f88 100644
  		for (a = st->arrays; a; a = a->next)
  			a->check_degraded = 1;
  		break;
-@@ -8072,6 +8731,8 @@ struct superswitch super_amd = {
+@@ -8072,6 +8732,8 @@ struct superswitch super_amd = {
  	.write_init_super = write_init_super_amd,
  	.add_to_super	= add_to_super_amd,
  	.remove_from_super	= remove_from_super_amd,

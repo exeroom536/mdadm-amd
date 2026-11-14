@@ -1,5 +1,5 @@
 diff --git a/Assemble.c b/Assemble.c
-index 03dc5f3f..08a3f92b 100644
+index 65204dc6..68b69a96 100644
 --- a/Assemble.c
 +++ b/Assemble.c
 @@ -1380,7 +1380,7 @@ int Assemble(char *mddev, struct mddev_ident *ident,
@@ -153,7 +153,7 @@ index 03dc5f3f..08a3f92b 100644
  			break;
  		}
 diff --git a/Create.c b/Create.c
-index 6bcdcccd..19e51774 100644
+index 2dc27d0a..70255dd2 100644
 --- a/Create.c
 +++ b/Create.c
 @@ -49,6 +49,23 @@ static int round_size_and_verify(unsigned long long *size, int chunk)
@@ -202,9 +202,11 @@ index 6bcdcccd..19e51774 100644
  			if (!st->ss->validate_geometry(st, s->level, s->layout,
  						       s->raiddisks,
  						       &s->chunk, s->size*2,
-@@ -879,17 +904,20 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
+@@ -878,18 +903,22 @@ int Create(struct supertype *st, struct mddev_ident *ident, int subdevs,
+ 			}
  			warn |= check_ext2(fd, dname);
  			warn |= check_reiser(fd, dname);
++			warn |= check_fs_magic(fd, dname);
  			warn |= check_raid(fd, dname);
 -			if (strcmp(st->ss->name, "1.x") == 0 &&
 -			    st->minor_version >= 1)
@@ -229,10 +231,10 @@ index 6bcdcccd..19e51774 100644
  			    st->minor_version >= 1 &&
  			    did_default &&
 diff --git a/Grow.c b/Grow.c
-index d76dd1c9..14c415ee 100644
+index c49df9e5..0609d45c 100644
 --- a/Grow.c
 +++ b/Grow.c
-@@ -1852,6 +1852,26 @@ error:
+@@ -1853,6 +1853,26 @@ error:
  	return 1;
  }
  
@@ -259,7 +261,7 @@ index d76dd1c9..14c415ee 100644
  int Grow_reshape(char *devname, int fd,
  		 struct mddev_dev *devlist,
  		 struct context *c, struct shape *s)
-@@ -1960,12 +1980,14 @@ int Grow_reshape(char *devname, int fd,
+@@ -1961,12 +1981,14 @@ int Grow_reshape(char *devname, int fd,
  			goto release;
  		}
  
@@ -275,7 +277,7 @@ index d76dd1c9..14c415ee 100644
  	}
  
  	added_disks = 0;
-@@ -2359,16 +2381,8 @@ size_change_error:
+@@ -2360,16 +2382,8 @@ size_change_error:
  	} else {
  		/* get spare devices from external metadata
  		 */
@@ -294,7 +296,7 @@ index d76dd1c9..14c415ee 100644
  
  		/* Impose these changes on a single array.  First
  		 * check that the metadata is OK with the change.
-@@ -3344,6 +3358,16 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3345,6 +3359,16 @@ static int reshape_array(char *container, int fd, char *devname,
  		    array.raid_disks !=
  		    (info->array.raid_disks + info->delta_disks)) {
  			array.raid_disks += info->delta_disks;
@@ -312,7 +314,7 @@ index d76dd1c9..14c415ee 100644
  				pr_err("failed to set raid disks\n");
  				goto release;
 diff --git a/Incremental.c b/Incremental.c
-index dbcc1b8f..b500b0bc 100644
+index 5a1f8ebe..b669ad81 100644
 --- a/Incremental.c
 +++ b/Incremental.c
 @@ -281,6 +281,14 @@ int Incremental(struct mddev_dev *devlist, struct context *c,
@@ -361,7 +363,7 @@ index dbcc1b8f..b500b0bc 100644
  		if (!rv)
  			rv = Incremental_container(st, chosen_name, c, NULL);
  		map_unlock(&map);
-@@ -1631,6 +1660,19 @@ static int Incremental_container(struct supertype *st, char *devname,
+@@ -1635,6 +1664,19 @@ static int Incremental_container(struct supertype *st, char *devname,
  			close_fd(&mdfd);
  			continue;
  		}
@@ -382,7 +384,7 @@ index dbcc1b8f..b500b0bc 100644
  		assemble_container_content(st, mdfd, ra, c,
  					   chosen_name, &result);
 diff --git a/Makefile b/Makefile
-index 8fe2d66d..67d9aeab 100644
+index 40fb3b9c..93f7716c 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -182,7 +182,7 @@ OBJS = mdadm.o config.o policy.o mdstat.o  ReadMe.o uuid.o util.o maps.o lib.o u
@@ -942,7 +944,7 @@ index 69434e2c..28695805 100644
  .B path=
  file glob matching anything from
 diff --git a/mdadm.h b/mdadm.h
-index da05c8bd..05360106 100644
+index 0f94fe2b..544e450b 100644
 --- a/mdadm.h
 +++ b/mdadm.h
 @@ -496,6 +496,10 @@ enum update_opt {
@@ -956,7 +958,7 @@ index da05c8bd..05360106 100644
  	UOPT_SUBARRAY_ONLY,
  	UOPT_SPARC22,
  	UOPT_SUPER_MINOR,
-@@ -1168,6 +1172,22 @@ extern struct superswitch {
+@@ -1170,6 +1174,22 @@ extern struct superswitch {
  	 */
  	int (*update_subarray)(struct supertype *st, char *subarray,
  			       enum update_opt update, struct mddev_ident *ident);
@@ -979,7 +981,7 @@ index da05c8bd..05360106 100644
  	/* Check if reshape is supported for this external format.
  	 * st is obtained from super_by_fd() where st->subarray[0] is
  	 * initialized to indicate if reshape is being performed at the
-@@ -1251,11 +1271,17 @@ extern struct superswitch {
+@@ -1253,11 +1273,17 @@ extern struct superswitch {
  
  	int swapuuid; /* true if uuid is bigending rather than hostendian */
  	int external;
@@ -998,7 +1000,7 @@ index da05c8bd..05360106 100644
  extern struct superswitch mbr, gpt;
  
  void imsm_set_no_platform(int v);
-@@ -1302,6 +1328,13 @@ struct supertype {
+@@ -1304,6 +1330,13 @@ struct supertype {
  				 Used when examining metadata to display content of disk
  				 when user has no hw/firmare compatible system.
  			      */
@@ -1012,6 +1014,14 @@ index da05c8bd..05360106 100644
  	struct metadata_update *updates;
  	struct metadata_update **update_tail;
  
+@@ -1534,6 +1567,7 @@ extern int parse_num(int *dest, const char *num);
+ extern int parse_cluster_confirm_arg(char *inp, char **devname, int *slot);
+ extern bool check_ext2(int fd, char *name);
+ extern int check_reiser(int fd, char *name);
++extern bool check_fs_magic(int fd, char *name);
+ extern int check_raid(int fd, char *name);
+ extern int check_partitions(int fd, char *dname,
+ 			    unsigned long long freesize,
 diff --git a/mdmon.c b/mdmon.c
 index 037602ab..aa047591 100644
 --- a/mdmon.c
@@ -1169,10 +1179,10 @@ index f92a9a11..af1a26b8 100644
  int devpath_to_char(const char *dev_path, const char *entry, char *buf,
 diff --git a/super-amd.c b/super-amd.c
 new file mode 100644
-index 00000000..133b896b
+index 00000000..b0cb2764
 --- /dev/null
 +++ b/super-amd.c
-@@ -0,0 +1,11324 @@
+@@ -0,0 +1,11325 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * mdadm - support for AMD RAIDXpert2 ("RAIDCore") metadata.
@@ -6948,18 +6958,19 @@ index 00000000..133b896b
 +/*
 + * mdadm --add of a disk that is not of this configuration: Initialize zeroes
 + * its first and last 20 MiB.  What mdadm can tell holds data is refused
-+ * unless --force, as Create asks before it goes on: a file system it knows
-+ * on the whole disk (check_ext2, check_reiser - they say what they found),
-+ * or a member of a volume of another AMD RAID configuration.  A volume of
-+ * @super is no reason: its member comes back (the AMD driver dropped the PD
-+ * of a disk it ran without).
++ * unless --force, as Create asks before it goes on: a file system or volume
++ * it knows on the whole disk (check_ext2, check_reiser, check_fs_magic -
++ * they say what they found), or a member of a volume of another AMD RAID
++ * configuration.  A volume of @super is no reason: its member comes back
++ * (the AMD driver dropped the PD of a disk it ran without).
 + */
 +static int amd_add_holds_data(struct amd_super *super, int fd, char *subdev)
 +{
 +	struct amd_super *other;
 +	int vol, foreign = 0;
 +
-+	if (check_ext2(fd, subdev) | check_reiser(fd, subdev)) {
++	if (check_ext2(fd, subdev) | check_reiser(fd, subdev) |
++	    check_fs_magic(fd, subdev)) {
 +		cont_err("not adding %s: --force wipes it\n", subdev);
 +		return 1;
 +	}
@@ -12498,10 +12509,10 @@ index 00000000..133b896b
 +	.activate_spare	= amd_mm_activate_spare,
 +};
 diff --git a/sysfs.c b/sysfs.c
-index 96bfd5a7..b10ff3f9 100644
+index 8fca3c01..2597fb02 100644
 --- a/sysfs.c
 +++ b/sysfs.c
-@@ -829,7 +829,8 @@ int sysfs_set_array(struct mdinfo *info)
+@@ -987,7 +987,8 @@ int sysfs_set_array(struct mdinfo *info)
  			return 1;
  		}
  	}
@@ -12512,10 +12523,64 @@ index 96bfd5a7..b10ff3f9 100644
  	rv |= sysfs_set_str(info, NULL, "level",
  			    map_num_s(pers, info->array.level));
 diff --git a/util.c b/util.c
-index d5405548..19bb8cda 100644
+index d5405548..1b1a0e4f 100644
 --- a/util.c
 +++ b/util.c
-@@ -1225,7 +1225,7 @@ void wait_for(char *dev, int fd)
+@@ -662,6 +662,53 @@ int check_reiser(int fd, char *name)
+ 	return 1;
+ }
+ 
++/**
++ * check_fs_magic() - Check for a file system or volume mdadm would wipe.
++ * @fd: file descriptor of the device to check.
++ * @name: name of the device to check.
++ *
++ * What check_ext2() and check_reiser() do not see: XFS ("XFSB" at 0),
++ * btrfs ("_BHRfS_M" at 64K + 0x40), LUKS ("LUKS\xba\xbe" at 0) and an LVM2
++ * physical volume (label "LABELONE" of type "LVM2 001" at the start of one
++ * of the first four 512-byte sectors) - the magic numbers of their on-disk
++ * formats, as libblkid knows them.
++ *
++ * Return: true if one is found (and reported).
++ */
++bool check_fs_magic(int fd, char *name)
++{
++	static const struct {
++		const char *what;
++		off_t offset;
++		const char *magic;
++	} magics[] = {
++		{ "an XFS file system", 0, "XFSB" },
++		{ "a btrfs file system", 0x10040, "_BHRfS_M" },
++		{ "a LUKS encrypted volume", 0, "LUKS\xba\xbe" },
++	};
++	char buf[512];
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(magics); i++) {
++		size_t len = strlen(magics[i].magic);
++
++		if (pread(fd, buf, len, magics[i].offset) != (ssize_t)len ||
++		    memcmp(buf, magics[i].magic, len) != 0)
++			continue;
++		pr_info("%s appears to contain %s\n", name, magics[i].what);
++		return true;
++	}
++	for (i = 0; i < 4; i++) {
++		if (pread(fd, buf, sizeof(buf), i * 512) != sizeof(buf) ||
++		    memcmp(buf, "LABELONE", 8) != 0 ||
++		    memcmp(buf + 24, "LVM2 001", 8) != 0)
++			continue;
++		pr_info("%s appears to be an LVM physical volume\n", name);
++		return true;
++	}
++	return false;
++}
++
+ int check_raid(int fd, char *name)
+ {
+ 	struct mdinfo info;
+@@ -1225,7 +1272,7 @@ void wait_for(char *dev, int fd)
  struct superswitch *superlist[] =
  {
  	&super0, &super1,

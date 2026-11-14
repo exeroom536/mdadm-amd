@@ -1,7 +1,7 @@
-From 538552322e6e1a590b0e4270ec56c7daf05265e9 Mon Sep 17 00:00:00 2001
+From 641867f64894eb748dbcb7dcd3221440f511ced0 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Fri, 13 Nov 2026 06:57:11 +0500
-Subject: [PATCH 30/32] super-amd: grow a RAIDABLE volume into a RAID1
+Date: Sat, 14 Nov 2026 01:35:20 +0500
+Subject: [PATCH 31/33] super-amd: grow a RAIDABLE volume into a RAID1
 
 RAIDABLE is a volume of one disk kept for a future mirror; the AMD
 driver makes it a RAID1 by a migration.  With subarray_raid_disks:
@@ -26,7 +26,7 @@ Written by Claude Opus 5.5, an AI model by Anthropic.
  1 file changed, 404 insertions(+), 36 deletions(-)
 
 diff --git a/super-amd.c b/super-amd.c
-index a17dac8f..98d8c3e6 100644
+index e9f16c8f..5e437818 100644
 --- a/super-amd.c
 +++ b/super-amd.c
 @@ -130,8 +130,12 @@
@@ -296,7 +296,7 @@ index a17dac8f..98d8c3e6 100644
  	for (i = 0; i < v->nel; i++) {
  		struct amd_element *el = &v->el[i];
  		__u64 id = __le64_to_cpu(el->id.id);
-@@ -7241,8 +7345,8 @@ static void amd_mark_missing(struct active_array *a, struct amd_vol *v);
+@@ -7242,8 +7346,8 @@ static void amd_mark_missing(struct active_array *a, struct amd_vol *v);
  
  /*
   * Back to the start packet of the transform recorded for @v: nothing of it
@@ -307,7 +307,7 @@ index a17dac8f..98d8c3e6 100644
   */
  static void amd_transform_rewind(struct amd_super *super, struct amd_vol *v)
  {
-@@ -7255,7 +7359,13 @@ static void amd_transform_rewind(struct amd_super *super, struct amd_vol *v)
+@@ -7256,7 +7360,13 @@ static void amd_transform_rewind(struct amd_super *super, struct amd_vol *v)
  	ld->transform_protect_size = __cpu_to_le32(amd_protect_size(v));
  	ld->flags = (ld->flags & ~__cpu_to_le32(AMD_LDF_TRANSFORM)) |
  		    __cpu_to_le32(AMD_LDF_RESTORE_SRC);
@@ -322,7 +322,7 @@ index a17dac8f..98d8c3e6 100644
  	super->config_dirty = 1;
  }
  
-@@ -7456,8 +7566,8 @@ static int amd_fail_element(struct amd_super *super, struct amd_vol *v, int n,
+@@ -7457,8 +7567,8 @@ static int amd_fail_element(struct amd_super *super, struct amd_vol *v, int n,
  	if (flags & AMD_ELEMENT_FAILED)
  		return 0;
  	el->flags = __cpu_to_le32(flags | mark);
@@ -333,7 +333,7 @@ index a17dac8f..98d8c3e6 100644
  		el = &amd_link_elements(v)[n];
  		el->flags |= __cpu_to_le32(mark);
  		v->link->state = __cpu_to_le32(amd_volume_state(super, v));
-@@ -7508,6 +7618,7 @@ static void amd_set_disk(struct active_array *a, int n, int state)
+@@ -7509,6 +7619,7 @@ static void amd_set_disk(struct active_array *a, int n, int state)
  		}
  		return;
  	}
@@ -341,7 +341,7 @@ index a17dac8f..98d8c3e6 100644
  	if (n >= v->nel || !(state & DS_FAULTY))
  		return;
  	d = amd_find_disk(super, __le64_to_cpu(v->el[n].id.id));
-@@ -7654,7 +7765,9 @@ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
+@@ -7655,7 +7766,9 @@ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
  			      __u32 tstate)
  {
  	struct amd_vol *v = &super->vol[vol];
@@ -352,7 +352,7 @@ index a17dac8f..98d8c3e6 100644
  
  	super->config_dirty = 1;
  	ld->transform_type = 0;
-@@ -7837,6 +7950,118 @@ static int amd_rebuilt_into(struct amd_super *super, const struct amd_disk *d)
+@@ -7838,6 +7951,118 @@ static int amd_rebuilt_into(struct amd_super *super, const struct amd_disk *d)
  	return vol;
  }
  
@@ -471,7 +471,7 @@ index a17dac8f..98d8c3e6 100644
  /*
   * mdadm --update-subarray: the AMD driver's cache policy of a volume (LD
   * Cache: read-ahead, write back - what the menu and RAIDXpert2 set, used by
-@@ -7991,6 +8216,44 @@ static void amd_finish_init(struct amd_super *super, int vol)
+@@ -7992,6 +8217,44 @@ static void amd_finish_init(struct amd_super *super, int vol)
  			  AMD_TRANSFORM_COMPLETED);
  }
  
@@ -516,7 +516,7 @@ index a17dac8f..98d8c3e6 100644
  /*
   * Record a finished rebuild the way the AMD driver ends RESTORE_SEGMENTS
   * (the ring of an X399 RAID10): the spare's element takes the slot with
-@@ -8000,7 +8263,8 @@ static void amd_finish_init(struct amd_super *super, int vol)
+@@ -8001,7 +8264,8 @@ static void amd_finish_init(struct amd_super *super, int vol)
   * unassigns the spare (rcblob RC_DeassignPhysicalDeviceGlobalSpare,
   * rcraid.sys FUN_1400652d0).
   * An initialization still pending stays so, with the new member in both
@@ -526,7 +526,7 @@ index a17dac8f..98d8c3e6 100644
   */
  static void amd_finish_rebuild(struct amd_super *super, int vol)
  {
-@@ -8009,6 +8273,8 @@ static void amd_finish_rebuild(struct amd_super *super, int vol)
+@@ -8010,6 +8274,8 @@ static void amd_finish_rebuild(struct amd_super *super, int vol)
  	struct amd_disk *d;
  	__u32 state;
  
@@ -535,7 +535,7 @@ index a17dac8f..98d8c3e6 100644
  	/* a dedicated spare whose start was not recorded leaves the list now */
  	amd_drop_dedicated(super, vol, __le64_to_cpu(v->mon.rebuild_el.id.id));
  	ld = v->ld;
-@@ -8018,6 +8284,23 @@ static void amd_finish_rebuild(struct amd_super *super, int vol)
+@@ -8019,6 +8285,23 @@ static void amd_finish_rebuild(struct amd_super *super, int vol)
  		d->rejoin = 1;
  	v->mon.rebuilding = 0;
  	v->mon.rebuild_done = 0;
@@ -559,7 +559,7 @@ index a17dac8f..98d8c3e6 100644
  	super->config_dirty = 1;
  	v->el[v->mon.rebuild_slot] = v->mon.rebuild_el;
  	if (v->link && amd_same_geometry(ld, v->link))
-@@ -8095,7 +8378,10 @@ static int amd_drop_dedicated(struct amd_super *super, int vol, __u64 id)
+@@ -8096,7 +8379,10 @@ static int amd_drop_dedicated(struct amd_super *super, int vol, __u64 id)
   * The LD a rebuild of @v goes into, *@size bytes: a copy of its LD without
   * the dedicated spares (as the menu writes the second copy), the spare in
   * the slot, failed members marked 0x8000 too (the ring of an X399
@@ -571,7 +571,7 @@ index a17dac8f..98d8c3e6 100644
   * Made in ldbuf, as large as managemon has made it (amd_mm_activate_spare):
   * NULL if it does not fit.
   */
-@@ -8103,13 +8389,14 @@ static struct amd_ld *amd_rebuild_ld(struct amd_super *super,
+@@ -8104,13 +8390,14 @@ static struct amd_ld *amd_rebuild_ld(struct amd_super *super,
  				     struct amd_vol *v, unsigned int *size)
  {
  	struct amd_ld *ld = v->ld, *t;
@@ -587,7 +587,7 @@ index a17dac8f..98d8c3e6 100644
  	if (*size > super->ldbuf_room)
  		return NULL;
  	t = super->ldbuf;
-@@ -8119,6 +8406,15 @@ static struct amd_ld *amd_rebuild_ld(struct amd_super *super,
+@@ -8120,6 +8407,15 @@ static struct amd_ld *amd_rebuild_ld(struct amd_super *super,
  	t->packet_size = __cpu_to_le32(*size);
  	tel = amd_ld_elements(t);
  	tel[v->mon.rebuild_slot] = v->mon.rebuild_el;
@@ -603,7 +603,7 @@ index a17dac8f..98d8c3e6 100644
  	for (i = 0; i < v->nel; i++)
  		if (i != v->mon.rebuild_slot &&
  		    (__le32_to_cpu(tel[i].flags) & AMD_ELEMENT_FAILED))
-@@ -8132,7 +8428,10 @@ static struct amd_ld *amd_rebuild_ld(struct amd_super *super,
+@@ -8133,7 +8429,10 @@ static struct amd_ld *amd_rebuild_ld(struct amd_super *super,
   * then RESTORE_SEGMENTS in the LD and a second copy of it - the LD rebuilt
   * into, with the spare in the slot - in the next config packet.  Then a
   * reboot, into Linux or the AMD driver, goes on from the log instead of
@@ -615,7 +615,7 @@ index a17dac8f..98d8c3e6 100644
   * Without the log first the AMD driver would not go on with it at all.
   * 1: not yet - another transform is pending (an initialization), or the
   * log of one that has ended is still to be cleared: it is in the same
-@@ -8144,7 +8443,9 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
+@@ -8145,7 +8444,9 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
  	struct amd_ld *ld = v->ld;
  	unsigned int size = amd_ld_size(ld);
  	unsigned int at = (char *)ld - (char *)super->packet + size;
@@ -626,7 +626,7 @@ index a17dac8f..98d8c3e6 100644
  	__u32 protect = __cpu_to_le32(amd_protect_size(v));
  	struct amd_ld *t, saved;
  
-@@ -8157,13 +8458,21 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
+@@ -8158,13 +8459,21 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
  	if (!t)
  		return -1;
  	t->last_operation = op;
@@ -652,7 +652,7 @@ index a17dac8f..98d8c3e6 100644
  	if (amd_tlog_write(super, v, t, 0,
  			   amd_member_to_volume(v, v->mon.rebuild_ckpt),
  			   __le32_to_cpu(op)) != 0)
-@@ -8179,6 +8488,11 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
+@@ -8180,6 +8489,11 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
  	ld->transform_percent = 0;
  	ld->flags |= __cpu_to_le32(AMD_LDF_RESTORE_SRC);
  	ld->transform_link = __cpu_to_le32(1);
@@ -664,7 +664,7 @@ index a17dac8f..98d8c3e6 100644
  	/*
  	 * The packet only changes if the insertion succeeds - and the log
  	 * written above goes then (REB-B7): it would lie in the elements'
-@@ -8191,6 +8505,9 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
+@@ -8192,6 +8506,9 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
  	}
  	/* a dedicated spare taken leaves the volume's list (RC_SetupTransform) */
  	amd_drop_dedicated(super, vol, __le64_to_cpu(v->mon.rebuild_el.id.id));
@@ -674,7 +674,7 @@ index a17dac8f..98d8c3e6 100644
  	super->config_dirty = 1;
  	return 0;
  }
-@@ -8400,7 +8717,11 @@ static void amd_sync_transforms(struct amd_super *super)
+@@ -8401,7 +8718,11 @@ static void amd_sync_transforms(struct amd_super *super)
  	}
  }
  
@@ -687,7 +687,7 @@ index a17dac8f..98d8c3e6 100644
  static void amd_sync_ended_logs(struct amd_super *super)
  {
  	int vol;
-@@ -8409,8 +8730,10 @@ static void amd_sync_ended_logs(struct amd_super *super)
+@@ -8410,8 +8731,10 @@ static void amd_sync_ended_logs(struct amd_super *super)
  		struct amd_vol *v = &super->vol[vol];
  
  		if (v->mon.tlog_dirty == 2 &&
@@ -699,7 +699,7 @@ index a17dac8f..98d8c3e6 100644
  		}
  		if (v->mon.init_tlog == 2 && amd_tlog_write(super, v, v->ld, 1, 0, 0) == 0)
  			v->mon.init_tlog = 0;
-@@ -8421,29 +8744,36 @@ static void amd_sync_ended_logs(struct amd_super *super)
+@@ -8422,29 +8745,36 @@ static void amd_sync_ended_logs(struct amd_super *super)
   * The start of a rebuild, after amd_sync_ended_logs: its log goes where
   * the log of a transform that has just ended was (an initialization md finished
   * by this very recovery, as with a degraded volume started --force).
@@ -740,7 +740,7 @@ index a17dac8f..98d8c3e6 100644
  }
  
  /* The write-intent bitmaps of the managed volumes, as md has them */
-@@ -8477,6 +8807,7 @@ static void amd_sync_bitmaps(struct amd_super *super)
+@@ -8478,6 +8808,7 @@ static void amd_sync_bitmaps(struct amd_super *super)
  static void amd_sync_metadata(struct supertype *st)
  {
  	struct amd_super *super = st->sb;
@@ -748,7 +748,7 @@ index a17dac8f..98d8c3e6 100644
  
  	if (!super)
  		return;
-@@ -8498,10 +8829,12 @@ static void amd_sync_metadata(struct supertype *st)
+@@ -8499,10 +8830,12 @@ static void amd_sync_metadata(struct supertype *st)
  	}
  	amd_flush_config(st);
  	amd_sync_ended_logs(super);
@@ -762,7 +762,7 @@ index a17dac8f..98d8c3e6 100644
  }
  
  /* activate_spare -> process_update: md recovers @slot of @vol onto @el */
-@@ -8524,6 +8857,7 @@ static const unsigned int amd_update_size[] = {
+@@ -8525,6 +8858,7 @@ static const unsigned int amd_update_size[] = {
  	[AMD_UPDATE_KILL]	= sizeof(struct amd_update_disk),
  	[AMD_UPDATE_SUBARRAY]	= sizeof(struct amd_update_subarray),
  	[AMD_UPDATE_ROLE]	= sizeof(struct amd_update_role),
@@ -770,7 +770,7 @@ index a17dac8f..98d8c3e6 100644
  };
  
  /*
-@@ -8549,7 +8883,7 @@ static int amd_update_type(const struct metadata_update *update)
+@@ -8550,7 +8884,7 @@ static int amd_update_type(const struct metadata_update *update)
  
  /*
   * The updates mdadm sends (--create, --add, --kill-subarray,
@@ -779,7 +779,7 @@ index a17dac8f..98d8c3e6 100644
   */
  static int amd_prepare_update(struct supertype *st,
  			      struct metadata_update *update)
-@@ -8568,6 +8902,7 @@ static int amd_prepare_update(struct supertype *st,
+@@ -8569,6 +8903,7 @@ static int amd_prepare_update(struct supertype *st,
  	case AMD_UPDATE_KILL:
  	case AMD_UPDATE_SUBARRAY:
  	case AMD_UPDATE_ROLE:
@@ -787,7 +787,7 @@ index a17dac8f..98d8c3e6 100644
  		break;
  	default:
  		return 0;
-@@ -8777,6 +9112,9 @@ static void amd_process_update(struct supertype *st,
+@@ -8778,6 +9113,9 @@ static void amd_process_update(struct supertype *st,
  		for (a = st->arrays; a; a = a->next)
  			a->check_degraded = 1;
  		break;
@@ -797,7 +797,7 @@ index a17dac8f..98d8c3e6 100644
  	}
  }
  
-@@ -8889,6 +9227,28 @@ static struct amd_disk *amd_spare_disk(struct amd_super *super,
+@@ -8890,6 +9228,28 @@ static struct amd_disk *amd_spare_disk(struct amd_super *super,
  	return d && amd_disk_current(super, d) ? d : NULL;
  }
  
@@ -826,7 +826,7 @@ index a17dac8f..98d8c3e6 100644
  /*
   * PD @pd of disk @d (may be NULL) is an AMD RAID disk to rebuild onto: ONLINE,
   * or OFFLINE in the packet (failed, or away at the last write: the record
-@@ -9030,6 +9390,7 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
+@@ -9031,6 +9391,7 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
  	*recorded = 0;
  	if (amd_rebuild_slot(v) == slot)
  		d = amd_spare_target(super, v, slot, el, recorded);
@@ -834,7 +834,7 @@ index a17dac8f..98d8c3e6 100644
  	if (!d && slot < v->nel)
  		d = amd_spare_own(super, v, slot, el, recorded);
  	if (d)
-@@ -9225,6 +9586,8 @@ static const char *amd_dedicated_refusal(struct amd_super *super,
+@@ -9226,6 +9587,8 @@ static const char *amd_dedicated_refusal(struct amd_super *super,
  
  	if (v->blocked)
  		return v->blocked;
@@ -843,7 +843,7 @@ index a17dac8f..98d8c3e6 100644
  	if (v->single || (v->level != 1 && v->level != 5 && v->level != 10))
  		return "it has no redundancy (AMD gives dedicated spares to RAID1, RAID5 and RAID10 only)";
  	if (amd_in_volume(v, d->device_id))
-@@ -9593,7 +9956,9 @@ static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
+@@ -9594,7 +9957,9 @@ static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
  	/*
  	 * A slot md runs without: out of service, or its member missing - a
  	 * running volume takes no late member in sync; amd_mark_missing
@@ -854,7 +854,7 @@ index a17dac8f..98d8c3e6 100644
  	 */
  	for (slot = 0; slot < a->info.array.raid_disks && amd_md_slot(v, slot);
  	     slot++) {
-@@ -9949,7 +10314,10 @@ struct superswitch super_amd = {
+@@ -9950,7 +10315,10 @@ struct superswitch super_amd = {
  	.free_super	= free_super_amd,
  	.match_metadata_desc = match_metadata_desc_amd,
  	.container_content = container_content_amd,
