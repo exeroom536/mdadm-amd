@@ -23,6 +23,11 @@ done
 
 WK=${WORKDIR:-/var/tmp/mdadm-amd-tests}
 case "$WK" in *" "*) echo "WORKDIR must not contain spaces" >&2; exit 1 ;; esac
+# a run as root leaves files a user's run cannot remove
+if [ "$(id -u)" != 0 ] && [ -e "$WK" ] && [ -n "$(find "$WK" ! -user "$(id -u)" -print -quit 2>/dev/null)" ]; then
+	echo "$WK has files of another user (a run as root?): remove it (sudo rm -rf $WK) or set WORKDIR" >&2
+	exit 1
+fi
 export MDADM_DIR WK
 export IMG=$WK/images WQ=$WK/q TMPW=$WK/tmp
 export FIXT=$T/fixtures HLP=$T/helpers TOOLS=$R/tools X399=$R/test-data/x399-raid10-plaidpiper

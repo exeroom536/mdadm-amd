@@ -111,11 +111,9 @@ use under Windows; md itself does not cache. Names are at most 31 characters, an
   udev older than systemd 257, run `mdadm -If sdc` yourself after pulling the disk.
 - **A disk comes back:** a member that was missing is rebuilt into its own place on that disk. A disk that failed
   on I/O errors waits for you, as with the AMD driver: `--remove` it, then `--add` it.
-- **Booting with a disk missing:** the volume that holds the root file system starts degraded after about 30
-  seconds (the last-resort timer, as for native md). Another volume on the same disks is not started then: start it
-  with `mdadm --run` on the container (the `super external:amd` line of `/proc/mdstat`, for example
-  `mdadm --run /dev/md127`). At the first boot after the disk is back such a volume stays `inactive` until the same
-  command; left alone, it starts whole at a boot after the root volume's rebuild has finished.
+- **Booting with a disk missing:** the volumes start degraded after about 30 seconds (mdadm's last-resort timer, as
+  for native md): the volume with the root file system still in the initramfs, the others in the running system, 30
+  to 90 seconds after boot. When the disk is back, they are rebuilt onto it.
 - **A reboot during a rebuild or an initialization:** it goes on from the point recorded in the metadata. A rebuild
   target that comes only after its volume has started is copied from the start.
 

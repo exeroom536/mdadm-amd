@@ -11,6 +11,8 @@ build() {
     add_binary mdadm
     add_binary mdmon
     add_systemd_unit 'mdmon@.service'
+    # with their drop-ins in /usr/lib/systemd/system/<unit>.d/ (add_systemd_unit takes them
+    # along): those of this package keep the timer past the switch to the real root
     add_systemd_unit 'mdadm-last-resort@.timer'
     add_systemd_unit 'mdadm-last-resort@.service'
 }

@@ -12,22 +12,35 @@ NVMe arrays on real hardware.
 
 ## Distributions
 
-| Distribution | initramfs | Checked |
-|---|---|---|
-| CachyOS | mkinitcpio | hardware: the Arch package, booting from a volume |
-| Arch Linux | mkinitcpio | VM: the package built and installed, a container and a RAID1 created |
-| Debian 13 | initramfs-tools | emulation, booting from a volume |
-| Ubuntu 24.04 | initramfs-tools | emulation, booting from a volume, AppArmor on; install guide followed as written |
-| Ubuntu 26.04 | dracut | emulation, booting from a volume, AppArmor on; install guide followed as written |
-| Fedora 45 | dracut | emulation, booting from a volume, SELinux enforcing |
-| AlmaLinux 10.2, openSUSE Tumbleweed | dracut | emulation, booting from a volume, SELinux enforcing |
-| AlmaLinux 9 | — | builds without warnings; not run |
-| openSUSE Leap 15.6 | — | does not build: gcc 7 rejects upstream mdadm code (`platform-intel.h`) |
+| Distribution | Kernel | initramfs | Checked |
+|---|---|---|---|
+| CachyOS | 7.3 | mkinitcpio | hardware: the Arch package, booting from a volume |
+| Arch Linux | 7.3.4 | mkinitcpio | emulation: install guide as written, booting from a volume |
+| Debian 13 | 6.12 | initramfs-tools | emulation: install guide as written, booting from a volume, AppArmor on |
+| Ubuntu 24.04 | 6.8 | initramfs-tools | emulation: install guide as written, booting from a volume, AppArmor on |
+| Ubuntu 26.04 | 7.0 | dracut | emulation: install guide as written, booting from a volume, AppArmor on |
+| Fedora 45 | 7.3.3 | dracut | emulation: install guide as written, booting from a volume, SELinux enforcing |
+| AlmaLinux 9.8 and 10.2 | 5.14, 6.12 | dracut | emulation: install guide as written, booting from a volume, SELinux enforcing |
+| openSUSE Tumbleweed, Leap 16.1 | 7.3.3, 6.12 | dracut | emulation: install guide as written, booting from a volume, SELinux enforcing |
+| Manjaro, EndeavourOS | — | mkinitcpio, dracut | container: the Arch package built and installed; a container and a RAID1 made on loop devices and assembled again. Not booted from a volume |
+| Linux Mint 22.3 | — | initramfs-tools | container: steps 1 to 3 for Debian and Ubuntu as written; volumes on loop devices as above. Not booted from a volume |
+| Gentoo, NixOS, Void Linux (glibc and musl), Alpine Linux 3.24 | — | — | container: mdadm builds without warnings (Alpine needs `linux-headers` as well); not run. Their initramfs tools (genkernel, ugrd, NixOS stage 1, mkinitfs) have no integration here; Gentoo and Void can use dracut, untried |
+| openSUSE Leap 15.6 | — | — | does not build: gcc 7 rejects upstream mdadm code (`platform-intel.h`) |
 
-Every row uses mdadm at commit `cd27b828` with `mdadm/mdadm-amd.patch` as it was on the day of the test (mdadm-amd
-1.0); for 1.1 (upstream `5542bf40`) only the CachyOS hardware and the test suites below were run again. In
-emulation each system booted from an NVMe RAID1 made by this mdadm, also with a disk missing and with the disk
-coming back (rebuilt into its slot), with no SELinux or AppArmor denials; boot loader systemd-boot.
+For 1.3 (upstream `5542bf40`), each emulation row started from the distribution's cloud image: the commands of
+[install.md](install.md) as written, on the running system (the boot steps in a chroot of the system copied onto
+the volume); then booting from an NVMe RAID1 made by this mdadm, with a second RAID1 of two SATA disks in the same
+container. Each system rebooted without a resync; booted with an NVMe disk missing (the root volume started
+degraded) and with a SATA disk missing (the other volume started degraded by mdadm's last-resort timer, 30 to 65
+seconds after boot); each disk coming back was rebuilt into its slot, and `md` check found the volumes clean
+(once, on Leap 16.1, a check right after the rebuild of the root counted 128 sectors; two more rebuilds and every
+later check were clean). No SELinux or AppArmor denials for `mdadm` or `mdmon`. The Uninstall steps ran as
+written on the same systems, with the root still on the volume; Ubuntu 26.04 hung then (see install.md). Boot
+loader systemd-boot; root file system ext4. Volume (`md-linear`) ran on Arch, Ubuntu 26.04, Fedora, AlmaLinux 9 and
+10 and openSUSE; Debian 13 and Ubuntu 24.04 have no `md-linear`. The md bitmap ran on the kernels before 6.18
+(AlmaLinux 9 and 10, Debian 13, Ubuntu 24.04, Leap 16.1); on the 7.x kernels `mdadm` ran the volume without it, as
+[install.md](install.md#the-md-bitmap) says. The container rows used the same 1.3 sources: podman with loop devices,
+docker for the builds.
 
 ## Hardware
 
@@ -102,8 +115,8 @@ An ASRock X670E RAID0 of two NVMe drives (our dump) and an ASUS X399 RAID10 (pub
 ## Test suites
 
 - The test suite in [tests/](../tests/README.md), on loop devices with metadata of real disks and of the emulated
-  board: 573 checks, all pass on a VM with the emulated AMD controllers (1.2; 545 for 1.1; for 1.0: 530 checks, 504 of them
-  also on a plain VM without the controllers).
+  board: 586 checks, all pass on a VM with the emulated AMD controllers (1.3; 573 for 1.2, 545 for 1.1; for 1.0:
+  530 checks, 504 of them also on a plain VM without the controllers).
 - The same suite with mdadm and mdmon built with AddressSanitizer and UBSan: no reports. A fuzzer on the metadata
   parser: no crashes. (Both for 1.0.)
 - The upstream mdadm test suite: no regressions (1.1: 67 pass, 0 fail, 1 skipped, the same as upstream `5542bf40`
@@ -112,9 +125,11 @@ An ASRock X670E RAID0 of two NVMe drives (our dump) and an ASUS X399 RAID10 (pub
 
 ## Not tested
 
-NVMe arrays on real hardware; booting from a degraded volume on real hardware; the Windows driver 9.3.3-00329; the md bitmap with the AMD drivers on real hardware; the
+NVMe arrays on real hardware; booting with a disk missing on real hardware (the root volume or another volume
+started degraded); the Windows driver 9.3.3-00329; the md bitmap with the AMD drivers on real hardware; the
 controller check refusing a disk on real hardware; distributions other than the test machine's on real hardware;
-GRUB with shim; openSUSE Leap and RHEL 9; other boards and BIOS versions.
+GRUB with shim; root file systems other than ext4 on a volume; booting from a volume on Manjaro, EndeavourOS, Linux
+Mint and the distributions checked by build only; RHEL itself; other boards and BIOS versions.
 
 ## Not supported
 

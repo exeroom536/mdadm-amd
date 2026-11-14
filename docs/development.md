@@ -47,7 +47,7 @@ bitmap question for containers (patch 5).
 Build as in [install.md](install.md#building-mdadm-from-source). With the patch applied, upstream's own test suite
 runs as usual (`./test`); it needs devices of 1 GiB or more.
 
-The test suite of this project is in [tests/](../tests/README.md): 573 checks on loop devices, with the metadata of
+The test suite of this project is in [tests/](../tests/README.md): 586 checks on loop devices, with the metadata of
 real disks and of the emulated board as fixtures; `sudo tests/run.sh /path/to/upstream-mdadm` runs it in about 50
 minutes. Metadata dumps from other boards help most —
 `tools/amdraid_dump.py <disk> --brief --ring`, or the first 12 MiB of a member

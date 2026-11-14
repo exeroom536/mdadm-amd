@@ -1,6 +1,6 @@
-From 76fabe230a366c3d1bcb714fedfa8a19ccdd8896 Mon Sep 17 00:00:00 2001
+From 1a5051837349f3d0af82375261dc8cb799a3261e Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Sat, 14 Nov 2026 01:34:54 +0500
+Date: Sat, 14 Nov 2026 15:55:53 +0500
 Subject: [PATCH 24/33] super-amd: read AMD RAIDXpert2 (RAIDCore) metadata
 
 AMD RAIDXpert2 is the RAID of AMD chipsets (X399, X570, X670, X870...):
@@ -102,7 +102,7 @@ index 69019ccd..544e450b 100644
  void imsm_set_no_platform(int v);
 diff --git a/super-amd.c b/super-amd.c
 new file mode 100644
-index 00000000..394240db
+index 00000000..e778646a
 --- /dev/null
 +++ b/super-amd.c
 @@ -0,0 +1,2927 @@
@@ -865,7 +865,7 @@ index 00000000..394240db
 +static void amd_classify_state(struct amd_vol *v)
 +{
 +	struct amd_ld *ld = v->ld;
-+	__u32 state;
++	__u32 state, type = __le32_to_cpu(ld->transform_type);
 +	int transform;
 +
 +	/*
@@ -887,7 +887,7 @@ index 00000000..394240db
 +	if (state == AMD_LD_STATE_LOCKED)
 +		state = AMD_LD_STATE_CRITICAL;
 +	/* a transform not ended (initialization, rebuild, migration) */
-+	transform = ld->transform_type &&
++	transform = type &&
 +		__le32_to_cpu(ld->transform_state) != AMD_TRANSFORM_COMPLETED;
 +	/* nothing is recorded for AMD yet: what has state stays read-only */
 +	if (v->level == 0 || v->level == LEVEL_LINEAR)

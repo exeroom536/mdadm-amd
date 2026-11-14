@@ -1,5 +1,39 @@
 # Changes
 
+## 1.3 — 2026-11-15
+
+**Fixed.**
+- A volume whose check (Verify) in Windows was cut short, by a power loss for one, is no longer assembled read-only:
+  md resyncs it from where the AMD driver's transform log has it, and `mdmon` records the check as completed, as
+  the AMD driver does; Windows then takes the volume as Normal (tried with the Windows driver 9.5.0-00201 and
+  9.3.3.218 in a VM). The end of an initialization now also clears the transform fields the AMD driver clears.
+- After a boot with a disk missing, a volume the boot does not need is started degraded as well, 30 to 90 s after
+  boot, by mdadm's own last-resort timer. Before, it stayed inactive until `mdadm --run`: the timer started in the
+  initramfs was stopped at the switch to the real root. Tried in emulation on Arch, CachyOS, Debian 13, Ubuntu
+  24.04 and 26.04, Fedora 45, AlmaLinux 9.8 and 10.2, openSUSE Tumbleweed and Leap 16.1; not on real hardware.
+- `mdadm --create` of a Volume (linear) on a kernel without `md-linear` (Debian 13, Ubuntu 24.04) is refused before
+  anything is written. Before, the volume was written into the AMD configuration and then failed to start.
+
+**Tests.** Stages 43 (a check cut short in Windows) and 44 (a Volume on a kernel without `md-linear`): 586 checks in
+57 stages. The scripts in the repository are executable again (after a clone, `tests/run.sh` failed with
+"Permission denied"), and `run.sh` says so when files of an earlier run as root are in its work directory.
+
+**Packaging.**
+- Drop-ins for `mdadm-last-resort@.timer` and `.service` (`IgnoreOnIsolate`, the initramfs waits for a running
+  `mdadm --run`, a 90 s start timeout) in the Arch package and the dracut module; a `local-bottom` script for
+  initramfs-tools.
+
+**Docs.**
+- The install guide was followed as written, booting from a volume in emulation, on Arch, Debian 13, Ubuntu 24.04
+  and 26.04, Fedora 45, AlmaLinux 9.8 and 10.2, openSUSE Tumbleweed and Leap 16.1; Manjaro, EndeavourOS and Linux
+  Mint were checked in containers, Gentoo, NixOS, Void and Alpine build. Fixes from that: the dnf versionlock plugin
+  on RHEL 9 and 10, Uninstall steps for Ubuntu 26.04 and openSUSE, a warning not to uninstall with the root on a
+  volume, which kernels ship `md-linear` ([testing.md](docs/testing.md#distributions)).
+
+**Known issues.**
+- Debian and Ubuntu with the root on a volume: restart `mdmon@` after installing a new build, or the root volume
+  resyncs after the next reboot ([install.md](docs/install.md#debian-and-ubuntu-initramfs-tools)).
+
 ## 1.2 — 2026-11-14
 
 **New.**

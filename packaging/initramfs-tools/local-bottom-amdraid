@@ -1,0 +1,42 @@
+#!/bin/sh
+# initramfs-tools local-bottom script: AMD RAIDXpert2 (RAIDCore) volumes.
+# Install into /etc/initramfs-tools/scripts/local-bottom/amdraid.
+# This initramfs has no systemd, so the last-resort timer that the udev rule
+# asks for when a volume misses a member never runs here, and once the root is
+# up the local-block mdadm script no longer starts degraded volumes.  A volume
+# the boot does not wait for would stay inactive for good: in the real root
+# its disks already belong to the container, and mdadm -I leaves them alone.
+# Hand the timer of such a container to the real root's systemd: it starts
+# the volume degraded 30 s later, as for a volume assembled there.
+PREREQ=""
+prereqs() { echo "$PREREQ"; }
+case $1 in
+prereqs) prereqs; exit 0 ;;
+esac
+
+for d in /sys/block/md*; do
+	[ "$(cat "$d/md/metadata_version" 2>/dev/null)" = external:amd ] || continue
+	c=${d##*/}
+	# volumes in the metadata ("Subarray : N" of mdadm -E) against those running
+	n=0
+	while read -r k _; do
+		[ "$k" = Subarray ] && n=$((n + 1))
+	done <<-EOF
+	$(mdadm --examine "/dev/$c" 2>/dev/null)
+	EOF
+	r=0
+	for v in /sys/block/md*; do
+		case $(cat "$v/md/metadata_version" 2>/dev/null) in
+		external:/$c/*)
+			case $(cat "$v/md/array_state") in
+			inactive | clear) ;;
+			*) r=$((r + 1)) ;;
+			esac ;;
+		esac
+	done
+	[ "$r" -lt "$n" ] || continue
+	w=/run/systemd/system/sysinit.target.wants
+	mkdir -p "$w"
+	ln -sf /usr/lib/systemd/system/mdadm-last-resort@.timer "$w/mdadm-last-resort@$c.timer"
+done
+exit 0

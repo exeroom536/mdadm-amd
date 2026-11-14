@@ -1179,10 +1179,10 @@ index f92a9a11..af1a26b8 100644
  int devpath_to_char(const char *dev_path, const char *entry, char *buf,
 diff --git a/super-amd.c b/super-amd.c
 new file mode 100644
-index 00000000..80a5303f
+index 00000000..478a8c28
 --- /dev/null
 +++ b/super-amd.c
-@@ -0,0 +1,11429 @@
+@@ -0,0 +1,11491 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * mdadm - support for AMD RAIDXpert2 ("RAIDCore") metadata.
@@ -1321,6 +1321,7 @@ index 00000000..80a5303f
 +/* RC_TransformTypes / RC_TransformState */
 +#define AMD_TRANSFORM_NORMAL	0x5354	/* a migration: level, size, disks (rcadm -T) */
 +#define AMD_TRANSFORM_CREATE_REDUNDANCY	0x5355	/* initialization of a new volume */
++#define AMD_TRANSFORM_CHECK_REDUNDANCY	0x5356	/* Verify, rcadm -M -cs */
 +#define AMD_TRANSFORM_RESTORE_SEGMENTS	0x5358	/* rebuild onto a spare */
 +#define AMD_TRANSFORM_STARTED	0xa1a1
 +#define AMD_TRANSFORM_FAILED	0xa1a4
@@ -1692,7 +1693,7 @@ index 00000000..80a5303f
 +	int managed;		/* mdmon keeps its state in the AMD metadata */
 +	int single;		/* RAIDABLE: md raid1 of its one member, no bitmap */
 +	int grow;		/* RAIDABLE -> RAID1 recorded: @link is the RAID1 */
-+	int init_pending;	/* CREATE_REDUNDANCY not completed: md resyncs */
++	int init_pending;	/* CREATE/CHECK_REDUNDANCY pending: md resyncs */
 +	struct amd_vol_mon mon;
 +	const char *blocked;	/* why it cannot be assembled */
 +};
@@ -2286,11 +2287,27 @@ index 00000000..80a5303f
 +	return 1;
 +}
 +
++/*
++ * Transform @type is one md runs as a resync, from where the volume's
++ * transform log has it (amd_init_resume_point), as the AMD driver resumes
++ * it (rcblob RC_RestartTask): an initialization, or a check the AMD driver
++ * left unfinished (Verify in Windows cut short by a power loss).  md has no
++ * check it could resume and record; its resync does what that check does
++ * and more: mirrors are copied from their first member, as rcadm -M -cs
++ * repairs a RAID10 from [i][0], and the parity of a RAID5 is put right,
++ * which the AMD check leaves as it is.
++ */
++static int amd_resync_transform(__u32 type)
++{
++	return type == AMD_TRANSFORM_CREATE_REDUNDANCY ||
++	       type == AMD_TRANSFORM_CHECK_REDUNDANCY;
++}
++
 +/* mdmon manages @v, or md runs it read-only: by its state and transform */
 +static void amd_classify_state(struct amd_vol *v)
 +{
 +	struct amd_ld *ld = v->ld;
-+	__u32 state;
++	__u32 state, type = __le32_to_cpu(ld->transform_type);
 +	int transform;
 +
 +	/*
@@ -2311,17 +2328,22 @@ index 00000000..80a5303f
 +	 */
 +	if (state == AMD_LD_STATE_LOCKED)
 +		state = AMD_LD_STATE_CRITICAL;
-+	v->init_pending = __le32_to_cpu(ld->transform_type) ==
-+			  AMD_TRANSFORM_CREATE_REDUNDANCY &&
++	/*
++	 * Not a check of a volume gone critical since: the AMD driver checks
++	 * none (rcblob RC_CheckManageCheck), nor can md resync one.
++	 */
++	v->init_pending = amd_resync_transform(type) &&
++		(type != AMD_TRANSFORM_CHECK_REDUNDANCY ||
++		 state == AMD_LD_STATE_NORMAL) &&
 +		__le32_to_cpu(ld->transform_state) != AMD_TRANSFORM_COMPLETED;
 +	/*
-+	 * An initialization or a rebuild left unfinished goes on from the
-+	 * volume's transform log (amd_tlog_read).  Any other transform is an
-+	 * AMD migration: only RAIDABLE -> RAID1 is supported (v->grow), with
-+	 * any other the volume is not assembled.
++	 * An initialization, a check or a rebuild left unfinished goes on
++	 * from the volume's transform log (amd_tlog_read).  Any other
++	 * transform is an AMD migration: only RAIDABLE -> RAID1 is supported
++	 * (v->grow), with any other the volume is not assembled.
 +	 */
-+	transform = ld->transform_type && !v->init_pending &&
-+		__le32_to_cpu(ld->transform_type) != AMD_TRANSFORM_RESTORE_SEGMENTS &&
++	transform = type && !v->init_pending &&
++		type != AMD_TRANSFORM_RESTORE_SEGMENTS &&
 +		__le32_to_cpu(ld->transform_state) != AMD_TRANSFORM_COMPLETED &&
 +		ld->transform_state;
 +	if (v->single || v->grow) {
@@ -4573,8 +4595,8 @@ index 00000000..80a5303f
 + * from ProtectStart (RC_SetTaskLog, RC_RestartTask, RC_InitTransformStruct).
 + * For a rebuild of a mirror IOStart/IOSize and the stripe fields stay 0
 + * (the AMD driver works its I/O size out again each region, see below);
-+ * a migration (NORMAL), an initialization and any transform of RAID5
-+ * (@raid5) have them as the AMD drivers write them.
++ * a migration (NORMAL), an initialization, a check and any transform of
++ * RAID5 (@raid5) have them as the AMD drivers write them.
 + */
 +static void amd_tlog_fill(const struct amd_vol *v, const struct amd_ld *tl,
 +			  struct amd_tlog *t, unsigned long long done,
@@ -4603,14 +4625,14 @@ index 00000000..80a5303f
 +		t->dynamic_protect_stripe =
 +			__cpu_to_le32(amd_protect_size(v) / AMD_GROW_IO_SIZE);
 +		t->log_update_stripe = t->dynamic_protect_stripe;
-+	} else if (raid5 ||
-+		   type == AMD_TRANSFORM_CREATE_REDUNDANCY) {
++	} else if (raid5 || amd_resync_transform(type)) {
 +		/*
 +		 * The I/O at ProtectStart and the protect window in
 +		 * stripes, as the AMD drivers log them: initializing a
 +		 * RAID1, rcraid 0x100 sectors, 0x90 stripes; RAID5,
 +		 * rcraid.sys a chunk (RAID10 a chunk by rcblob
-+		 * RC_SetTransformSize).  The flags are those of the
++		 * RC_SetTransformSize); so does rcraid.sys 9.5.0.201 a
++		 * check (q4-judge95).  The flags are those of the
 +		 * LD at any level: 0x211 on a volume of the menu or
 +		 * of mdadm -C, 0x241 of rcadm -C (rcraid on mirrors,
 +		 * rcraid.sys on a RAID5).  Resuming,
@@ -4618,7 +4640,8 @@ index 00000000..80a5303f
 +		 * (RC_InitTransformInfo skips RC_SetTransformSize); a
 +		 * rebuild or migration works it out again each region
 +		 * (RC_MaxDynamicTransformIoSize), an initialization
-+		 * does not (RC_TransformUpdateNextRegionFromBeginning).
++		 * or a check does not
++		 * (RC_TransformUpdateNextRegionFromBeginning).
 +		 * Left 0, rcraid 9.3.3-00302 makes no headway on an
 +		 * initialization - I/O past the mark times out, the
 +		 * volume goes critical - and rcraid.sys 9.3.3.218 fails
@@ -4778,10 +4801,10 @@ index 00000000..80a5303f
 +}
 +
 +/*
-+ * Volume sector an initialization (CREATE_REDUNDANCY) of @v that was
-+ * stopped resumes from: what its transform log says, short of the end so
-+ * that md still resyncs and mdmon sees it finish.  md resyncs a mirror in
-+ * volume sectors (RAID10: the array's).
++ * Volume sector an initialization or a check of @v that was stopped
++ * resumes from (amd_resync_transform): what its transform log says, short
++ * of the end so that md still resyncs and mdmon sees it finish.  md
++ * resyncs a mirror in volume sectors (RAID10: the array's).
 + */
 +static unsigned long long amd_init_resume_point(struct amd_super *super,
 +						struct amd_vol *v)
@@ -4792,7 +4815,7 @@ index 00000000..80a5303f
 +	if (!v->link)
 +		return 0;
 +	done = amd_tlog_read(super, v, v->link,
-+			     AMD_TRANSFORM_CREATE_REDUNDANCY);
++			     __le32_to_cpu(v->ld->transform_type));
 +	return amd_short_of_end(done, cap);
 +}
 +
@@ -7586,6 +7609,40 @@ index 00000000..80a5303f
 +	return 1;
 +}
 +
++/* md lists the personalities it has on the first line of /proc/mdstat */
++static int amd_md_has_linear(void)
++{
++	char line[1024];
++	FILE *f = fopen("/proc/mdstat", "r");
++	int found = 0;
++
++	if (!f)
++		return 0;
++	if (fgets(line, sizeof(line), f))
++		found = strstr(line, "[linear]") != NULL;
++	fclose(f);
++	return found;
++}
++
++/*
++ * md linear is a module of its own (md-linear; "linear" up to Linux 6.7,
++ * gone in 6.8 to 6.13), and Debian 13 and Ubuntu 24.04 do not ship it.  md loads it only to
++ * start the volume - after Create has recorded the volume in the AMD
++ * configuration, so a Volume that cannot run stayed there (q7distro).
++ * Load it now, as md would, and refuse before writing.
++ */
++static int amd_linear_ok(int verbose)
++{
++	if (amd_md_has_linear())
++		return 1;
++	if (system("modprobe md-linear >/dev/null 2>&1") == 0 &&
++	    amd_md_has_linear())
++		return 1;
++	if (verbose)
++		pr_err("this kernel has no md linear (module md-linear): it cannot run an AMD RAID Volume\n");
++	return 0;
++}
++
 +static int validate_geometry_amd(struct supertype *st, int level, int layout,
 +				 int raiddisks, int *chunk,
 +				 unsigned long long size,
@@ -7636,7 +7693,7 @@ index 00000000..80a5303f
 +		if (super->npick == 1 && (!amd_array_limit(st, verbose) ||
 +					  !amd_disk_limit(st, raiddisks, verbose)))
 +			return 0;
-+		return 1;
++		return level != LEVEL_LINEAR || amd_linear_ok(verbose);
 +	}
 +	/* -e amd and disks: the first of them loads the container */
 +	if (!super)
@@ -7667,7 +7724,7 @@ index 00000000..80a5303f
 +			amd_explain_room(super, raiddisks, size);
 +		return 0;
 +	}
-+	return 1;
++	return level != LEVEL_LINEAR || amd_linear_ok(verbose);
 +}
 +
 +static void default_geometry_amd(struct supertype *st, int *level,
@@ -10296,18 +10353,23 @@ index 00000000..80a5303f
 +	}
 +}
 +
-+/* Record a finished initialization (CREATE_REDUNDANCY). */
++/*
++ * Record a finished initialization (CREATE_REDUNDANCY), or check
++ * (CHECK_REDUNDANCY).  Its transform fields go as the AMD driver clears
++ * them at the end: its final packet has TransformFlags and ProtectSize 0,
++ * and none of the transform flags it set for the initialization or check
++ * (rcraid.sys 9.5.0.201, q5-judge, q6c).
++ */
 +static void amd_finish_init(struct amd_super *super, int vol)
 +{
 +	struct amd_ld *ld = super->vol[vol].ld;
++	__u32 op = __le32_to_cpu(ld->transform_type);
 +
 +	if (ld->state == 0)
 +		ld->state = __cpu_to_le32(AMD_LD_STATE_NORMAL);
-+	/* the AMD drivers set them for an initialization too (q5-judge) */
-+	ld->flags &= ~__cpu_to_le32(AMD_LDF_TRANSFORM);
++	amd_ld_clear_transform(ld);
 +	super->vol[vol].mon.init_tlog = 2;	/* cleared once the end is written */
-+	amd_end_transform(super, vol, AMD_TRANSFORM_CREATE_REDUNDANCY,
-+			  AMD_TRANSFORM_COMPLETED);
++	amd_end_transform(super, vol, op, AMD_TRANSFORM_COMPLETED);
 +}
 +
 +/*
@@ -10356,9 +10418,9 @@ index 00000000..80a5303f
 + * keeps SpareInfo 0x100: the AMD driver clears it only when the user
 + * unassigns the spare (rcblob RC_DeassignPhysicalDeviceGlobalSpare,
 + * rcraid.sys FUN_1400652d0).
-+ * An initialization still pending stays so, with the new member in both
-+ * copies of the LD.  The mirror of a RAIDABLE ends in three packets
-+ * (amd_grow_copied): it can only once its start is recorded.
++ * An initialization or a check still pending stays so, with the new
++ * member in both copies of the LD.  The mirror of a RAIDABLE ends in three
++ * packets (amd_grow_copied): it can only once its start is recorded.
 + */
 +static void amd_finish_rebuild(struct amd_super *super, int vol)
 +{
@@ -10405,7 +10467,7 @@ index 00000000..80a5303f
 +	if (v->mon.rebuild_slot == 0)
 +		v->mon.bitmap_dirty = -1;
 +
-+	if (__le32_to_cpu(ld->transform_type) == AMD_TRANSFORM_CREATE_REDUNDANCY) {
++	if (amd_resync_transform(__le32_to_cpu(ld->transform_type))) {
 +		if (v->link)
 +			v->link->state = state;
 +		return;
@@ -10801,8 +10863,8 @@ index 00000000..80a5303f
 +			v->mon.tlog_dirty = 0;
 +		/* initialization progress, logged as the AMD driver does per region */
 +		if (v->init_pending && !v->mon.init_done && v->mon.init_tlog == 1 &&
-+		    v->link && amd_sync_tlog(super, vol, v->mon.init_ckpt,
-+					     AMD_TRANSFORM_CREATE_REDUNDANCY) == 0)
++		    v->link &&
++		    amd_sync_tlog(super, vol, v->mon.init_ckpt, type) == 0)
 +			v->mon.init_tlog = 0;
 +		if (v->mon.rebuilding && v->mon.rebuild_done && amd_all_disks_here(super))
 +			amd_finish_rebuild(super, vol);

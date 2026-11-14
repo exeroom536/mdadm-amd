@@ -44,4 +44,12 @@ depends() {
 # called by dracut
 install() {
     inst_rules "$moddir/64-amd-raid-assembly.rules"
+    # keep a waiting last-resort timer past the switch to the real root (see the files; the real
+    # root needs them too)
+    if dracut_module_included systemd; then
+        inst_simple "$moddir/last-resort-timer.conf" \
+            "$systemdsystemunitdir/mdadm-last-resort@.timer.d/amdraid.conf"
+        inst_simple "$moddir/last-resort-service.conf" \
+            "$systemdsystemunitdir/mdadm-last-resort@.service.d/amdraid.conf"
+    fi
 }

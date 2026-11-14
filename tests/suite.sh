@@ -4161,6 +4161,182 @@ q42speed 400000
 fi
 # --- end of stage 42 ---
 
+# --- stage 43: a check of a volume (CHECK_REDUNDANCY 0x5356) cut short in Windows is finished by md as an
+# initialization.  A model without Windows: the initialization of a new volume (our -C: a pair of LDs and the transform
+# log), recorded by mdmon, is stopped midway; in the live packet of each disk it is rewritten into a check as
+# rcraid.sys 9.5.0.201 writes it midway: TransformType and LastOperation 0x5356, TransformState 0xa1a7, State 0x200,
+# TransformFlags 0x241, Flags 0x20020626 / 0x30020022; the log - type 0x5356, flags 0x241, the same mark.  The volume
+# was written during the initialization, so its copies agree everywhere, as on a volume being checked.  RAID1: garbage
+# in copy [0][1] above the mark and below it.  Assembly: the volume runs read-write, md resyncs from the mark (above it
+# puts things right, below it does not touch: the AMD driver checked there already), the end is recorded as the AMD
+# driver records it (Transform 0, last 0x5356, 0xa1a6, one LD, the flags and TransformFlags cleared, the log wiped),
+# a second assembly - no resync.  RAID5 - the same without garbage.
+if want 43; then
+cd "$MDADM_DIR"
+Q43=$WQ/q43
+q43l() { sudo losetup -j $Q43/$1.img | cut -d: -f1; }
+q43sec() { $M -E $(q43l g0) 2>/dev/null | sed -n "/^\[$1\]/,/^\[/p"; }
+q43speed() { local m=$(( $1 < 1000 ? $1 : 1000 ))
+	echo $m | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null; echo $1 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null; }
+q43clean() { stopall; for l in $(sudo losetup -a | grep "$Q43/" | cut -d: -f1); do sudo losetup -d $l; done; rm -f $Q43/*.img; }
+# q43mk <disks> <level> <MiB per member> <name>: g0..., container q43c, a volume of all the disks; data written during
+# the initialization (2 MB/s), then a stop midway through it
+q43mk() {
+	mkdir -p $Q43; q43clean
+	for n in $(seq 0 $(($1 - 1))); do truncate -s 1G $Q43/g$n.img; sudo losetup -f $Q43/g$n.img; done
+	q43speed 2000
+	$M -C /dev/md/q43c -e amd -n$1 $(for n in $(seq 0 $(($1 - 1))); do q43l g$n; done) --run >/dev/null 2>&1
+	$M -C /dev/md/$4 -e amd -l$2 -n$1 -z $3M $(for n in $(seq 0 $(($1 - 1))); do q43l g$n; done) --run >/dev/null 2>&1
+	sleep 2; Q43V=$(mdof raid$2)
+	sudo dd if=/dev/urandom of=/dev/$Q43V bs=1M oflag=direct status=none 2>/dev/null
+	Q43MD5=$(sudo md5sum /dev/$Q43V | cut -c1-32); sleep 12
+}
+# q43lds <disk>: the LDs of the live packet - "name:TransformType:Last:TransformState:Flags:TransformFlags:Link" separated by spaces
+q43lds() {
+	python3 - $Q43/$1.img <<'PY'
+import os, struct, sys
+sys.path.insert(0, os.environ["TOOLS"]); import amdraid_dump as ad
+dk = ad.Disk(sys.argv[1]); rc = ad.parse_raidcore(dk.read(ad.LBA_RAIDCORE)); c = ad.parse_commit(dk.read(rc["commit_lba"]))
+h, pds, lds = ad.parse_gen(ad.read_gen(dk, c["gen_lba"], c["gen_len"]))
+print(" ".join("%s:%x:%x:%x:%x:%x:%d" % (l["name"], l["transform"], l["last_op"], l["transform_state"], l["flags84"],
+	struct.unpack_from("<I", l["raw_hdr"], 0x78)[0], l["linked_next"]) for l in lds))
+PY
+}
+# q43log <disk>...: the transform log in the service sector of the volume's elements on the disk - "type:mark" or "-";
+# q43start <disk>: the data start of its element (sectors)
+q43tlog() {
+	python3 - "$1" $(for n in $2; do echo $Q43/$n.img; done) <<'PY'
+import os, struct, sys
+sys.path.insert(0, os.environ["TOOLS"]); import amdraid_dump as ad
+for p in sys.argv[2:]:
+    dk = ad.Disk(p); rc = ad.parse_raidcore(dk.read(ad.LBA_RAIDCORE)); c = ad.parse_commit(dk.read(rc["commit_lba"]))
+    h, pds, lds = ad.parse_gen(ad.read_gen(dk, c["gen_lba"], c["gen_len"]))
+    el = [e for l in lds for e in l["elems"] if e["device_id"] == rc["device_id"]][:1]
+    if sys.argv[1] == "start":
+        print(el[0]["start"] if el else -1); continue
+    s = dk.read(el[0]["alloc_off"]) if el else b"\0" * 512
+    ok = any(s[8:0x68]) and struct.unpack_from("<Q", s, 0)[0] == ad.rc_sum(s, 8, 0x60)
+    print("%x:%d" % (struct.unpack_from("<I", s, 0x18)[0], struct.unpack_from("<Q", s, 0x1c)[0]) if ok else "-")
+PY
+}
+q43log() { q43tlog log "$*" | tr '\n' ' '; }
+q43start() { q43tlog start $1; }
+# q43check <disk>...: the initialization in the live packet and in the log made into a check, as rcraid.sys 9.5 has it midway
+# through one; packet, commit and log sums valid.  Prints the marks of the logs
+q43check() {
+	python3 - $(for n in "$@"; do echo $Q43/$n.img; done) <<'PY'
+import os, struct, sys
+sys.path.insert(0, os.environ["TOOLS"]); import amdraid_dump as ad
+for p in sys.argv[1:]:
+    with open(p, "r+b") as f:
+        f.seek(0x5000 * 512); dev = struct.unpack_from("<Q", f.read(512), 0x10)[0]
+        f.seek(0x5001 * 512); c = bytearray(f.read(512)); off, size = struct.unpack_from("<II", c, 8)
+        f.seek(off * 512); g = bytearray(f.read((size + 511) // 512 * 512)); q, end = struct.unpack_from("<II", g, 0x2c); end += q
+        logs = set()
+        while q + 0x200 <= end and struct.unpack_from("<I", g, q)[0] == 0x25BD:
+            if struct.unpack_from("<I", g, q + 0x10)[0] == 0x5355:
+                link = struct.unpack_from("<I", g, q + 0x88)[0]
+                struct.pack_into("<I", g, q + 8, 0x200)
+                struct.pack_into("<III", g, q + 0x10, 0x5356, 0x5356, 0xa1a7)
+                struct.pack_into("<I", g, q + 0x78, 0x241)
+                struct.pack_into("<I", g, q + 0x84, 0x20020626 if link else 0x30020022)
+                logs |= {e["alloc_off"] for e in ad.parse_ld(g, q)["elems"] if e["device_id"] == dev}
+            q += struct.unpack_from("<I", g, q + 0x90)[0]
+        struct.pack_into("<Q", g, 0, ad.rc_sum(g, 0xc, size - 0xc)); f.seek(off * 512); f.write(g)
+        struct.pack_into("<Q", c, 0x10, struct.unpack_from("<Q", g, 0)[0]); struct.pack_into("<Q", c, 0, ad.rc_sum(c, 8, 0x1f8))
+        f.seek(0x5001 * 512); f.write(c)
+        for lba in sorted(logs):
+            f.seek(lba * 512); s = bytearray(f.read(512))
+            if struct.unpack_from("<I", s, 0x18)[0] != 0x5355 or struct.unpack_from("<Q", s, 0)[0] != ad.rc_sum(s, 8, 0x60):
+                continue
+            struct.pack_into("<I", s, 0x18, 0x5356); struct.pack_into("<I", s, 0x30, 0x241)
+            struct.pack_into("<Q", s, 0, ad.rc_sum(s, 8, 0x60)); f.seek(lba * 512); f.write(s)
+            print(struct.unpack_from("<Q", s, 0x1c)[0])
+PY
+}
+# q43junk <disk> <MiB of the volume>: 1 MiB of garbage into the volume's element on the disk (RAID1: volume MiB = element MiB)
+q43junk() { sudo dd if=/dev/urandom of=$(q43l $1) bs=1M count=1 seek=$(( $(q43start $1) * 512 + $2 * 1048576 )) oflag=seek_bytes,direct conv=notrunc status=none; }
+# q43same <MiB of the volume>: that MiB is the same on g0 and g1
+q43same() { [ "$(sudo dd if=$(q43l g0) bs=1M count=1 skip=$(( $(q43start g0) * 512 + $1 * 1048576 )) iflag=skip_bytes,direct status=none | md5sum)" = \
+	"$(sudo dd if=$(q43l g1) bs=1M count=1 skip=$(( $(q43start g1) * 512 + $1 * 1048576 )) iflag=skip_bytes,direct status=none | md5sum)" ]; }
+# q43asm <disk>...: assemble the container of these disks (-A, -I)
+q43asm() {
+	q43speed 400000
+	$M -A /dev/md/q43c -e amd $(for n in "$@"; do q43l $n; done) >/dev/null 2>&1
+	$M -I /dev/$(cont1) >/dev/null 2>&1; sleep 2
+}
+q43nres() { sudo dmesg | grep -c 'md: resync of RAID array'; }
+q43rw() { local m=$(cat /sys/block/$1/md/metadata_version 2>/dev/null); case "$m" in external:/*) [ "$(cat /sys/block/$1/md/array_state)" != readonly ] ;; *) false ;; esac; }
+# q43ended <volume>: the end of the check recorded as the AMD driver records it: normal, Transform 0, last 0x5356, COMPLETED; one LD
+# without the transform flags (mask AMD_LDF_TRANSFORM), TransformFlags 0, no TransformLink
+q43ended() { local r n tt lo ts fl tf lk
+	q43sec $1 | grep -q 'State : 0x200 (normal)' && q43sec $1 | grep -q 'Transform : 0x0, last 0x5356, state 0xa1a6' || return 1
+	r=$(q43lds g0 | tr ' ' '\n' | grep "^$1:"); [ "$(echo "$r" | grep -c .)" = 1 ] || return 1
+	IFS=: read n tt lo ts fl tf lk <<< "$r"
+	[ $(( 0x$fl & 0x30020094 )) = 0 ] && [ "$tf" = 0 ] && [ "$lk" = 0 ]; }
+
+# RAID1: a check midway, garbage in [0][1] above the mark and below it
+q43mk 2 1 256 q43v; stopall
+L=$(q43check g0 g1 | sort -n | head -1); L=${L:-0}; MK=$(( L / 2048 ))
+check "43 raid1: Windows' check stopped midway, at MiB $MK of 256 ($(q43lds g0); log $(q43log g0 g1))" "q43sec q43v | grep -q 'Transform : 0x5356, last 0x5356, state 0xa1a7' && [ $MK -ge 8 ] && [ $MK -le 200 ] && q43log g0 g1 | grep -q '^5356:$L 5356:$L '"
+LO=$(( MK / 2 )); q43junk g1 230; q43junk g1 $LO
+R0=$(q43nres)
+q43asm g0 g1; V=$(mdof raid1); waitrec 120; sleep 4
+check "43 raid1: ... assembled read-write ($V: $(cat /sys/block/$V/md/metadata_version 2>/dev/null) $(cat /sys/block/$V/md/array_state 2>/dev/null)), md resynced it ($(( $(q43nres) - R0 )) resync)" "[ -n '$V' ] && q43rw $V && [ $(q43nres) -gt $R0 ]"
+check "43 raid1: ... ended as AMD ends a check: normal, last 0x5356, one LD, transform flags clear ($(q43lds g0)), log cleared ($(q43log g0 g1))" "q43ended q43v && [ \"\$(q43log g0 g1)\" = '- - ' ]"
+check "43 raid1: ... resynced from the log, as AMD resumes a check: the junk above it is gone, below it is left" "q43same 230 && ! q43same $LO"
+echo repair | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; waitrec 120
+echo check | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; waitrec 120
+check "43 raid1: ... data as before (md5 ${Q43MD5:0:8}), md check 0" "[ \"\$(sudo md5sum /dev/$V | cut -c1-32)\" = $Q43MD5 ] && [ \"\$(cat /sys/block/$V/md/mismatch_cnt)\" = 0 ]"
+stopall; R0=$(q43nres); q43asm g0 g1; V=$(mdof raid1); waitrec 60
+check "43 raid1: ... assembled again: no resync, still ended" "[ -n '$V' ] && q43rw $V && [ $(q43nres) = $R0 ] && [ \"\$(cat /sys/block/$V/md/resync_start)\" = none ] && q43ended q43v"
+
+# RAID5: the same without garbage (md puts the parity right from the data - garbage in the data would not show)
+q43mk 3 5 128 q43r; stopall
+L=$(q43check g0 g1 g2 | sort -n | head -1); L=${L:-0}; MK=$(( L / 2048 ))
+check "43 raid5: Windows' check stopped midway, at MiB $MK of 256 ($(q43lds g0); log $(q43log g0 g1 g2))" "q43sec q43r | grep -q 'Transform : 0x5356, last 0x5356, state 0xa1a7' && [ $MK -ge 8 ] && [ $MK -le 200 ]"
+R0=$(q43nres)
+q43asm g0 g1 g2; V=$(mdof raid5); waitrec 120; sleep 4
+check "43 raid5: ... assembled read-write ($V: $(cat /sys/block/$V/md/metadata_version 2>/dev/null)), md resynced it, ended as AMD ends a check ($(q43lds g0); log $(q43log g0 g1 g2))" "[ -n '$V' ] && q43rw $V && [ $(q43nres) -gt $R0 ] && q43ended q43r && [ \"\$(q43log g0 g1 g2)\" = '- - - ' ]"
+echo check | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; waitrec 120
+check "43 raid5: ... data as before (md5 ${Q43MD5:0:8}), md check 0" "[ \"\$(sudo md5sum /dev/$V | cut -c1-32)\" = $Q43MD5 ] && [ \"\$(cat /sys/block/$V/md/mismatch_cnt)\" = 0 ]"
+stopall; R0=$(q43nres); q43asm g0 g1 g2; V=$(mdof raid5); waitrec 60
+check "43 raid5: ... assembled again: no resync, still ended" "[ -n '$V' ] && q43rw $V && [ $(q43nres) = $R0 ] && [ \"\$(cat /sys/block/$V/md/resync_start)\" = none ] && q43ended q43r"
+q43clean; rmdir $Q43
+q43speed 400000
+fi
+# --- end of stage 43 ---
+
+# --- stage 44: -C of a Volume (linear) on a kernel with no md linear.  md linear is a module of its own, and Debian 13
+# and Ubuntu 24.04 do not ship it.  -C used to write the volume into the AMD configuration and then fail on array_state
+# ("failed to activate array"), leaving the volume there; now it loads md-linear as md would and refuses before
+# writing.  On a kernel with md linear the volume is created and runs.
+if want 44; then
+cd "$MDADM_DIR"
+stopall
+Q44=$WQ/q44
+q44drop() { stopall; for l in $(sudo losetup -a | grep $Q44/ | cut -d: -f1); do sudo losetup -d $l; done; rm -f $Q44/*.img; }
+mkdir -p $Q44; q44drop
+QL=""; for n in 0 1; do truncate -s 1G $Q44/d$n.img; QL="$QL $(sudo losetup -f --show $Q44/d$n.img)"; done
+QL=${QL# }; Q1=${QL%% *}
+q44gen() { $M -E $Q1 2>/dev/null | sed -n 's/^ *Generation : //p'; }
+q44vols() { $M -E $Q1 2>/dev/null | grep -c '^\['; }
+if grep -q '\[linear\]' /proc/mdstat || sudo modprobe -n md-linear 2>/dev/null; then LIN=1; else LIN=0; fi
+$M -C /dev/md/q44c -e amd -n 2 $QL --run >/dev/null 2>&1; CN=$(cont1); G0=$(q44gen)
+OUT=$($M -C /dev/md/q44v -l linear -n2 -z 64M /dev/$CN --run 2>&1); RC=$?
+if [ $LIN = 0 ]; then
+check "44: kernel without md linear: -C Volume in the container: refused, said, nothing written" "[ $RC != 0 ] && echo \"\$OUT\" | grep -q 'this kernel has no md linear' && [ \$(q44vols) = 0 ] && [ \"\$(q44gen)\" = '$G0' ]"
+OUT=$($M -C /dev/md/q44v -e amd -l linear -n2 -z 64M $QL --run 2>&1); RC=$?
+check "44: ... -C -e amd Volume, the disks given: refused, said, nothing written" "[ $RC != 0 ] && echo \"\$OUT\" | grep -q 'this kernel has no md linear' && [ \$(q44vols) = 0 ] && [ \"\$(q44gen)\" = '$G0' ]"
+V0=$(q44vols); OUT=$($M -C /dev/md/q44r -l0 -n2 -z 64M /dev/$CN --run 2>&1); RC=$?
+check "44: ... RAID0 in the same container: created" "[ $RC = 0 ] && [ \$(q44vols) = $((V0 + 1)) ] && grep -q '^md.* : active raid0' /proc/mdstat"
+else
+check "44: kernel with md linear: -C Volume: created and running" "[ $RC = 0 ] && [ \$(q44vols) = 1 ] && grep -q '^md.* : active linear' /proc/mdstat"
+fi
+q44drop; rmdir $Q44
+fi
+# --- end of stage 44 ---
+
 # the ASRock and X399 snapshots are untouched: attached before stage 7, assembled only in stage 1
 if want 1; then
 # reg <image> <fixture> <LBA>: the image has the fixture (xz or raw) at that LBA

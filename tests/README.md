@@ -1,6 +1,6 @@
 # Test suite
 
-Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 573 checks in 55
+Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 586 checks in 57
 stages, on images of real AMD RAID disks, of disks made by the board's own RAID firmware in emulation, and of
 disks this mdadm makes. Everything runs on loop devices of sparse files (plus LIO SCSI disks backed by files for
 the udev stages); no real disk is touched unless you provide the optional AMD controller disks below.
@@ -111,6 +111,8 @@ about the X399 fixture (its dump has no LBA 0), printed by `-E` inside checks.
 | 40 | XFS, btrfs, LUKS or LVM on a whole disk: `-C` reports it and asks, `--add` to a container refuses it (`xfsprogs`, `cryptsetup`, `lvm2`; skipped without them) |
 | 41 | a crash, then the AMD Windows driver clears the AMD bitmap: mdmon's shadow of it still says dirty, the next assembly resyncs (RAID1/5/10, and RAID1 with an md bitmap by its bits only); a clean stop leaves no dirty shadow |
 | 42 | the bit rcraid.sys 9.5 sets in LD.Flags during a rebuild or an initialization is cleared when mdmon ends the transform |
+| 43 | a check of a volume cut short in Windows (CHECK_REDUNDANCY): the volume runs read-write, md resyncs from the AMD log's mark, the end is recorded as the AMD driver records it |
+| 44 | `-C` of a Volume (linear) on a kernel with no md linear (Debian 13, Ubuntu 24.04): refused before anything is written; on a kernel with it, created and running |
 
 Fixtures and where they come from: [fixtures/README.md](fixtures/README.md). `helpers/` has the scripts that
 forge metadata with valid checksums for some stages; `../tools/amdraid_dump.py` parses it.

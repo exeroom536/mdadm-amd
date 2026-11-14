@@ -18,11 +18,15 @@ write-intent bitmap on recent kernels.
 
 - **BIOS.** Set the SATA mode to RAID. The disks must be AMD RAID disks: initialized in the RAIDXpert2 menu, or by
   `mdadm --create --metadata=amd` after installing. mdadm takes only disks behind the controllers the firmware uses
-  for RAID (EFI variable `AMD_RAID`); `--force` overrides that.
+  for RAID (EFI variable `AMD_RAID`); `--force` overrides that. Disks that are not behind a PCI controller, such as
+  loop devices over image files, are taken as they are; each disk needs at least 552 MiB.
 - **Kernel.** RAID0, RAID1, RAID10, RAID5 and RAIDABLE work on any current kernel. Volume (linear) arrays need the
-  `md-linear` module: Linux 6.14 and later, or a kernel that ships it (RHEL 10 and its rebuilds do in their 6.12;
-  Debian does not build it).
+  `md-linear` module: Linux 6.14 and later, or a kernel that ships it (RHEL 9 and 10 and their rebuilds do in their
+  5.14 and 6.12; Debian 13 and Ubuntu 24.04 do not). Without it `mdadm --create` refuses a Volume.
 - **Back up.** This is experimental code that writes RAID metadata. Never load `rcraid` on the same disks.
+- **Uninstalling** brings the distribution's `mdadm` and `mdmon` back, and they do not know the AMD metadata: do
+  it with no AMD volume in use, never with the root file system on one. (On Ubuntu 26.04 `needrestart` restarted
+  `mdmon` in the middle of the uninstall, and a system with its root on a volume hung.)
 - **Get the sources:**
 
   ```sh
@@ -40,6 +44,10 @@ How each distribution was checked is in [testing.md](testing.md#distributions).
 |---|---|
 | `mdadm-amd` | mdadm and mdmon with the AMD handler, the udev rule, the `amdraid` mkinitcpio hook and a shutdown hook. Replaces `mdadm`. |
 | `md-bitmap-ext-dkms` | optional: `md_mod` with the md bitmap fix, for Linux 6.18.57 to 6.18.63 and 7.3.0 to 7.3.4 ([details](#the-md-bitmap)) |
+
+Manjaro and EndeavourOS build and install them the same way. New EndeavourOS installs build their initramfs with
+dracut, not mkinitcpio: for booting from a volume there, use the dracut module (step 3 of
+[Fedora](#fedora-rhel-and-its-rebuilds)) instead of step 3 below; that was not tried.
 
 **1. Build.**
 
@@ -100,7 +108,8 @@ sudo pacman -R md-bitmap-ext-dkms        # if installed
 Debian's own initramfs scripts assemble the volumes with this mdadm as they are; Ubuntu's need one more file
 (step 4).
 
-Ubuntu 24.04 builds its initramfs with initramfs-tools; new installs of Ubuntu 26.04 use dracut, see
+Ubuntu 24.04 and Linux Mint 22, which is based on it, build their initramfs with initramfs-tools (on Mint, follow
+the Ubuntu steps); new installs of Ubuntu 26.04 use dracut, see
 [dracut systems](#ubuntu-2604-and-other-dracut-systems). On Ubuntu 25.10 the server and the desktop differ, and an
 upgraded system keeps what it had, so check:
 
@@ -126,6 +135,10 @@ for b in mdadm mdmon; do
 done
 ```
 
+If the root file system is on an AMD volume, run `sudo systemctl restart mdmon@md127` after installing a new build
+(the container is the `super external:amd` line of `/proc/mdstat`): the old `mdmon` keeps the deleted binary open,
+the root cannot be remounted read-only at shutdown, and the volume resyncs at the next boot.
+
 **3. udev rule** for disks attached after boot:
 
 ```sh
@@ -137,16 +150,20 @@ sed 's,/usr/bin/mdadm,/usr/sbin/mdadm,' packaging/arch/64-amd-raid-assembly.rule
 **4. Boot from a volume.** The initramfs assembles the volumes listed in `mdadm.conf`. On Ubuntu, also install the
 hook that puts the udev rule into the initramfs: Ubuntu waits 30 s for the root device before it runs its mdadm
 script, and with the rule udev assembles the volumes as soon as the disks show up. With a disk missing, the volume
-starts degraded after those 30 s.
+starts degraded after those 30 s. On both, install the `local-bottom` script too: with a disk missing, a volume the
+boot does not wait for is then started degraded by systemd 30 s after boot (this initramfs has no systemd to run
+mdadm's last-resort timer).
 
 ```sh
 sudo /usr/share/mdadm/mkconf force-generate /etc/mdadm/mdadm.conf
 sudo install -m755 /path/to/mdadm-amd/packaging/initramfs-tools/amdraid /etc/initramfs-tools/hooks/   # Ubuntu
+sudo install -m755 /path/to/mdadm-amd/packaging/initramfs-tools/local-bottom-amdraid \
+	/etc/initramfs-tools/scripts/local-bottom/amdraid
 sudo update-initramfs -u
 ```
 
-**Uninstall.** Remove `/usr/lib/udev/rules.d/64-amd-raid-assembly.rules` and `/etc/initramfs-tools/hooks/amdraid`,
-then:
+**Uninstall.** Remove `/usr/lib/udev/rules.d/64-amd-raid-assembly.rules`, `/etc/initramfs-tools/hooks/amdraid` and
+`/etc/initramfs-tools/scripts/local-bottom/amdraid`, then:
 
 ```sh
 for b in mdadm mdmon; do sudo rm /usr/sbin/$b && sudo dpkg-divert --rename --remove /usr/sbin/$b; done
@@ -182,33 +199,50 @@ cd /path/to/mdadm-amd
 sudo cp -r packaging/dracut/90amdraid /usr/lib/dracut/modules.d/
 sudo chmod 755 /usr/lib/dracut/modules.d/90amdraid/module-setup.sh
 sudo cp packaging/dracut/90amdraid/64-amd-raid-assembly.rules /usr/lib/udev/rules.d/
+for u in timer service; do
+	sudo install -Dm644 packaging/dracut/90amdraid/last-resort-$u.conf \
+		/usr/lib/systemd/system/mdadm-last-resort@.$u.d/amdraid.conf
+done
 sudo dracut -f
 ```
+
+The two `last-resort` files keep mdadm's last-resort timer running past the switch to the real root, so that a volume
+the boot does not need also starts degraded when a disk is missing.
 
 **4. Keep it in place.** An update of the `mdadm` package writes its own binaries back. Hold the package with
 dnf's versionlock, or install these again after each update:
 
 ```sh
+sudo dnf install 'dnf-command(versionlock)'    # RHEL 9 and 10 need the plugin; Fedora's dnf has the command
 sudo dnf versionlock add mdadm
 ```
 
 SELinux needs nothing beyond the labels set by `restorecon`. `rd.md=0` on the kernel command line turns the module
 off, as it does `mdraid`.
 
-**Uninstall.** Remove `/usr/lib/dracut/modules.d/90amdraid` and `/usr/lib/udev/rules.d/64-amd-raid-assembly.rules`,
-then `sudo dnf versionlock delete mdadm; sudo dnf reinstall mdadm; sudo dracut -f`.
+**Uninstall.** Remove `/usr/lib/dracut/modules.d/90amdraid`, `/usr/lib/udev/rules.d/64-amd-raid-assembly.rules` and
+`/usr/lib/systemd/system/mdadm-last-resort@.{timer,service}.d/amdraid.conf`, then `sudo dnf versionlock delete mdadm; sudo dnf reinstall mdadm; sudo dracut -f`.
 
 ## openSUSE
 
-openSUSE Tumbleweed uses dracut as well; follow [Fedora](#fedora-rhel-and-its-rebuilds) with `zypper`:
+openSUSE Tumbleweed and Leap 16 use dracut as well; follow [Fedora](#fedora-rhel-and-its-rebuilds) with `zypper`:
 
 ```sh
 sudo zypper install gcc make git systemd-devel           # build
 sudo zypper install mdadm dracut grep sed                 # install
 ```
 
-Install `grep` and `sed` themselves: with the busybox variants dracut fails. SELinux on Tumbleweed needs the same
-`restorecon` line. To hold the package: `sudo zypper addlock mdadm`.
+Install `grep` and `sed` themselves: with the busybox variants dracut fails. SELinux on Tumbleweed and Leap 16 needs
+the same `restorecon` line. To hold the package: `sudo zypper addlock mdadm`. The minimal VM images come with
+`kernel-default-base`, which has no md modules; install `kernel-default`.
+
+**Uninstall.** Remove the files listed in Fedora's Uninstall, then:
+
+```sh
+sudo zypper removelock mdadm
+sudo zypper install --force mdadm
+sudo dracut -f
+```
 
 openSUSE Leap 15.6 cannot build current upstream mdadm (gcc 7 rejects code in `platform-intel.h`).
 
@@ -221,6 +255,14 @@ with `sudo update-initramfs -u` in place of `sudo dracut -f`. On Ubuntu `update-
 updates the copy the boot loader reads; with systemd-boot, `dracut -f` writes a file the boot entry does not use,
 and the system does not boot. AppArmor has no profile for mdadm or mdmon, so nothing more is needed. To hold the
 package: `sudo apt-mark hold mdadm`.
+
+**Uninstall.** Remove the files listed in Fedora's Uninstall, then:
+
+```sh
+sudo apt-mark unhold mdadm
+sudo apt install --reinstall mdadm
+sudo update-initramfs -u
+```
 
 ## Building mdadm from source
 

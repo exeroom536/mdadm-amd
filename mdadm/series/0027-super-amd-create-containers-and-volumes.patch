@@ -1,6 +1,6 @@
-From 9a931fd51b3c798adc778e7008d07fd8b0ddebfb Mon Sep 17 00:00:00 2001
+From 4d057963cab6f88a15702a0b108579b47c3fc754 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Sat, 14 Nov 2026 10:04:10 +0500
+Date: Sat, 14 Nov 2026 15:56:03 +0500
 Subject: [PATCH 27/33] super-amd: create containers and volumes
 
 - --create of a container: its disks are initialized as the BIOS menu
@@ -34,15 +34,18 @@ Subject: [PATCH 27/33] super-amd: create containers and volumes
 
 The levels, numbers of disks and chunk sizes are those AMD allows.  A
 volume is made on all its disks: "missing" is refused, as by IMSM, and
-so are --write-zeroes and --data-offset.
+so are --write-zeroes and --data-offset.  A Volume is refused when the
+kernel has no md linear (Debian 13 and Ubuntu 24.04 do not ship the
+module): md would load it only to start the volume, after the volume
+is written.
 
 Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
 ---
- super-amd.c | 1773 ++++++++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 1763 insertions(+), 10 deletions(-)
+ super-amd.c | 1807 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 1797 insertions(+), 10 deletions(-)
 
 diff --git a/super-amd.c b/super-amd.c
-index b3293dca..2255df26 100644
+index c68a50f6..ed8e4509 100644
 --- a/super-amd.c
 +++ b/super-amd.c
 @@ -10,7 +10,9 @@
@@ -72,7 +75,7 @@ index b3293dca..2255df26 100644
  #define AMD_MIB			0x800		/* sectors */
  /*
   * The controller serial number of the AMD BIOS and Windows driver alike: a
-@@ -392,6 +396,7 @@ struct amd_disk {
+@@ -393,6 +397,7 @@ struct amd_disk {
   *  - ATTACH (struct amd_update_attach): it joined the container.
   */
  #define AMD_UPDATE_SPARE	1	/* struct amd_update_spare */
@@ -80,7 +83,7 @@ index b3293dca..2255df26 100644
  #define AMD_UPDATE_REMOVE	3
  #define AMD_UPDATE_ATTACH	5	/* amd_update_attach */
  
-@@ -492,6 +497,14 @@ struct amd_super {
+@@ -493,6 +498,14 @@ struct amd_super {
  	void *ldbuf;
  	unsigned int ldbuf_room;
  	bool busy;		/* mdmon: a thread works on it (amd_lock) */
@@ -95,7 +98,7 @@ index b3293dca..2255df26 100644
  	int whole;		/* it is a RAIDABLE: one whole disk free of volumes */
  };
  
-@@ -512,6 +525,7 @@ static void amd_reparse_without(struct amd_super *super, int gone);
+@@ -513,6 +526,7 @@ static void amd_reparse_without(struct amd_super *super, int gone);
  static struct amd_disk *amd_find_spare(struct amd_super *super,
  				       struct amd_vol *v, int slot,
  				       struct amd_element *el, int *recorded);
@@ -103,7 +106,7 @@ index b3293dca..2255df26 100644
  static int amd_pd_index(struct amd_super *super, __u64 id);
  static int amd_disk_in_volumes(struct amd_super *super, __u64 id);
  static void amd_kmsg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-@@ -555,6 +569,13 @@ static __u64 amd_sector_sum(const void *sector)
+@@ -556,6 +570,13 @@ static __u64 amd_sector_sum(const void *sector)
  	return amd_checksum((const char *)sector + 8, AMD_SECTOR - 8);
  }
  
@@ -117,7 +120,7 @@ index b3293dca..2255df26 100644
  static int amd_read(int fd, unsigned long long lba, void *buf, size_t len)
  {
  	ssize_t n;
-@@ -1846,6 +1867,8 @@ static struct amd_super *amd_new_super(void)
+@@ -1868,6 +1889,8 @@ static struct amd_super *amd_new_super(void)
  	struct amd_super *super = xcalloc(1, sizeof(*super));
  
  	super->current_vol = -1;
@@ -126,7 +129,7 @@ index b3293dca..2255df26 100644
  	super->iobuf = amd_alloc(AMD_SECTOR);
  	super->mmbuf = amd_alloc(AMD_SECTOR);
  	return super;
-@@ -2383,10 +2406,15 @@ static void amd_container_uuid(struct amd_super *super, int uuid[4])
+@@ -2405,10 +2428,15 @@ static void amd_container_uuid(struct amd_super *super, int uuid[4])
  	struct amd_super *set = NULL;
  	__u64 id = super->container_id;
  
@@ -143,7 +146,7 @@ index b3293dca..2255df26 100644
  	if (!super->from_md) {
  		set = amd_running_set(super, devnm);
  		if (set) {
-@@ -2613,6 +2641,35 @@ static int amd_container_disks(struct amd_super *super)
+@@ -2635,6 +2663,35 @@ static int amd_container_disks(struct amd_super *super)
  	return n;
  }
  
@@ -179,7 +182,7 @@ index b3293dca..2255df26 100644
  /* getinfo_super_amd of volume super->current_vol, as on disk @disk */
  static void amd_getinfo_volume(struct supertype *st, struct mdinfo *info,
  			       struct amd_disk *disk)
-@@ -2622,6 +2679,10 @@ static void amd_getinfo_volume(struct supertype *st, struct mdinfo *info,
+@@ -2644,6 +2701,10 @@ static void amd_getinfo_volume(struct supertype *st, struct mdinfo *info,
  	int i;
  
  	amd_fill_volume(super, super->current_vol, info);
@@ -190,7 +193,7 @@ index b3293dca..2255df26 100644
  	info->disk.raid_disk = -1;
  	for (i = 0; i < v->nel; i++)
  		if (__le64_to_cpu(v->el[i].id.id) == disk->device_id) {
-@@ -2656,6 +2717,8 @@ static void amd_getinfo_container(struct amd_super *super, struct mdinfo *info,
+@@ -2678,6 +2739,8 @@ static void amd_getinfo_container(struct amd_super *super, struct mdinfo *info,
  	 * that came first would keep all the others out).
  	 */
  	info->array.raid_disks = 0;
@@ -199,7 +202,7 @@ index b3293dca..2255df26 100644
  
  	idx = amd_pd_index(super, disk->device_id);
  	info->disk.number = idx;
-@@ -2691,6 +2754,12 @@ static void getinfo_super_amd(struct supertype *st, struct mdinfo *info,
+@@ -2713,6 +2776,12 @@ static void getinfo_super_amd(struct supertype *st, struct mdinfo *info,
  	int map_disks = info->array.raid_disks;
  
  	memset(info, 0, sizeof(*info));
@@ -212,7 +215,7 @@ index b3293dca..2255df26 100644
  	if (!disk)
  		return;
  	if (super->current_vol >= 0 && super->current_vol < super->nvol)
-@@ -2703,7 +2772,7 @@ static void getinfo_super_amd(struct supertype *st, struct mdinfo *info,
+@@ -2725,7 +2794,7 @@ static void getinfo_super_amd(struct supertype *st, struct mdinfo *info,
   * Are @first and @second disks of one container?  Of the set @first
   * belongs to (amd_find_set) - the configuration of @first alone may not
   * list @second: a disk added while @first was away.  Disks without a
@@ -221,7 +224,7 @@ index b3293dca..2255df26 100644
   */
  static int amd_same_set(struct amd_super *first, struct amd_super *second)
  {
-@@ -2713,7 +2782,8 @@ static int amd_same_set(struct amd_super *first, struct amd_super *second)
+@@ -2735,7 +2804,8 @@ static int amd_same_set(struct amd_super *first, struct amd_super *second)
  	int u1[4], u2[4];
  	int same;
  
@@ -231,7 +234,7 @@ index b3293dca..2255df26 100644
  		amd_container_uuid(first, u1);
  		amd_container_uuid(second, u2);
  		return memcmp(u1, u2, sizeof(u1)) == 0;
-@@ -4058,14 +4128,68 @@ static int update_super_amd(struct supertype *st, struct mdinfo *info,
+@@ -4081,14 +4151,68 @@ static int update_super_amd(struct supertype *st, struct mdinfo *info,
  	return update == UOPT_SPEC_ASSEMBLE ? 0 : -1;
  }
  
@@ -300,7 +303,7 @@ index b3293dca..2255df26 100644
  /*
   * ATA IDENTIFY DEVICE through SG_IO (ATA PASS-THROUGH(16)); 0 on success.
   * Not drive_encryption.c's ata_pass_through12_ioctl(): it sets CK_COND and
-@@ -4099,6 +4223,78 @@ static int amd_ata_identify(int fd, __u16 *id)
+@@ -4122,6 +4246,78 @@ static int amd_ata_identify(int fd, __u16 *id)
  	return 0;
  }
  
@@ -379,7 +382,7 @@ index b3293dca..2255df26 100644
  static int amd_is_nvme(int major, int minor)
  {
  	char real[PATH_MAX];
-@@ -4166,6 +4362,609 @@ static void amd_fill_pd(struct amd_pd *pd, __u64 id, int handle,
+@@ -4189,6 +4385,643 @@ static void amd_fill_pd(struct amd_pd *pd, __u64 id, int handle,
  	pd->features = __cpu_to_le32(features);
  }
  
@@ -986,10 +989,44 @@ index b3293dca..2255df26 100644
 +	return 1;
 +}
 +
++/* md lists the personalities it has on the first line of /proc/mdstat */
++static int amd_md_has_linear(void)
++{
++	char line[1024];
++	FILE *f = fopen("/proc/mdstat", "r");
++	int found = 0;
++
++	if (!f)
++		return 0;
++	if (fgets(line, sizeof(line), f))
++		found = strstr(line, "[linear]") != NULL;
++	fclose(f);
++	return found;
++}
++
++/*
++ * md linear is a module of its own (md-linear; "linear" up to Linux 6.7,
++ * gone in 6.8 to 6.13), and Debian 13 and Ubuntu 24.04 do not ship it.  md loads it only to
++ * start the volume - after Create has recorded the volume in the AMD
++ * configuration, so a Volume that cannot run stayed there (q7distro).
++ * Load it now, as md would, and refuse before writing.
++ */
++static int amd_linear_ok(int verbose)
++{
++	if (amd_md_has_linear())
++		return 1;
++	if (system("modprobe md-linear >/dev/null 2>&1") == 0 &&
++	    amd_md_has_linear())
++		return 1;
++	if (verbose)
++		pr_err("this kernel has no md linear (module md-linear): it cannot run an AMD RAID Volume\n");
++	return 0;
++}
++
  static int validate_geometry_amd(struct supertype *st, int level, int layout,
  				 int raiddisks, int *chunk,
  				 unsigned long long size,
-@@ -4173,9 +4972,87 @@ static int validate_geometry_amd(struct supertype *st, int level, int layout,
+@@ -4196,9 +5029,87 @@ static int validate_geometry_amd(struct supertype *st, int level, int layout,
  				 char *subdev, unsigned long long *freesize,
  				 int consistency_policy, int verbose)
  {
@@ -1035,7 +1072,7 @@ index b3293dca..2255df26 100644
 +				pr_err("the container has the maximum number of volumes\n");
 +			return 0;
 +		}
-+		return 1;
++		return level != LEVEL_LINEAR || amd_linear_ok(verbose);
 +	}
 +	/* -e amd and disks: the first of them loads the container */
 +	if (!super)
@@ -1063,7 +1100,7 @@ index b3293dca..2255df26 100644
 +			amd_explain_room(super, raiddisks, size);
 +		return 0;
 +	}
-+	return 1;
++	return level != LEVEL_LINEAR || amd_linear_ok(verbose);
 +}
 +
 +static void default_geometry_amd(struct supertype *st, int *level,
@@ -1080,7 +1117,7 @@ index b3293dca..2255df26 100644
  }
  
  static __u64 avail_size_amd(struct supertype *st, __u64 devsize,
-@@ -4187,6 +5064,290 @@ static __u64 avail_size_amd(struct supertype *st, __u64 devsize,
+@@ -4210,6 +5121,290 @@ static __u64 avail_size_amd(struct supertype *st, __u64 devsize,
  	return (devsize - AMD_DEFAULT_ALLOC_LBA - AMD_SERVICE) / AMD_MIB * AMD_MIB;
  }
  
@@ -1371,7 +1408,7 @@ index b3293dca..2255df26 100644
  /* end of the last section of the packet (PD, LD, 25BE, 25BF) */
  static unsigned int amd_sections_end(const struct amd_packet_header *h)
  {
-@@ -4225,6 +5386,21 @@ static void amd_packet_move(struct amd_super *super, void *p,
+@@ -4248,6 +5443,21 @@ static void amd_packet_move(struct amd_super *super, void *p,
  	super->packet_room = room;
  }
  
@@ -1393,7 +1430,7 @@ index b3293dca..2255df26 100644
  /*
   * Insert @size bytes of @rec (not in the packet) at offset @at, within the
   * sections; the packet grows to the sections rounded up to sectors and the
-@@ -4524,6 +5700,52 @@ refuse:
+@@ -4547,6 +5757,52 @@ refuse:
  static int add_to_super_amd(struct supertype *st, mdu_disk_info_t *dinfo,
  			    int fd, char *devname, unsigned long long data_offset)
  {
@@ -1446,7 +1483,7 @@ index b3293dca..2255df26 100644
  	if (dinfo->raid_disk < 0)
  		return amd_attach_disk(st, fd, devname);	/* mdmon */
  	pr_err("writing AMD RAID metadata is not supported yet\n");
-@@ -4571,9 +5793,257 @@ static int remove_from_super_amd(struct supertype *st, mdu_disk_info_t *dk)
+@@ -4594,9 +5850,257 @@ static int remove_from_super_amd(struct supertype *st, mdu_disk_info_t *dk)
  	return 0;
  }
  
@@ -1704,7 +1741,7 @@ index b3293dca..2255df26 100644
  
  	if (!super)
  		return 1;
-@@ -4582,12 +6052,127 @@ static int write_init_super_amd(struct supertype *st)
+@@ -4605,12 +6109,127 @@ static int write_init_super_amd(struct supertype *st)
  		super->attached = 0;
  		return 0;
  	}
@@ -1832,7 +1869,7 @@ index b3293dca..2255df26 100644
  	pr_err("storing AMD metadata on a single disk is not supported\n");
  	return 1;
  }
-@@ -5171,6 +6756,50 @@ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
+@@ -5194,6 +6813,50 @@ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
  	amd_reparse(super);
  }
  
@@ -1883,7 +1920,7 @@ index b3293dca..2255df26 100644
  /* Cut @size bytes at offset @at out of the LD section of the packet. */
  static void amd_cut_ld(struct amd_super *super, unsigned int at,
  		       unsigned int size)
-@@ -5622,16 +7251,18 @@ struct amd_update_spare {
+@@ -5650,16 +7313,18 @@ struct amd_update_spare {
  	struct amd_element el;
  };
  
@@ -1904,7 +1941,7 @@ index b3293dca..2255df26 100644
   */
  static int amd_update_type(const struct metadata_update *update)
  {
-@@ -5642,11 +7273,99 @@ static int amd_update_type(const struct metadata_update *update)
+@@ -5670,11 +7335,99 @@ static int amd_update_type(const struct metadata_update *update)
  	type = *(int *)update->buf;
  	if (type <= 0 || type >= (int)ARRAY_SIZE(amd_update_size))
  		return 0;
@@ -2005,7 +2042,7 @@ index b3293dca..2255df26 100644
  /*
   * The monitor's array of volume @vol, or NULL - not one it let go of
   * (amd_sync_progress): a volume started again may be another md array.
-@@ -5755,6 +7474,9 @@ static void amd_process_update(struct supertype *st,
+@@ -5783,6 +7536,9 @@ static void amd_process_update(struct supertype *st,
  	case AMD_UPDATE_SPARE:
  		amd_spare_update(st, buf);
  		break;
@@ -2015,7 +2052,7 @@ index b3293dca..2255df26 100644
  	case AMD_UPDATE_REMOVE:
  		amd_remove_disk(super, buf);
  		break;
-@@ -6052,6 +7774,34 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
+@@ -6080,6 +7836,34 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
  	return NULL;
  }
  
@@ -2050,7 +2087,7 @@ index b3293dca..2255df26 100644
  /*
   * A managed volume with a member out of service (recorded so in the
   * config: flags 0x4030, or no disk) gets that member's own disk back if
-@@ -6418,6 +8168,7 @@ struct superswitch super_amd = {
+@@ -6446,6 +8230,7 @@ struct superswitch super_amd = {
  	.detail_super	= detail_super_amd,
  	.brief_detail_super = brief_detail_super_amd,
  	.validate_geometry = validate_geometry_amd,
@@ -2058,7 +2095,7 @@ index b3293dca..2255df26 100644
  	.write_init_super = write_init_super_amd,
  	.add_to_super	= add_to_super_amd,
  	.remove_from_super	= remove_from_super_amd,
-@@ -6429,6 +8180,7 @@ struct superswitch super_amd = {
+@@ -6457,6 +8242,7 @@ struct superswitch super_amd = {
  	.avail_size	= avail_size_amd,
  	.compare_super	= compare_super_amd,
  	.load_super	= load_super_amd,
@@ -2066,7 +2103,7 @@ index b3293dca..2255df26 100644
  	.store_super	= store_super_amd,
  	.free_super	= free_super_amd,
  	.match_metadata_desc = match_metadata_desc_amd,
-@@ -6443,5 +8195,6 @@ struct superswitch super_amd = {
+@@ -6471,5 +8257,6 @@ struct superswitch super_amd = {
  	.set_disk	= amd_mon_set_disk,
  	.sync_metadata	= amd_mon_sync_metadata,
  	.process_update	= amd_mon_process_update,
