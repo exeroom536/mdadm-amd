@@ -1,6 +1,6 @@
-From dfe89e1a9e9f75e1ba1c99caba934cccf1cf9f1f Mon Sep 17 00:00:00 2001
+From 763e71000e66c86de3c33c57ed83eb6456392b24 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Sat, 14 Nov 2026 01:35:09 +0500
+Date: Sat, 14 Nov 2026 10:04:13 +0500
 Subject: [PATCH 28/33] super-amd: add disks, delete and update volumes
 
 - --add to the container: a new disk becomes an AMD global hot spare,
@@ -31,7 +31,7 @@ Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
  1 file changed, 673 insertions(+), 11 deletions(-)
 
 diff --git a/super-amd.c b/super-amd.c
-index d6451543..4fb12d04 100644
+index 2255df26..b14ac99b 100644
 --- a/super-amd.c
 +++ b/super-amd.c
 @@ -12,7 +12,9 @@
@@ -45,7 +45,7 @@ index d6451543..4fb12d04 100644
   *
   * On-disk layout, little-endian, 512-byte sectors:
   *   LBA 0x5000         RC_MetaData: per-disk label, "RAIDCore", DeviceId
-@@ -118,6 +120,7 @@
+@@ -120,6 +122,7 @@
   * Of a RAID0 or Volume it keeps no 0x10 at all (@140018b80).
   */
  #define AMD_ELEMENT_FAILED	0x10
@@ -53,7 +53,7 @@ index d6451543..4fb12d04 100644
  #define AMD_ELEMENT_OFFLINE	0x30
  /*
   * The failure is committed to the configuration (rcblob
-@@ -358,6 +361,7 @@ struct amd_disk {
+@@ -364,6 +367,7 @@ struct amd_disk {
  	int write_failed;	/* a configuration write to it failed: stale until back */
  	int rejoin;		/* a former member rebuilt in place: gets configs again */
  	int removed;		/* taken out of the container (mdmon): gone, as missing */
@@ -61,7 +61,7 @@ index d6451543..4fb12d04 100644
  	__u64 last_online;	/* LastOnlineSerialNumber of its commit block */
  	int foreign;		/* ... not AMD_SERIAL: last online on another controller */
  	int mbr;		/* LBA 0 against its label: AMD_MBR_* */
-@@ -392,7 +396,10 @@ struct amd_disk {
+@@ -398,7 +402,10 @@ struct amd_disk {
  #define AMD_UPDATE_SPARE	1	/* struct amd_update_spare */
  #define AMD_UPDATE_CREATE	2	/* struct amd_update_create */
  #define AMD_UPDATE_REMOVE	3
@@ -72,7 +72,7 @@ index d6451543..4fb12d04 100644
  
  struct amd_update_disk {
  	int type;
-@@ -484,6 +491,8 @@ struct amd_super {
+@@ -490,6 +497,8 @@ struct amd_super {
  	int foreign;		/* the live packet is from a disk last online elsewhere */
  	int from_md;		/* the disks of a running container (amd_load_md) */
  	int attached;		/* add_to_super took a disk in, nothing to init */
@@ -81,7 +81,7 @@ index d6451543..4fb12d04 100644
  	void *iobuf;		/* one sector, for mdmon's writes */
  	/* ... for reads and writes under amd_lock by managemon (and mdadm) */
  	void *mmbuf;
-@@ -3346,8 +3355,9 @@ static void amd_pd_states(struct amd_super *super)
+@@ -3438,8 +3447,9 @@ static void amd_pd_states(struct amd_super *super)
  		    (state != AMD_DEV_STATE_ONLINE && state != AMD_DEV_STATE_OFFLINE))
  			continue;
  		d = amd_find_disk(super, __le64_to_cpu(pd->id.id));
@@ -92,7 +92,7 @@ index d6451543..4fb12d04 100644
  		       AMD_DEV_STATE_ONLINE : AMD_DEV_STATE_OFFLINE;
  		if (state != want) {
  			pd->device_state = __cpu_to_le32(want);
-@@ -4058,6 +4068,7 @@ static int update_super_amd(struct supertype *st, struct mdinfo *info,
+@@ -4156,6 +4166,7 @@ static int update_super_amd(struct supertype *st, struct mdinfo *info,
  static int amd_insert_ld(struct amd_super *super, unsigned int at,
  			 const void *rec, unsigned int size);
  static int amd_packet_reserve(struct amd_super *super, unsigned int size);
@@ -100,7 +100,7 @@ index d6451543..4fb12d04 100644
  static int amd_erase(int fd);
  static int amd_in_volume(const struct amd_vol *v, __u64 id);
  static int amd_vol_has_disk(const struct amd_vol *v, __u64 id);
-@@ -4725,6 +4736,155 @@ static int amd_pick_disk(struct supertype *st, char *subdev, int whole,
+@@ -4823,6 +4834,155 @@ static int amd_pick_disk(struct supertype *st, char *subdev, int whole,
  	return 1;
  }
  
@@ -256,7 +256,7 @@ index d6451543..4fb12d04 100644
  /* map_update() frees the entry's path before copying the new one */
  static void amd_map_set_uuid(struct map_ent **map, struct map_ent *me,
  			     int uuid[4])
-@@ -4738,6 +4898,31 @@ static void amd_map_set_uuid(struct map_ent **map, struct map_ent *me,
+@@ -4836,6 +4996,31 @@ static void amd_map_set_uuid(struct map_ent **map, struct map_ent *me,
  	free(path);
  }
  
@@ -288,7 +288,7 @@ index d6451543..4fb12d04 100644
  /*
   * Send the updates queued for mdmon and see that it has recorded them.  It
   * sends no answer, and an update that no longer fits its configuration -
-@@ -4775,6 +4960,87 @@ static int amd_mdmon_recorded(struct supertype *st,
+@@ -4873,6 +5058,87 @@ static int amd_mdmon_recorded(struct supertype *st,
  	return rv;
  }
  
@@ -376,7 +376,7 @@ index d6451543..4fb12d04 100644
  /* the LD record with volume ID @id in the packet, any type; NULL if none */
  static struct amd_ld *amd_ld_by_id(struct amd_super *super, __u64 id)
  {
-@@ -4788,6 +5054,17 @@ static struct amd_ld *amd_ld_by_id(struct amd_super *super, __u64 id)
+@@ -4886,6 +5152,17 @@ static struct amd_ld *amd_ld_by_id(struct amd_super *super, __u64 id)
  	return NULL;
  }
  
@@ -394,7 +394,7 @@ index d6451543..4fb12d04 100644
  /* @subdev can be a disk of the container: a whole disk, not in use */
  static int amd_validate_disk(struct supertype *st, char *subdev,
  			     unsigned long long *freesize, int verbose)
-@@ -4797,11 +5074,10 @@ static int amd_validate_disk(struct supertype *st, char *subdev,
+@@ -4895,11 +5172,10 @@ static int amd_validate_disk(struct supertype *st, char *subdev,
  	unsigned int sectsize;
  	int fd;
  
@@ -409,7 +409,7 @@ index d6451543..4fb12d04 100644
  	fd = open(subdev, O_RDONLY | O_EXCL);
  	if (!is_fd_valid(fd)) {
  		if (verbose)
-@@ -5454,6 +5730,98 @@ static void amd_rebuild_pd(struct amd_super *super, struct amd_element *el,
+@@ -5552,6 +5828,98 @@ static void amd_rebuild_pd(struct amd_super *super, struct amd_element *el,
  		el->id.handle = super->pd[i]->id.handle;
  }
  
@@ -508,7 +508,7 @@ index d6451543..4fb12d04 100644
  /*
   * A disk joins the running container (udev adds disks one at a time, or
   * mdadm --add): managemon calls add_to_super.  It only reads the disk's
-@@ -5545,8 +5913,20 @@ static void amd_attach_update(struct supertype *st,
+@@ -5643,8 +6011,20 @@ static void amd_attach_update(struct supertype *st,
  			     !amd_disk_in_volumes(super, u->id)))
  		goto refuse;
  	d = amd_find_disk(super, u->id);
@@ -531,7 +531,7 @@ index d6451543..4fb12d04 100644
  		if (!d) {
  			d = rec;
  			rec = NULL;
-@@ -5648,9 +6028,16 @@ static int add_to_super_amd(struct supertype *st, mdu_disk_info_t *dinfo,
+@@ -5746,9 +6126,16 @@ static int add_to_super_amd(struct supertype *st, mdu_disk_info_t *dinfo,
  		super->add_slot = dinfo->raid_disk;
  		return 0;
  	}
@@ -549,7 +549,7 @@ index d6451543..4fb12d04 100644
  	return 1;
  }
  
-@@ -5836,6 +6223,12 @@ static int amd_has_volume(struct amd_super *super, const void *id)
+@@ -5934,6 +6321,12 @@ static int amd_has_volume(struct amd_super *super, const void *id)
  	return amd_ld_by_id(super, *(const __u64 *)id) != NULL;
  }
  
@@ -562,7 +562,7 @@ index d6451543..4fb12d04 100644
  /*
   * --create while mdmon runs the container: mdmon records new volume @v -
   * or not, if a rebuild it began meanwhile took an extent of it, as onto a
-@@ -6075,7 +6468,7 @@ static int store_super_amd(struct supertype *st, int fd)
+@@ -6173,7 +6566,7 @@ static int store_super_amd(struct supertype *st, int fd)
  	/* Kill() frees the loaded metadata before asking us to store it */
  	if (st->sb == NULL)
  		return amd_erase(fd);
@@ -571,7 +571,7 @@ index d6451543..4fb12d04 100644
  	return 1;
  }
  
-@@ -6658,6 +7051,126 @@ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
+@@ -6756,6 +7149,126 @@ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
  	amd_reparse(super);
  }
  
@@ -698,7 +698,7 @@ index d6451543..4fb12d04 100644
  /* the volume number of member array @devnm (its metadata_version: "/md127/1"), or -1 */
  static int amd_devnm_volume(struct amd_super *super, char *devnm)
  {
-@@ -6702,6 +7215,120 @@ static int amd_rebuilt_into(struct amd_super *super, const struct amd_disk *d)
+@@ -6800,6 +7313,120 @@ static int amd_rebuilt_into(struct amd_super *super, const struct amd_disk *d)
  	return vol;
  }
  
@@ -819,7 +819,7 @@ index d6451543..4fb12d04 100644
  /* Cut @size bytes at offset @at out of the LD section of the packet. */
  static void amd_cut_ld(struct amd_super *super, unsigned int at,
  		       unsigned int size)
-@@ -6908,6 +7535,7 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
+@@ -7008,6 +7635,7 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
  static void amd_flush_config(struct supertype *st)
  {
  	struct amd_super *super = st->sb;
@@ -827,7 +827,7 @@ index d6451543..4fb12d04 100644
  
  	if (!super->config_dirty)
  		return;
-@@ -6916,6 +7544,15 @@ static void amd_flush_config(struct supertype *st)
+@@ -7016,6 +7644,15 @@ static void amd_flush_config(struct supertype *st)
  		return;
  	}
  	super->config_dirty = 0;
@@ -843,7 +843,7 @@ index d6451543..4fb12d04 100644
  }
  
  /*
-@@ -7156,7 +7793,10 @@ static const unsigned int amd_update_size[] = {
+@@ -7256,7 +7893,10 @@ static const unsigned int amd_update_size[] = {
  	[AMD_UPDATE_SPARE]	= sizeof(struct amd_update_spare),
  	[AMD_UPDATE_CREATE]	= sizeof(struct amd_update_create),
  	[AMD_UPDATE_REMOVE]	= sizeof(struct amd_update_disk),
@@ -854,7 +854,7 @@ index d6451543..4fb12d04 100644
  };
  
  /*
-@@ -7180,7 +7820,10 @@ static int amd_update_type(const struct metadata_update *update)
+@@ -7280,7 +7920,10 @@ static int amd_update_type(const struct metadata_update *update)
  	return type;
  }
  
@@ -866,7 +866,7 @@ index d6451543..4fb12d04 100644
  static int amd_prepare_update(struct supertype *st,
  			      struct metadata_update *update)
  {
-@@ -7191,6 +7834,13 @@ static int amd_prepare_update(struct supertype *st,
+@@ -7291,6 +7934,13 @@ static int amd_prepare_update(struct supertype *st,
  		/* the monitor allocates nothing (amd_mm_room): zeroes to clear with */
  		update->space = amd_alloc(AMD_SERVICE_BYTES);
  		break;
@@ -880,7 +880,7 @@ index d6451543..4fb12d04 100644
  	default:
  		return 0;
  	}
-@@ -7380,9 +8030,19 @@ static void amd_process_update(struct supertype *st,
+@@ -7480,9 +8130,19 @@ static void amd_process_update(struct supertype *st,
  	case AMD_UPDATE_REMOVE:
  		amd_remove_disk(super, buf);
  		break;
@@ -900,7 +900,7 @@ index d6451543..4fb12d04 100644
  		for (a = st->arrays; a; a = a->next)
  			a->check_degraded = 1;
  		break;
-@@ -8072,6 +8732,8 @@ struct superswitch super_amd = {
+@@ -8172,6 +8832,8 @@ struct superswitch super_amd = {
  	.write_init_super = write_init_super_amd,
  	.add_to_super	= add_to_super_amd,
  	.remove_from_super	= remove_from_super_amd,

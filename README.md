@@ -84,7 +84,7 @@ More — spares, RAIDABLE, the md bitmap, failed disks, booting — in [docs/usa
 | [Usage](docs/usage.md) | creating and managing arrays, spares, failures, compatibility with the BIOS and Windows |
 | [Testing](docs/testing.md) | what was tested where, what was not, what is not supported |
 | [Development](docs/development.md) | repository layout, the patch series, the kernel and util-linux patches |
-| [Tests](tests/README.md) | the test suite (545 checks on loop devices) and how to run it |
+| [Tests](tests/README.md) | the test suite (573 checks on loop devices) and how to run it |
 | [Format](docs/format.md) | the on-disk format, with a source for each statement (in Russian) |
 | [Firmware bugs](docs/firmware-bugs.md) | known problems of the AMD RAID firmware |
 | [Benchmark](docs/benchmark.md) | md against AMD's own Linux and Windows drivers on the same volumes |
@@ -97,7 +97,7 @@ More — spares, RAIDABLE, the md bitmap, failed disks, booting — in [docs/usa
 - [x] md write-intent bitmap; RAIDABLE → RAID1 migration
 - [x] Detect XFS, btrfs, LUKS and LVM on a disk at `--add` and `--create`, as ext2/3/4 and ReiserFS
 - [ ] Start a volume that the boot does not need, left inactive after booting with a disk missing
-- [ ] The md bitmap and TRIM kernel fixes for 6.18 and 7.0 and later, as DKMS modules (today: Linux 7.3.0–7.3.4)
+- [ ] The md bitmap and TRIM kernel fixes for more kernels, as DKMS modules (today: the md bitmap on Linux 6.18.57–6.18.63 and 7.3.0–7.3.4)
 - [ ] Other AMD migrations: expansion, level and stripe size changes
 
 ## How it was made

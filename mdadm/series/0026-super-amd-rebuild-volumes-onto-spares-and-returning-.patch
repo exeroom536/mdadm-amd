@@ -1,6 +1,6 @@
-From ed3d0b805a94b58e90ddec083b23ace1529db5f5 Mon Sep 17 00:00:00 2001
+From 6d4991b010f06e3af763956f41b28e54701d29c3 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Sat, 14 Nov 2026 01:35:04 +0500
+Date: Sat, 14 Nov 2026 10:04:08 +0500
 Subject: [PATCH 26/33] super-amd: rebuild volumes onto spares and returning
  members
 
@@ -35,11 +35,11 @@ md finished while no mdmon watched.
 
 Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
 ---
- super-amd.c | 1581 ++++++++++++++++++++++++++++++++++++++++++++++++++-
- 1 file changed, 1570 insertions(+), 11 deletions(-)
+ super-amd.c | 1584 ++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 1573 insertions(+), 11 deletions(-)
 
 diff --git a/super-amd.c b/super-amd.c
-index 97d5d5c0..9136a29f 100644
+index 32628ad4..b3293dca 100644
 --- a/super-amd.c
 +++ b/super-amd.c
 @@ -8,8 +8,9 @@
@@ -72,7 +72,7 @@ index 97d5d5c0..9136a29f 100644
  
  #define AMD_SECTOR		512
  #define AMD_METADATA_LBA	0x5000
-@@ -111,9 +115,26 @@
+@@ -113,9 +117,29 @@
   */
  #define AMD_ELEMENT_FAILED	0x10
  #define AMD_ELEMENT_OFFLINE	0x30
@@ -91,15 +91,18 @@ index 97d5d5c0..9136a29f 100644
 +/*
 + * RC_LogicalDevice.Flags set while RESTORE_SEGMENTS runs (the ring of an
 + * X399 RAID10); the LD a migration starts from has the same SRC flags
-+ * (rcraid 9.3.3 midway through RAIDABLE -> RAID1).
++ * (rcraid 9.3.3 midway through RAIDABLE -> RAID1).  rcraid.sys 9.5.0.201
++ * sets 0x20000000 too, in both LDs, while it creates, rebuilds or checks
++ * a volume, and clears it with the rest as it ends: of a transform mdmon
++ * ends, it keeps the bit until its own next one (Windows in a VM,
++ * q4-judge95).
 + */
 +#define AMD_LDF_RESTORE_SRC	0x20010
 +#define AMD_LDF_RESTORE_DST	0x10020000
-+#define AMD_LDF_TRANSFORM	0x10020094	/* cleared when it ends */
+ #define AMD_LDF_TRANSFORM	0x30020094	/* cleared when it ends */
  
  /* SpareInfo of a PD: a global hot spare */
- #define AMD_SPARE_GLOBAL	0x100
-@@ -331,6 +352,7 @@ struct amd_disk {
+@@ -334,6 +358,7 @@ struct amd_disk {
  	/* md failed it (a member, or a rebuild onto it): not again until back */
  	int spare_failed;
  	int write_failed;	/* a configuration write to it failed: stale until back */
@@ -107,7 +110,7 @@ index 97d5d5c0..9136a29f 100644
  	int removed;		/* taken out of the container (mdmon): gone, as missing */
  	__u64 last_online;	/* LastOnlineSerialNumber of its commit block */
  	int foreign;		/* ... not AMD_SERIAL: last online on another controller */
-@@ -355,6 +377,15 @@ struct amd_disk {
+@@ -358,6 +383,15 @@ struct amd_disk {
  /* the one partition AMD writes in LBA 0 (RAIDCoreDxe FUN_00016e28) */
  #define AMD_MBR_TYPE	0x82
  #define AMD_MBR_START	0x3f	/* its first sector */
@@ -123,7 +126,7 @@ index 97d5d5c0..9136a29f 100644
  #define AMD_UPDATE_REMOVE	3
  #define AMD_UPDATE_ATTACH	5	/* amd_update_attach */
  
-@@ -399,6 +430,16 @@ struct amd_vol_mon {
+@@ -402,6 +436,16 @@ struct amd_vol_mon {
  	unsigned long long ckpt_seen;	/* the monitor's checkpoint, last call */
  	int members_checked;	/* the members md runs without are recorded (amd_mark_missing) */
  	int init_done;		/* md finished the init: record that at sync_metadata */
@@ -140,7 +143,7 @@ index 97d5d5c0..9136a29f 100644
  	unsigned long long init_ckpt;	/* volume sectors md has initialized */
  	int init_tlog;		/* 1: write init_ckpt to the log, 2: clear it */
  };
-@@ -424,6 +465,8 @@ struct amd_super {
+@@ -427,6 +471,8 @@ struct amd_super {
  	struct amd_disk *disks;
  	void *packet;		/* live config packet */
  	unsigned int packet_len;
@@ -149,7 +152,7 @@ index 97d5d5c0..9136a29f 100644
  	__u64 generation;
  	__u64 serial;		/* controller serial number */
  	__u64 container_id;	/* lowest DeviceId among RAIDCore disks */
-@@ -440,20 +483,29 @@ struct amd_super {
+@@ -443,20 +489,29 @@ struct amd_super {
  	/* ... for reads and writes under amd_lock by managemon (and mdadm) */
  	void *mmbuf;
  	/* mdmon: the LD a rebuild goes into is made here (amd_rebuild_ld) */
@@ -179,7 +182,7 @@ index 97d5d5c0..9136a29f 100644
  static int amd_pd_index(struct amd_super *super, __u64 id);
  static int amd_disk_in_volumes(struct amd_super *super, __u64 id);
  static void amd_kmsg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-@@ -543,6 +595,22 @@ static unsigned long long amd_align_capacity(unsigned long long sectors)
+@@ -546,6 +601,22 @@ static unsigned long long amd_align_capacity(unsigned long long sectors)
  	       AMD_DEFAULT_ALLOC_LBA;
  }
  
@@ -202,7 +205,7 @@ index 97d5d5c0..9136a29f 100644
  /*
   * PacketSize of LD record @ld by its counts (RAIDCoreDxe FUN_00006a80,
   * FUN_00025f74): the record, its elements, its parent references and its
-@@ -679,6 +747,22 @@ static struct amd_dev_id *amd_ld_spares(const struct amd_ld *ld)
+@@ -682,6 +753,22 @@ static struct amd_dev_id *amd_ld_spares(const struct amd_ld *ld)
  	return parents + __le32_to_cpu(ld->parent_count);
  }
  
@@ -225,7 +228,7 @@ index 97d5d5c0..9136a29f 100644
  /*
   * Slot @i of @v is in service in the LD and, while a transform runs, in
   * its second copy too: the AMD BIOS takes a stale member out of the second
-@@ -694,6 +778,46 @@ static int amd_slot_usable(const struct amd_vol *v, int i)
+@@ -697,6 +784,46 @@ static int amd_slot_usable(const struct amd_vol *v, int i)
  	return 1;
  }
  
@@ -272,7 +275,7 @@ index 97d5d5c0..9136a29f 100644
  /*
   * The md level, layout and members of @v from its device type and its First
   * x Second elements; @data_disks: how many members' user data make up the
-@@ -888,6 +1012,7 @@ static void amd_classify_state(struct amd_vol *v)
+@@ -891,6 +1018,7 @@ static void amd_classify_state(struct amd_vol *v)
  	 * any other the volume is not assembled.
  	 */
  	transform = ld->transform_type && !v->init_pending &&
@@ -280,7 +283,7 @@ index 97d5d5c0..9136a29f 100644
  		__le32_to_cpu(ld->transform_state) != AMD_TRANSFORM_COMPLETED &&
  		ld->transform_state;
  	if (v->single) {
-@@ -1585,6 +1710,7 @@ static void amd_take_packet(struct amd_super *super, void *packet,
+@@ -1588,6 +1716,7 @@ static void amd_take_packet(struct amd_super *super, void *packet,
  	free(super->packet);
  	super->packet = packet;
  	super->packet_len = len;
@@ -288,7 +291,7 @@ index 97d5d5c0..9136a29f 100644
  	super->generation = generation;
  	amd_parse_packet(super);
  }
-@@ -1728,8 +1854,10 @@ static void amd_free(struct amd_super *super)
+@@ -1731,8 +1860,10 @@ static void amd_free(struct amd_super *super)
  		amd_free_disk(d);
  	}
  	free(super->packet);
@@ -299,7 +302,7 @@ index 97d5d5c0..9136a29f 100644
  	free(super);
  }
  
-@@ -3046,6 +3174,29 @@ static unsigned long long amd_short_of_end(unsigned long long done,
+@@ -3135,6 +3266,29 @@ static unsigned long long amd_short_of_end(unsigned long long done,
  	return end > AMD_MIB ? (end - AMD_MIB) / AMD_MIB * AMD_MIB : 0;
  }
  
@@ -329,7 +332,7 @@ index 97d5d5c0..9136a29f 100644
  /*
   * Volume sector an initialization (CREATE_REDUNDANCY) of @v that was
   * stopped resumes from: what its transform log says, short of the end so
-@@ -3080,6 +3231,18 @@ static int amd_disk_failed(struct amd_super *super, __u64 id)
+@@ -3169,6 +3323,18 @@ static int amd_disk_failed(struct amd_super *super, __u64 id)
  	return 0;
  }
  
@@ -348,7 +351,7 @@ index 97d5d5c0..9136a29f 100644
  /* a configuration write to @d failed: it gets no further ones (amd_write_config) */
  static void amd_write_failed(struct amd_disk *d)
  {
-@@ -3258,6 +3421,7 @@ static int amd_disk_idle(struct amd_super *super, const struct amd_disk *d)
+@@ -3347,6 +3513,7 @@ static int amd_disk_idle(struct amd_super *super, const struct amd_disk *d)
  	       d->generation <= super->generation &&
  	       d->foreign == super->foreign &&
  	       amd_pd_index(super, d->device_id) >= 0 &&
@@ -356,7 +359,7 @@ index 97d5d5c0..9136a29f 100644
  	       !amd_disk_guarded(super, d, d->device_id);
  }
  
-@@ -3336,12 +3500,19 @@ static int amd_write_config(struct amd_super *super)
+@@ -3425,12 +3592,19 @@ static int amd_write_config(struct amd_super *super)
  		return -1;
  	for (d = super->disks; d; d = d->next) {
  		/*
@@ -380,7 +383,7 @@ index 97d5d5c0..9136a29f 100644
  		if (d->update && d->fd < 0)
  			return -1;	/* all of them, or none */
  		d->update |= amd_disk_idle(super, d);
-@@ -3373,6 +3544,22 @@ static int amd_write_config(struct amd_super *super)
+@@ -3462,6 +3636,22 @@ static int amd_write_config(struct amd_super *super)
  	return 0;
  }
  
@@ -403,7 +406,7 @@ index 97d5d5c0..9136a29f 100644
  /* the md device of element @el of a volume, in slot @slot, on disk @d */
  static struct mdinfo *amd_member_info(struct amd_super *super,
  				      const struct amd_element *el,
-@@ -3444,12 +3631,13 @@ static void amd_resync_start(struct amd_super *super, struct amd_vol *v,
+@@ -3535,12 +3725,13 @@ static void amd_resync_start(struct amd_super *super, struct amd_vol *v,
  	this->resync_start = amd_volume_to_sync(v, done);
  }
  
@@ -419,7 +422,7 @@ index 97d5d5c0..9136a29f 100644
  
  	for (i = 0; i < v->nel; i++) {
  		struct amd_element *el = &v->el[i];
-@@ -3462,12 +3650,46 @@ static void amd_volume_devs(struct amd_super *super, struct amd_vol *v,
+@@ -3553,12 +3744,46 @@ static void amd_volume_devs(struct amd_super *super, struct amd_vol *v,
  		d = amd_volume_disk(super, v, el);
  		if (!d || (d->major == 0 && d->minor == 0))
  			continue;
@@ -466,7 +469,7 @@ index 97d5d5c0..9136a29f 100644
  }
  
  static struct mdinfo *container_content_amd(struct supertype *st,
-@@ -3737,8 +3959,114 @@ static int update_super_amd(struct supertype *st, struct mdinfo *info,
+@@ -3832,8 +4057,114 @@ static int update_super_amd(struct supertype *st, struct mdinfo *info,
  	 */
  	return update == UOPT_SPEC_ASSEMBLE ? 0 : -1;
  }
@@ -581,7 +584,7 @@ index 97d5d5c0..9136a29f 100644
  
  static int validate_geometry_amd(struct supertype *st, int level, int layout,
  				 int raiddisks, int *chunk,
-@@ -3789,6 +4117,83 @@ static void amd_move_sections(struct amd_packet_header *h, unsigned int at,
+@@ -3884,6 +4215,83 @@ static void amd_move_sections(struct amd_packet_header *h, unsigned int at,
  		h->sep_offset = __cpu_to_le32(__le32_to_cpu(h->sep_offset) + delta);
  }
  
@@ -665,7 +668,7 @@ index 97d5d5c0..9136a29f 100644
  /* Is disk @id in an element of @v (or of its second LD copy)? */
  static int amd_vol_has_disk(const struct amd_vol *v, __u64 id)
  {
-@@ -3813,6 +4218,66 @@ static int amd_disk_in_volumes(struct amd_super *super, __u64 id)
+@@ -3908,6 +4316,66 @@ static int amd_disk_in_volumes(struct amd_super *super, __u64 id)
  	return 0;
  }
  
@@ -732,7 +735,7 @@ index 97d5d5c0..9136a29f 100644
  /*
   * A disk joins the running container (udev adds disks one at a time, or
   * mdadm --add): managemon calls add_to_super.  It only reads the disk's
-@@ -4040,6 +4505,9 @@ static int store_super_amd(struct supertype *st, int fd)
+@@ -4135,6 +4603,9 @@ static int store_super_amd(struct supertype *st, int fd)
   *  - the initialization (CREATE_REDUNDANCY) of a volume made in the BIOS:
   *    md resyncs it, and when that is done a new config packet has the
   *    transform completed (amd_finish_init);
@@ -742,7 +745,7 @@ index 97d5d5c0..9136a29f 100644
   * Other volumes are not taken.
   */
  static struct amd_vol *amd_active_vol(struct active_array *a)
-@@ -4076,11 +4544,54 @@ static void amd_kmsg(const char *fmt, ...)
+@@ -4171,11 +4642,54 @@ static void amd_kmsg(const char *fmt, ...)
  	close(fd);
  }
  
@@ -797,7 +800,7 @@ index 97d5d5c0..9136a29f 100644
  
  	if (inst < 0 || inst >= super->nvol)
  		return -ENODEV;
-@@ -4100,14 +4611,86 @@ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
+@@ -4195,14 +4709,86 @@ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
  	 * Here already, not only as the array leaves readonly (amd_set_array_state):
  	 * an mdmon that takes a running array over never sees that.
  	 */
@@ -884,7 +887,7 @@ index 97d5d5c0..9136a29f 100644
  /*
   * What md itself records as done, exact where a sync action was
   * interrupted (frozen, md -S, the shutdown): resync_start for an
-@@ -4118,6 +4701,8 @@ static void amd_mark_missing(struct active_array *a, struct amd_vol *v);
+@@ -4213,6 +4799,8 @@ static void amd_mark_missing(struct active_array *a, struct amd_vol *v);
   */
  static void amd_note_md_progress(struct active_array *a, struct amd_vol *v)
  {
@@ -893,7 +896,7 @@ index 97d5d5c0..9136a29f 100644
  	if (v->init_pending && !v->mon.init_done &&
  	    a->info.resync_start != MaxSector) {
  		unsigned long long cap = __le64_to_cpu(v->ld->capacity);
-@@ -4129,6 +4714,16 @@ static void amd_note_md_progress(struct active_array *a, struct amd_vol *v)
+@@ -4224,6 +4812,16 @@ static void amd_note_md_progress(struct active_array *a, struct amd_vol *v)
  			v->mon.init_tlog = 1;	/* written by amd_sync_metadata */
  		}
  	}
@@ -910,7 +913,7 @@ index 97d5d5c0..9136a29f 100644
  }
  
  /*
-@@ -4184,6 +4779,13 @@ static void amd_note_checkpoints(struct active_array *a, struct amd_vol *v)
+@@ -4279,6 +4877,13 @@ static void amd_note_checkpoints(struct active_array *a, struct amd_vol *v)
  		v->mon.init_ckpt = ckpt;
  		v->mon.init_tlog = 1;	/* written by amd_sync_metadata */
  	}
@@ -924,7 +927,7 @@ index 97d5d5c0..9136a29f 100644
  }
  
  static int amd_set_array_state(struct active_array *a, int consistent)
-@@ -4200,6 +4802,19 @@ static int amd_set_array_state(struct active_array *a, int consistent)
+@@ -4295,6 +4900,19 @@ static int amd_set_array_state(struct active_array *a, int consistent)
  		/* degraded: active, so that md rebuilds onto what it gets (as IMSM) */
  		if (amd_volume_state(a->container->sb, v) != AMD_LD_STATE_NORMAL)
  			consistent = 0;
@@ -944,7 +947,7 @@ index 97d5d5c0..9136a29f 100644
  	}
  	/*
  	 * An initialization not done yet is in the LD and its progress in the
-@@ -4262,6 +4877,39 @@ static void amd_set_disk(struct active_array *a, int n, int state)
+@@ -4357,6 +4975,39 @@ static void amd_set_disk(struct active_array *a, int n, int state)
  
  	if (!v || n < 0)
  		return;
@@ -984,7 +987,7 @@ index 97d5d5c0..9136a29f 100644
  	if (n >= v->nel || !(state & DS_FAULTY))
  		return;
  	d = amd_find_disk(super, __le64_to_cpu(v->el[n].id.id));
-@@ -4347,7 +4995,8 @@ static int amd_all_disks_here(struct amd_super *super)
+@@ -4442,7 +5093,8 @@ static int amd_all_disks_here(struct amd_super *super)
  		if ((!d || d->fd < 0) &&
  		    __le32_to_cpu(super->pd[i]->device_state) == AMD_DEV_STATE_OFFLINE)
  			continue;
@@ -994,7 +997,7 @@ index 97d5d5c0..9136a29f 100644
  			return 0;
  	}
  	return 1;
-@@ -4386,6 +5035,14 @@ static void amd_reparse_without(struct amd_super *super, int gone)
+@@ -4481,6 +5133,14 @@ static void amd_reparse_without(struct amd_super *super, int gone)
  	}
  }
  
@@ -1009,7 +1012,7 @@ index 97d5d5c0..9136a29f 100644
  /*
   * End a transform the way the AMD driver does (seen in the ring of an X399
   * RAID10 for RESTORE_SEGMENTS and CHECK_BITMAP_REDUNDANCY, and after a
-@@ -4454,6 +5111,170 @@ static void amd_finish_init(struct amd_super *super, int vol)
+@@ -4551,6 +5211,170 @@ static void amd_finish_init(struct amd_super *super, int vol)
  			  AMD_TRANSFORM_COMPLETED);
  }
  
@@ -1180,7 +1183,7 @@ index 97d5d5c0..9136a29f 100644
  /* write the configuration if it has changed */
  static void amd_flush_config(struct supertype *st)
  {
-@@ -4499,6 +5320,26 @@ static void amd_catch_up(struct amd_super *super)
+@@ -4596,6 +5420,26 @@ static void amd_catch_up(struct amd_super *super)
  	}
  }
  
@@ -1207,7 +1210,7 @@ index 97d5d5c0..9136a29f 100644
  /* write the transform log of @vol at @done, or say it could not */
  static int amd_sync_tlog(struct amd_super *super, int vol,
  			 unsigned long long done, __u32 type)
-@@ -4518,6 +5359,7 @@ static int amd_sync_tlog(struct amd_super *super, int vol,
+@@ -4615,6 +5459,7 @@ static int amd_sync_tlog(struct amd_super *super, int vol,
   */
  static void amd_sync_progress(struct supertype *st)
  {
@@ -1215,7 +1218,7 @@ index 97d5d5c0..9136a29f 100644
  	struct active_array *a;
  
  	for (a = st->arrays; a; a = a->next) {
-@@ -4540,9 +5382,12 @@ static void amd_sync_progress(struct supertype *st)
+@@ -4637,9 +5482,12 @@ static void amd_sync_progress(struct supertype *st)
  		if (!v->mon.members_checked && a->curr_state > readonly &&
  		    a->curr_state != bad_word) {
  			amd_mark_missing(a, v);
@@ -1228,7 +1231,7 @@ index 97d5d5c0..9136a29f 100644
  	}
  }
  
-@@ -4553,12 +5398,25 @@ static void amd_sync_transforms(struct amd_super *super)
+@@ -4650,12 +5498,25 @@ static void amd_sync_transforms(struct amd_super *super)
  
  	for (vol = 0; vol < super->nvol; vol++) {
  		struct amd_vol *v = &super->vol[vol];
@@ -1254,7 +1257,7 @@ index 97d5d5c0..9136a29f 100644
  		if (v->init_pending && v->mon.init_done && amd_all_disks_here(super))
  			amd_finish_init(super, vol);
  	}
-@@ -4572,11 +5430,44 @@ static void amd_sync_ended_logs(struct amd_super *super)
+@@ -4669,11 +5530,44 @@ static void amd_sync_ended_logs(struct amd_super *super)
  	for (vol = 0; vol < super->nvol && !super->config_dirty; vol++) {
  		struct amd_vol *v = &super->vol[vol];
  
@@ -1299,7 +1302,7 @@ index 97d5d5c0..9136a29f 100644
  /* The write-intent bitmaps of the managed volumes, as md has them */
  static void amd_sync_bitmaps(struct amd_super *super)
  {
-@@ -4615,12 +5506,25 @@ static void amd_sync_metadata(struct supertype *st)
+@@ -4712,12 +5606,25 @@ static void amd_sync_metadata(struct supertype *st)
  	amd_sync_transforms(super);
  	amd_flush_config(st);
  	amd_sync_ended_logs(super);
@@ -1325,7 +1328,7 @@ index 97d5d5c0..9136a29f 100644
  	[AMD_UPDATE_REMOVE]	= sizeof(struct amd_update_disk),
  	[AMD_UPDATE_ATTACH]	= sizeof(struct amd_update_attach),
  };
-@@ -4643,6 +5547,101 @@ static int amd_update_type(const struct metadata_update *update)
+@@ -4740,6 +5647,101 @@ static int amd_update_type(const struct metadata_update *update)
  	return type;
  }
  
@@ -1427,7 +1430,7 @@ index 97d5d5c0..9136a29f 100644
  static void amd_process_update(struct supertype *st,
  			       struct metadata_update *update)
  {
-@@ -4653,6 +5652,9 @@ static void amd_process_update(struct supertype *st,
+@@ -4750,6 +5752,9 @@ static void amd_process_update(struct supertype *st,
  	if (!super)
  		return;
  	switch (amd_update_type(update)) {
@@ -1437,7 +1440,7 @@ index 97d5d5c0..9136a29f 100644
  	case AMD_UPDATE_REMOVE:
  		amd_remove_disk(super, buf);
  		break;
-@@ -4665,6 +5667,84 @@ static void amd_process_update(struct supertype *st,
+@@ -4762,6 +5767,84 @@ static void amd_process_update(struct supertype *st,
  	}
  }
  
@@ -1522,7 +1525,7 @@ index 97d5d5c0..9136a29f 100644
  static int amd_in_volume(const struct amd_vol *v, __u64 id)
  {
  	int i;
-@@ -4675,6 +5755,373 @@ static int amd_in_volume(const struct amd_vol *v, __u64 id)
+@@ -4772,6 +5855,373 @@ static int amd_in_volume(const struct amd_vol *v, __u64 id)
  	return 0;
  }
  
@@ -1896,7 +1899,7 @@ index 97d5d5c0..9136a29f 100644
  /*
   * mdmon's two threads share the metadata.  The monitor changes the config
   * packet on its own (a failure, a member marked missing, the end of an
-@@ -4699,22 +6146,134 @@ static void amd_unlock(struct amd_super *super)
+@@ -4796,22 +6246,134 @@ static void amd_unlock(struct amd_super *super)
  	__atomic_clear(&super->busy, __ATOMIC_RELEASE);
  }
  

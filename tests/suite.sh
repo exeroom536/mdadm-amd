@@ -3998,6 +3998,169 @@ fi
 fi
 # --- end of stage 40 ---
 
+# --- stage 41: mdmon's shadow of the AMD bitmap.  A crash of Linux, then the AMD Windows driver 9.5 clears the AMD
+# bitmap without a check (notes of the judge 9.5) - the shadow (AllocatedSpace + 0x101 of element [0][0]) still says
+# "dirty": the next assembly resyncs (with an md bitmap: by its bits only).  A clean stop leaves no dirty shadow.
+# "Windows 9.5" here: the AMD bitmap sector zeroed and a configuration write (a rename) - what that driver leaves.
+if want 41; then
+cd "$MDADM_DIR"
+stopall
+Q41=$WQ/q41
+for l in $(sudo losetup -a | grep $Q41/ | cut -d: -f1); do sudo losetup -d $l; done
+mkdir -p $Q41 && rm -f $Q41/*
+Q41AS=$((0x100000)); Q41DATA=$((0x105000))	# AllocatedSpace and the data start of volumes -C makes on blank disks
+q41l() { sudo losetup -j $Q41/$1.img | cut -d: -f1; }
+q41vol() { local c=$(cont1) m; for m in $(ls /sys/block | grep ^md); do grep -qx "external:/$c/0" /sys/block/$m/md/metadata_version 2>/dev/null && echo $m; done; }
+q41nres() { sudo dmesg | grep -c 'md: resync of RAID array'; }
+q41spoil() { head -c 1M /dev/urandom | dd of=$Q41/$1.img bs=1M seek=$(( Q41DATA / 2048 + $2 )) conv=notrunc status=none; }
+q41check() { echo check | sudo tee /sys/block/$1/md/sync_action >/dev/null; sleep 1; waitrec; cat /sys/block/$1/md/mismatch_cnt; }
+q41crash() {	# q41crash <md> <images...>: writes to the volume, copies of the images meanwhile, a clean stop, the copies put back
+	local v=$1 n w; shift
+	( while :; do sudo dd if=/dev/urandom of=/dev/$v bs=1M count=4 seek=136 oflag=direct status=none; done ) & w=$!
+	sleep 3
+	for n in "$@"; do cp --sparse=always $Q41/$n.img $Q41/$n.crash; done
+	kill $w; wait $w 2>/dev/null
+	stopall
+	for n in "$@"; do sudo losetup -d $(q41l $n); mv $Q41/$n.crash $Q41/$n.img; sudo losetup -f $Q41/$n.img; done
+}
+q41win() {	# q41win <images...>: "Windows 9.5" - the AMD bitmap cleared, a configuration written; the container assembled, no volume
+	local n
+	for n in "$@"; do dd if=/dev/zero of=$Q41/$n.img bs=512 seek=$((Q41AS + 0x80)) count=1 conv=notrunc status=none; done
+	$M -A /dev/md/q41c -e amd $(for n in "$@"; do q41l $n; done) >/dev/null 2>&1
+	$M --update-subarray=0 --update=name -N q41w$RANDOM /dev/$(cont1) >/dev/null 2>&1
+}
+q41shadow() { for n in "$@"; do $M -E $(q41l $n) 2>/dev/null; done | grep -q 'mdmon bitmap : dirty from bit 0, the AMD bitmap cleared since'; }
+q41level() {	# q41level <level> <disks> [--bitmap=internal]
+	local lv=$1 n=$2 bm=${3:-} i D="" V P R tag=raid$1${3:+ md-bitmap}
+	for i in $(seq 0 $((n - 1))); do truncate -s 2G $Q41/l$i.img; D="$D l$i"; sudo losetup -f $Q41/l$i.img; done
+	$M -C /dev/md/q41c -e amd -n $n $(for i in $D; do q41l $i; done) --run >/dev/null 2>&1
+	$M -C /dev/md/q41v -e amd -l$lv -n$n -z 512M $bm $(for i in $D; do q41l $i; done) --run >/dev/null 2>&1
+	V=$(q41vol); waitrec
+	# with an md bitmap: the bitmap daemon clears the bits of the initial sync (~15-20 s) - else the "crash" would catch them all
+	[ -n "$bm" ] && for i in $(seq 1 60); do $M -E $(q41l l0) 2>/dev/null | grep -q 'md Bitmap : .*, 0 of ' && break; sleep 1; done
+	q41crash $V $D
+	# 1 MiB spoiled on member 1: in the md bitmap chunk written to (MiB 136-140 of the volume; MiB 140 of a RAID1 member,
+	# about 70 of a RAID5/10 one), and in a clean one (MiB 330 of the member)
+	q41spoil l1 $([ $lv = 1 ] && echo 140 || echo 70); [ -n "$bm" ] && q41spoil l1 330
+	q41win $D
+	check "41 $tag: crash, then the AMD driver cleared the bitmap: -E shows mdmon's shadow dirty from bit 0" "q41shadow $D"
+	R=$(q41nres)
+	$M -I /dev/$(cont1) >/dev/null 2>&1; sleep 2; V=$(q41vol); waitrec
+	check "41 $tag: ... assembled: resync ($R -> $(q41nres) in the kernel log)" "[ -n '$V' ] && [ \$(q41nres) -gt $R ]"
+	P=$(q41check $V)
+	if [ -n "$bm" ]; then
+		check "41 $tag: ... by the md bits only: the spoiled MiB in the dirty chunk fixed, the one in a clean chunk left ($P)" "[ '$P' = 2048 ]"
+		echo repair | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; waitrec
+	else
+		check "41 $tag: ... the spoiled MiB fixed, check 0 ($P)" "[ '$P' = 0 ]"
+	fi
+	stopall
+	# a dual boot without a crash: Linux stopped cleanly, Windows clears the (clean) AMD bitmap - no resync
+	q41win $D
+	check "41 $tag: clean stop, then the AMD driver: no shadow left dirty (-E)" "! q41shadow $D"
+	R=$(q41nres)
+	$M -I /dev/$(cont1) >/dev/null 2>&1; sleep 2; V=$(q41vol); waitrec
+	check "41 $tag: ... assembled without resync" "[ -n '$V' ] && [ \$(q41nres) = $R ] && [ \$(cat /sys/block/$V/md/resync_start) = none ]"
+	stopall
+	for i in $D; do sudo losetup -d $(q41l $i); done; rm -f $Q41/*
+}
+q41level 1 2
+q41level 5 3
+q41level 10 4
+q41level 1 2 --bitmap=internal
+rmdir $Q41
+fi
+# --- end of stage 41 ---
+
+# --- stage 42: the bit 0x20000000 in LD.Flags, which rcraid.sys 9.5.0.201 sets while a transform runs, is cleared when
+# mdmon ends the transform.  A model of Windows 9.5: a rebuild (RESTORE_SEGMENTS) or an initialization
+# (CREATE_REDUNDANCY) mdmon recorded is stopped midway; the bit is put into the LDs with a transform in the live
+# packet of each disk (as 9.5 writes them during its transforms, in a Windows VM); assembly, mdmon ends the transform.
+if want 42; then
+cd "$MDADM_DIR"
+Q42=$WQ/q42
+q42l() { sudo losetup -j $Q42/$1.img | cut -d: -f1; }
+q42sec() { $M -E $(q42l g0) 2>/dev/null | sed -n '/^\[q42v\]/,/^\[/p'; }
+# q42speed <KiB/s>: md's sync speed limit (and the lower one not above it)
+q42speed() { local m=$(( $1 < 1000 ? $1 : 1000 ))
+	echo $m | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null; echo $1 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null; }
+q42clean() { stopall; for l in $(sudo losetup -a | grep "$Q42/" | cut -d: -f1); do sudo losetup -d $l; done; rm -f $Q42/*.img; }
+# q42mk <disks> <in the container> <MiB of the volume>: g0...; container q42c of the first <in the container>, RAID1 q42v on g0+g1
+q42mk() {
+	mkdir -p $Q42; q42clean
+	for n in $(seq 0 $(($1 - 1))); do truncate -s 1G $Q42/g$n.img; sudo losetup -f $Q42/g$n.img; done
+	$M -C /dev/md/q42c -e amd -n$2 $(for n in $(seq 0 $(($2 - 1))); do q42l g$n; done) --run >/dev/null 2>&1
+	$M -C /dev/md/q42v -e amd -l1 -n2 -z $3M $(q42l g0) $(q42l g1) --run >/dev/null 2>&1; sleep 2
+}
+# q42bit <disk>...: "<how many LDs with 0x20000000> <name:Flags> ..." of the live packet of each disk
+q42bit() {
+	python3 - $(for n in "$@"; do echo $Q42/$n.img; done) <<'PY'
+import os, sys
+sys.path.insert(0, os.environ["TOOLS"]); import amdraid_dump as ad
+for p in sys.argv[1:]:
+    dk = ad.Disk(p); rc = ad.parse_raidcore(dk.read(ad.LBA_RAIDCORE)); c = ad.parse_commit(dk.read(rc["commit_lba"]))
+    h, pds, lds = ad.parse_gen(ad.read_gen(dk, c["gen_lba"], c["gen_len"]))
+    print(sum(1 for l in lds if l["flags84"] & 0x20000000), " ".join("%s:%x" % (l["name"], l["flags84"]) for l in lds))
+PY
+}
+# q42mark <disk>...: 0x20000000 into the LDs with a transform (TransformType != 0) of the live packet, packet and commit sums valid
+q42mark() {
+	python3 - $(for n in "$@"; do echo $Q42/$n.img; done) <<'PY'
+import os, struct, sys
+sys.path.insert(0, os.environ["TOOLS"]); from amdraid_dump import rc_sum
+for p in sys.argv[1:]:
+    with open(p, "r+b") as f:
+        f.seek(0x5001 * 512); c = bytearray(f.read(512)); off, size = struct.unpack_from("<II", c, 8)
+        f.seek(off * 512); g = bytearray(f.read((size + 511) // 512 * 512)); q, end = struct.unpack_from("<II", g, 0x2c); end += q
+        while q + 0x200 <= end and struct.unpack_from("<I", g, q)[0] == 0x25BD:
+            if struct.unpack_from("<I", g, q + 0x10)[0]:
+                struct.pack_into("<I", g, q + 0x84, struct.unpack_from("<I", g, q + 0x84)[0] | 0x20000000)
+            q += struct.unpack_from("<I", g, q + 0x90)[0]
+        struct.pack_into("<Q", g, 0, rc_sum(g, 0xc, size - 0xc)); f.seek(off * 512); f.write(g)
+        struct.pack_into("<Q", c, 0x10, struct.unpack_from("<Q", g, 0)[0]); struct.pack_into("<Q", c, 0, rc_sum(c, 8, 0x1f8))
+        f.seek(0x5001 * 512); f.write(c)
+PY
+}
+# q42again <disk>...: assemble the container of these disks again (-A, -I); mdmon ends the transform
+q42again() {
+	q42speed 400000
+	$M -A /dev/md/q42c -e amd $(for n in "$@"; do q42l $n; done) >/dev/null 2>&1
+	$M -I /dev/$(cont1) >/dev/null 2>&1; sleep 2; waitrec 120; sleep 4
+}
+
+# a rebuild onto a spare: started and recorded by mdmon, stopped midway, the LDs marked as 9.5 would; mdmon ends it
+q42mk 3 2 256; waitrec; sleep 2
+$M /dev/$(cont1) --add $(q42l g2) >/dev/null 2>&1; sleep 2
+q42speed 2000
+$M /dev/$(mdof raid1) --fail $(q42l g1) >/dev/null 2>&1; sleep 6
+check "42 rebuild: the rebuild onto the spare is recorded" "q42sec | grep -q 'Transform : 0x5358'"
+stopall
+q42mark g0 g2
+B=$(q42bit g0 g2)
+check "42 rebuild: ... stopped midway, 0x20000000 in both LDs of the volume as rcraid.sys 9.5 writes them ($(echo $B | tr '\n' ' '))" "[ \"\$(q42bit g0 g2 | cut -d' ' -f1 | tr '\n' ' ')\" = '2 2 ' ]"
+q42again g0 g2
+V=$(mdof raid1)
+check "42 rebuild: ... mdmon ended it: normal, last 0x5358, no 0x20000000 left ($(q42bit g0 g2 | tr '\n' ' '))" "q42sec | grep -q 'State : 0x200 (normal)' && q42sec | grep -q 'Transform : 0x0, last 0x5358, state 0xa1a6' && [ \"\$(q42bit g0 g2 | cut -d' ' -f1 | tr '\n' ' ')\" = '0 0 ' ]"
+echo check | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; waitrec 120
+check "42 rebuild: ... the mirror agrees" "[ -n '$V' ] && grep -A1 \"^$V \" /proc/mdstat | grep -q '\[UU\]' && [ \"\$(cat /sys/block/$V/md/mismatch_cnt)\" = 0 ]"
+
+# the initialization (CREATE_REDUNDANCY) of a new volume: stopped midway, the LD marked as 9.5 would; mdmon ends it
+q42speed 2000
+q42mk 2 2 256; sleep 4
+check "42 init: the initialization is recorded" "q42sec | grep -q 'Transform : 0x5355'"
+stopall
+q42mark g0 g1
+check "42 init: ... stopped midway, 0x20000000 in the LD ($(q42bit g0 g1 | tr '\n' ' '))" "! q42bit g0 g1 | grep -q '^0 '"
+q42again g0 g1
+V=$(mdof raid1)
+check "42 init: ... mdmon ended it: normal, last 0x5355, no 0x20000000 left ($(q42bit g0 g1 | tr '\n' ' '))" "q42sec | grep -q 'State : 0x200 (normal)' && q42sec | grep -q 'Transform : 0x0, last 0x5355, state 0xa1a6' && [ \"\$(q42bit g0 g1 | cut -d' ' -f1 | tr '\n' ' ')\" = '0 0 ' ]"
+echo check | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; waitrec 120
+check "42 init: ... the mirror agrees" "[ -n '$V' ] && [ \"\$(cat /sys/block/$V/md/mismatch_cnt)\" = 0 ]"
+q42clean; rmdir $Q42
+q42speed 400000
+fi
+# --- end of stage 42 ---
+
 # the ASRock and X399 snapshots are untouched: attached before stage 7, assembled only in stage 1
 if want 1; then
 # reg <image> <fixture> <LBA>: the image has the fixture (xz or raw) at that LBA

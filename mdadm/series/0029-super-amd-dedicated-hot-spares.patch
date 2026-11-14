@@ -1,6 +1,6 @@
-From 87be17ac23bed6a6616ef1e0a002445242c7afe0 Mon Sep 17 00:00:00 2001
+From 40faa10c8abdee3d86ff17bb4717787e43fd6bd7 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Sat, 14 Nov 2026 01:35:13 +0500
+Date: Sat, 14 Nov 2026 10:04:16 +0500
 Subject: [PATCH 29/33] super-amd: dedicated hot spares
 
 AMD volumes can have up to four spares of their own, taken before the
@@ -25,10 +25,10 @@ Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
  1 file changed, 528 insertions(+), 6 deletions(-)
 
 diff --git a/super-amd.c b/super-amd.c
-index 4fb12d04..6f833e25 100644
+index b14ac99b..8d569c1d 100644
 --- a/super-amd.c
 +++ b/super-amd.c
-@@ -400,6 +400,15 @@ struct amd_disk {
+@@ -406,6 +406,15 @@ struct amd_disk {
  #define AMD_UPDATE_ATTACH	5	/* amd_update_attach */
  #define AMD_UPDATE_KILL		6	/* mdadm --kill-subarray: @major = volume, @id = its LD */
  #define AMD_UPDATE_SUBARRAY	7	/* mdadm --update-subarray: struct amd_update_subarray */
@@ -44,7 +44,7 @@ index 4fb12d04..6f833e25 100644
  
  struct amd_update_disk {
  	int type;
-@@ -525,9 +534,12 @@ static int amd_extent_given_away(struct amd_super *super,
+@@ -531,9 +540,12 @@ static int amd_extent_given_away(struct amd_super *super,
  				 const struct amd_vol *v, int slot);
  static void amd_reparse(struct amd_super *super);
  static void amd_reparse_without(struct amd_super *super, int gone);
@@ -57,7 +57,7 @@ index 4fb12d04..6f833e25 100644
  static int amd_label_spare(int fd, __u64 id, __u32 spare);
  static int amd_pd_index(struct amd_super *super, __u64 id);
  static int amd_disk_in_volumes(struct amd_super *super, __u64 id);
-@@ -7385,6 +7397,8 @@ static void amd_finish_rebuild(struct amd_super *super, int vol)
+@@ -7485,6 +7497,8 @@ static void amd_finish_rebuild(struct amd_super *super, int vol)
  	struct amd_disk *d;
  	__u32 state;
  
@@ -66,7 +66,7 @@ index 4fb12d04..6f833e25 100644
  	ld = v->ld;
  	/* a former member rebuilt in place may be stale yet: written from now on */
  	d = amd_find_disk(super, __le64_to_cpu(v->mon.rebuild_el.id.id));
-@@ -7429,6 +7443,42 @@ static int amd_insert_ld(struct amd_super *super, unsigned int at,
+@@ -7529,6 +7543,42 @@ static int amd_insert_ld(struct amd_super *super, unsigned int at,
  	return 0;
  }
  
@@ -109,7 +109,7 @@ index 4fb12d04..6f833e25 100644
  /*
   * The LD a rebuild of @v goes into, *@size bytes: a copy of its LD without
   * the dedicated spares (as the menu writes the second copy), the spare in
-@@ -7527,6 +7577,8 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
+@@ -7627,6 +7677,8 @@ static int amd_start_rebuild(struct amd_super *super, int vol)
  		amd_tlog_write(super, v, t, 1, 0, 0);
  		return -1;
  	}
@@ -118,7 +118,7 @@ index 4fb12d04..6f833e25 100644
  	super->config_dirty = 1;
  	return 0;
  }
-@@ -7797,6 +7849,7 @@ static const unsigned int amd_update_size[] = {
+@@ -7897,6 +7949,7 @@ static const unsigned int amd_update_size[] = {
  	[AMD_UPDATE_ATTACH]	= sizeof(struct amd_update_attach),
  	[AMD_UPDATE_KILL]	= sizeof(struct amd_update_disk),
  	[AMD_UPDATE_SUBARRAY]	= sizeof(struct amd_update_subarray),
@@ -126,7 +126,7 @@ index 4fb12d04..6f833e25 100644
  };
  
  /*
-@@ -7822,7 +7875,7 @@ static int amd_update_type(const struct metadata_update *update)
+@@ -7922,7 +7975,7 @@ static int amd_update_type(const struct metadata_update *update)
  
  /*
   * The updates mdadm sends (--create, --add, --kill-subarray,
@@ -135,7 +135,7 @@ index 4fb12d04..6f833e25 100644
   */
  static int amd_prepare_update(struct supertype *st,
  			      struct metadata_update *update)
-@@ -7840,6 +7893,7 @@ static int amd_prepare_update(struct supertype *st,
+@@ -7940,6 +7993,7 @@ static int amd_prepare_update(struct supertype *st,
  		break;
  	case AMD_UPDATE_KILL:
  	case AMD_UPDATE_SUBARRAY:
@@ -143,7 +143,7 @@ index 4fb12d04..6f833e25 100644
  		break;
  	default:
  		return 0;
-@@ -8043,6 +8097,9 @@ static void amd_process_update(struct supertype *st,
+@@ -8143,6 +8197,9 @@ static void amd_process_update(struct supertype *st,
  		if (amd_apply_subarray(super, buf))
  			amd_kmsg("cannot update the volume: it changed meanwhile");
  		break;
@@ -153,7 +153,7 @@ index 4fb12d04..6f833e25 100644
  		for (a = st->arrays; a; a = a->next)
  			a->check_degraded = 1;
  		break;
-@@ -8290,6 +8347,7 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
+@@ -8390,6 +8447,7 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
  				       struct amd_vol *v, int slot,
  				       struct amd_element *el, int *recorded)
  {
@@ -161,7 +161,7 @@ index 4fb12d04..6f833e25 100644
  	const struct amd_element *model = NULL;
  	unsigned long long size, gap;
  	struct amd_disk *d = NULL;
-@@ -8310,14 +8368,28 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
+@@ -8410,14 +8468,28 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
  	gap = __le64_to_cpu(model->user_data.offset) -
  	      __le64_to_cpu(model->allocated.offset);
  
@@ -195,7 +195,7 @@ index 4fb12d04..6f833e25 100644
  	for (i = 0; i < super->npd; i++) {
  		struct amd_pd *pd = super->pd[i];
  		__u64 id = __le64_to_cpu(pd->id.id);
-@@ -8334,6 +8406,102 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
+@@ -8434,6 +8506,102 @@ static struct amd_disk *amd_find_spare(struct amd_super *super,
  	return NULL;
  }
  
@@ -298,7 +298,7 @@ index 4fb12d04..6f833e25 100644
  /*
   * SpareInfo of the label of disk @id on @fd: the BIOS fills the PD's in from
   * it at every start (RAIDCoreDxe FUN_0001d68c), and the AMD driver rewrites
-@@ -8362,6 +8530,359 @@ static int amd_label_spare(int fd, __u64 id, __u32 spare)
+@@ -8462,6 +8630,359 @@ static int amd_label_spare(int fd, __u64 id, __u32 spare)
  	return rv;
  }
  
@@ -658,7 +658,7 @@ index 4fb12d04..6f833e25 100644
  /*
   * A managed volume with a member out of service (recorded so in the
   * config: flags 0x4030, or no disk) gets that member's own disk back if
-@@ -8734,6 +9255,7 @@ struct superswitch super_amd = {
+@@ -8834,6 +9355,7 @@ struct superswitch super_amd = {
  	.remove_from_super	= remove_from_super_amd,
  	.kill_subarray	= kill_subarray_amd,
  	.update_subarray = update_subarray_amd,

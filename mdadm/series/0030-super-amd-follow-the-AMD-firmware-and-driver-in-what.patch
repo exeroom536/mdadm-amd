@@ -1,6 +1,6 @@
-From aafa804fcc510d813e33d5fa5fc3118081e931db Mon Sep 17 00:00:00 2001
+From cec00f3faf48aa9bfba90205c938939ae60e054f Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Sat, 14 Nov 2026 01:35:16 +0500
+Date: Sat, 14 Nov 2026 10:04:19 +0500
 Subject: [PATCH 30/33] super-amd: follow the AMD firmware and driver in what
  they check
 
@@ -28,7 +28,7 @@ Written by Claude Opus 5.5 and Claude Fable 5.2, AI models by Anthropic.
  1 file changed, 684 insertions(+), 3 deletions(-)
 
 diff --git a/super-amd.c b/super-amd.c
-index 6f833e25..e9f16c8f 100644
+index 8d569c1d..ceda40a9 100644
 --- a/super-amd.c
 +++ b/super-amd.c
 @@ -14,7 +14,9 @@
@@ -42,7 +42,7 @@ index 6f833e25..e9f16c8f 100644
   *
   * On-disk layout, little-endian, 512-byte sectors:
   *   LBA 0x5000         RC_MetaData: per-disk label, "RAIDCore", DeviceId
-@@ -463,6 +465,7 @@ struct amd_vol_mon {
+@@ -469,6 +471,7 @@ struct amd_vol_mon {
  	unsigned long long md_writes;	/* sectors md had written at open_new */
  	unsigned long long init_ckpt;	/* volume sectors md has initialized */
  	int init_tlog;		/* 1: write init_ckpt to the log, 2: clear it */
@@ -50,7 +50,7 @@ index 6f833e25..e9f16c8f 100644
  };
  
  /* A logical device exposed as an md array */
-@@ -497,6 +500,7 @@ struct amd_super {
+@@ -503,6 +506,7 @@ struct amd_super {
  	int nvol;
  	int current_vol;
  	int config_dirty;	/* the packet changed, write it out */
@@ -58,7 +58,7 @@ index 6f833e25..e9f16c8f 100644
  	int foreign;		/* the live packet is from a disk last online elsewhere */
  	int from_md;		/* the disks of a running container (amd_load_md) */
  	int attached;		/* add_to_super took a disk in, nothing to init */
-@@ -1484,6 +1488,123 @@ static void amd_repair_pds(int fd, void *packet, unsigned int len)
+@@ -1490,6 +1494,123 @@ static void amd_repair_pds(int fd, void *packet, unsigned int len)
  	}
  }
  
@@ -182,7 +182,7 @@ index 6f833e25..e9f16c8f 100644
  static struct amd_disk *amd_find_disk(struct amd_super *super, __u64 id)
  {
  	struct amd_disk *d;
-@@ -3915,7 +4036,10 @@ static void examine_super_amd(struct supertype *st, char *homehost)
+@@ -4013,7 +4134,10 @@ static void examine_super_amd(struct supertype *st, char *homehost)
  	printf("      Device ID : %016llx\n",
  	       (unsigned long long)disk->device_id);
  	printf(" Container UUID : %s\n", amd_uuid_text(uuid, nbuf));
@@ -194,7 +194,7 @@ index 6f833e25..e9f16c8f 100644
  		amd_mbr_advice(disk, 1);
  	if (!disk->commit_valid) {
  		printf("  Configuration : none (no valid commit block)\n");
-@@ -3949,6 +4073,10 @@ static void examine_super_amd(struct supertype *st, char *homehost)
+@@ -4047,6 +4171,10 @@ static void examine_super_amd(struct supertype *st, char *homehost)
  		       __le64_to_cpu(pd->id.id) == disk->device_id ?
  		       "  <- this disk" : "");
  	}
@@ -205,7 +205,7 @@ index 6f833e25..e9f16c8f 100644
  	for (i = 0; i < super->nvol; i++)
  		amd_print_volume(super, i);
  }
-@@ -4220,6 +4348,136 @@ static __u64 amd_disk_id(struct amd_super *super, int fd)
+@@ -4318,6 +4446,136 @@ static __u64 amd_disk_id(struct amd_super *super, int fd)
  	return amd_random_id(super);
  }
  
@@ -342,7 +342,7 @@ index 6f833e25..e9f16c8f 100644
  static int amd_is_nvme(int major, int minor)
  {
  	char real[PATH_MAX];
-@@ -5077,6 +5335,156 @@ static struct amd_vol *amd_vol_by_id(struct amd_super *super, __u64 id)
+@@ -5175,6 +5433,156 @@ static struct amd_vol *amd_vol_by_id(struct amd_super *super, __u64 id)
  	return NULL;
  }
  
@@ -499,7 +499,7 @@ index 6f833e25..e9f16c8f 100644
  /* @subdev can be a disk of the container: a whole disk, not in use */
  static int amd_validate_disk(struct supertype *st, char *subdev,
  			     unsigned long long *freesize, int verbose)
-@@ -5090,6 +5498,8 @@ static int amd_validate_disk(struct supertype *st, char *subdev,
+@@ -5188,6 +5596,8 @@ static int amd_validate_disk(struct supertype *st, char *subdev,
  	if (super && super->packet && !super->creating &&
  	    !amd_check_add(st, subdev))
  		return 0;
@@ -508,7 +508,7 @@ index 6f833e25..e9f16c8f 100644
  	fd = open(subdev, O_RDONLY | O_EXCL);
  	if (!is_fd_valid(fd)) {
  		if (verbose)
-@@ -5201,6 +5611,10 @@ static int validate_geometry_amd(struct supertype *st, int level, int layout,
+@@ -5299,6 +5709,10 @@ static int validate_geometry_amd(struct supertype *st, int level, int layout,
  				pr_err("the container has the maximum number of volumes\n");
  			return 0;
  		}
@@ -519,7 +519,7 @@ index 6f833e25..e9f16c8f 100644
  		return 1;
  	}
  	/* -e amd and disks: the first of them loads the container */
-@@ -5219,6 +5633,9 @@ static int validate_geometry_amd(struct supertype *st, int level, int layout,
+@@ -5317,6 +5731,9 @@ static int validate_geometry_amd(struct supertype *st, int level, int layout,
  	/* no disks given: the container's own (Create asks with size 0 first) */
  	if (!super->npick && !amd_new_size(super, whole, size, verbose))
  		return 0;
@@ -529,7 +529,7 @@ index 6f833e25..e9f16c8f 100644
  	if (!amd_autolayout(super, raiddisks, size, freesize)) {
  		if (verbose && super->npick && super->npick != raiddisks)
  			pr_err("give all %d disks of the new volume (%d given)\n",
-@@ -6404,6 +6821,8 @@ static int write_init_super_amd(struct supertype *st)
+@@ -6502,6 +6919,8 @@ static int write_init_super_amd(struct supertype *st)
  			pr_err("cannot clear the service area of the new volume\n");
  			rv = 1;
  		} else {
@@ -538,7 +538,7 @@ index 6f833e25..e9f16c8f 100644
  			if (amd_write_config(super) != 0) {
  				pr_err("cannot write the AMD RAID configuration\n");
  				rv = 1;
-@@ -6534,6 +6953,195 @@ static void amd_kmsg(const char *fmt, ...)
+@@ -6632,6 +7051,195 @@ static void amd_kmsg(const char *fmt, ...)
  	close(fd);
  }
  
@@ -734,7 +734,7 @@ index 6f833e25..e9f16c8f 100644
  /*
   * Sectors written or trimmed on the array, from its block device's stat
   * (fields 7 and 14, the discards since 4.18), or 0: what changes on the
-@@ -6603,6 +7211,7 @@ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
+@@ -6701,6 +7309,7 @@ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
  	 */
  	v->mon.target_away = amd_target_away(a, v);
  	v->mon.members_checked = 0;
@@ -742,7 +742,7 @@ index 6f833e25..e9f16c8f 100644
  	v->mon.md_writes = amd_md_writes(a);
  	a->info.container_member = inst;
  
-@@ -7152,7 +7761,9 @@ static int kill_subarray_amd(struct supertype *st, char *subarray_id)
+@@ -7250,7 +7859,9 @@ static int kill_subarray_amd(struct supertype *st, char *subarray_id)
  		return rv != 0;
  	}
  	/* no mdmon: this process writes it */
@@ -752,7 +752,7 @@ index 6f833e25..e9f16c8f 100644
  	return amd_write_changed(super);
  }
  
-@@ -7336,8 +7947,10 @@ static int update_subarray_amd(struct supertype *st, char *subarray,
+@@ -7434,8 +8045,10 @@ static int update_subarray_amd(struct supertype *st, char *subarray,
  		return rv != 0 ? 2 : 0;
  	}
  	/* no mdmon: this process writes it */
@@ -763,7 +763,7 @@ index 6f833e25..e9f16c8f 100644
  	return amd_write_changed(super);
  }
  
-@@ -7638,6 +8251,54 @@ static void amd_catch_up(struct amd_super *super)
+@@ -7738,6 +8351,54 @@ static void amd_catch_up(struct amd_super *super)
  	}
  }
  
@@ -818,7 +818,7 @@ index 6f833e25..e9f16c8f 100644
  /*
   * A recorded rebuild of a volume this mdmon found running (amd_open_new)
   * that md has finished already - as the other mdmon left, or with none
-@@ -7822,6 +8483,20 @@ static void amd_sync_metadata(struct supertype *st)
+@@ -7922,6 +8583,20 @@ static void amd_sync_metadata(struct supertype *st)
  		return;
  	amd_sync_progress(st);
  	amd_sync_transforms(super);
@@ -839,7 +839,7 @@ index 6f833e25..e9f16c8f 100644
  	amd_flush_config(st);
  	amd_sync_ended_logs(super);
  	amd_sync_rebuilds(super);
-@@ -8708,6 +9383,7 @@ static int amd_drop_roles_here(struct supertype *st)
+@@ -8808,6 +9483,7 @@ static int amd_drop_roles_here(struct supertype *st)
  	if (is_fd_valid(fd) && tst->ss->load_container(tst, fd, NULL) == 0) {
  		for (mu = st->updates; mu; mu = mu->next)
  			amd_apply_role(tst->sb, (const void *)mu->buf);
@@ -847,7 +847,7 @@ index 6f833e25..e9f16c8f 100644
  		rv = amd_write_changed(tst->sb) ? -1 : 0;
  		tst->ss->free_super(tst);
  	}
-@@ -9153,6 +9829,8 @@ static int amd_mm_open_new(struct supertype *c, struct active_array *a,
+@@ -9253,6 +9929,8 @@ static int amd_mm_open_new(struct supertype *c, struct active_array *a,
  	if (found)
  		len = amd_ld_size(super->vol[inst].ld) + sizeof(struct amd_element);
  	amd_unlock(super);
@@ -856,7 +856,7 @@ index 6f833e25..e9f16c8f 100644
  	/* managemon queues the update (manage_new), as imsm_open_new's */
  	if (!found || !c->update_tail) {
  		free(u);
-@@ -9184,11 +9862,14 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
+@@ -9284,11 +9962,14 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
  	amd_lock(super);
  	found = amd_activate_spare(a, di, u);
  	amd_unlock(super);

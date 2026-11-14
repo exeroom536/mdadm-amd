@@ -87,7 +87,9 @@ The board's RAIDCoreDxe in QEMU with emulated AMD SATA and NVMe controllers:
   data intact, and the other way round (a RAID5 it made, data it wrote); a rebuild it started is finished by
   `mdmon`; a member that fell behind during its rebuild is not taken back. After Linux crashed while writing, it
   clears the AMD bitmap without checking the volume ([usage.md](usage.md#working-with-the-bios-and-windows));
-  9.3.3 checks the mirrors then, but not RAID5 parity.
+  9.3.3 checks the mirrors then, but not RAID5 parity. 1.2: after such a crash and 9.5, Linux resyncs the volumes
+  (RAID1, RAID5, RAID10; a RAID1 with the md bitmap by its bits) and `md` check finds them clean; a rebuild and an
+  initialization 9.5 started and `mdmon` finished leave no flag of 9.5, and its next check runs to the end.
 - **Linux driver** rcraid (9.3.3-00302 and 9.3.2): takes the arrays made by this mdadm with the data intact; on a
   member failing, missing at start and coming back, it and `mdmon` pick the same spares and placements. A RAIDABLE →
   RAID1 migration started by one and interrupted is finished by the other. Interrupted rebuilds and
@@ -100,7 +102,7 @@ An ASRock X670E RAID0 of two NVMe drives (our dump) and an ASUS X399 RAID10 (pub
 ## Test suites
 
 - The test suite in [tests/](../tests/README.md), on loop devices with metadata of real disks and of the emulated
-  board: 545 checks, all pass on a VM with the emulated AMD controllers (1.1; for 1.0: 530 checks, 504 of them
+  board: 573 checks, all pass on a VM with the emulated AMD controllers (1.2; 545 for 1.1; for 1.0: 530 checks, 504 of them
   also on a plain VM without the controllers).
 - The same suite with mdadm and mdmon built with AddressSanitizer and UBSan: no reports. A fuzzer on the metadata
   parser: no crashes. (Both for 1.0.)

@@ -39,7 +39,7 @@ How each distribution was checked is in [testing.md](testing.md#distributions).
 | Package | What it is |
 |---|---|
 | `mdadm-amd` | mdadm and mdmon with the AMD handler, the udev rule, the `amdraid` mkinitcpio hook and a shutdown hook. Replaces `mdadm`. |
-| `md-bitmap-ext-dkms` | optional: `md_mod` with the md bitmap fix, for Linux 7.3.0 to 7.3.4 ([details](#the-md-bitmap)) |
+| `md-bitmap-ext-dkms` | optional: `md_mod` with the md bitmap fix, for Linux 6.18.57 to 6.18.63 and 7.3.0 to 7.3.4 ([details](#the-md-bitmap)) |
 
 **1. Build.**
 
@@ -273,23 +273,24 @@ after a crash.
 
 How to get the fix:
 
-- **Arch Linux, kernel 7.3.0 to 7.3.4:** install the `md-bitmap-ext-dkms` package. It builds `md_mod` from the
-  stable kernel's `drivers/md` with the fix (downloaded from kernel.org and checked by SHA-256) and installs it
-  under `/updates/dkms`. The package carries `drivers/md` of 7.3.1 (the same files as in 7.3.0 to 7.3.3) and of
-  7.3.4, and takes the one of the kernel it builds for. On any other kernel version it builds nothing, and the
-  stock `md_mod` stays. It needs md
-  built as a module (`CONFIG_BLK_DEV_MD=m`). If your kernel enforces module signatures, enroll the DKMS key first.
-  The kernel's own `md-mod.ko.zst` stays in place, so `pacman -Qk` finds the kernel package whole.
-- **Other distributions, kernel 7.3.0 to 7.3.4:** lay out `/usr/src/md-bitmap-ext-1/` as
+- **Arch Linux, kernel 6.18.57 to 6.18.63 or 7.3.0 to 7.3.4:** install the `md-bitmap-ext-dkms` package. It builds
+  `md_mod` from the stable kernel's `drivers/md` with the fix (downloaded from kernel.org and checked by SHA-256)
+  and installs it under `/updates/dkms`. The package carries `drivers/md` of 6.18.57 (the same files as in 6.18.57
+  to 6.18.60), 6.18.61 (to 6.18.62), 6.18.63, 7.3.1 (7.3.0 to 7.3.3) and 7.3.4, and takes the one of the kernel it
+  builds for. On any other kernel version it builds nothing, and the stock `md_mod` stays. It needs md built as a
+  module (`CONFIG_BLK_DEV_MD=m`). If your kernel enforces module signatures, enroll the DKMS key first. The kernel's
+  own `md-mod.ko.zst` stays in place, so `pacman -Qk` finds the kernel package whole.
+- **Other distributions, the same kernel versions:** lay out `/usr/src/md-bitmap-ext-1/` as
   `package_md-bitmap-ext-dkms()` in `packaging/arch/PKGBUILD` does: `Kbuild` and the two scripts from
   `packaging/dkms/`; a directory `v7.3.1/` with `md.c md.h md-bitmap.c md-bitmap.h md-llbitmap.c md-cluster.h` from
   Linux v7.3.1 `drivers/md` with `md-bitmap-ext.patch` applied; a file `bases` with the line `7\.3\.[0-3] v7.3.1`
-  (for 7.3.4 also a `v7.3.4/` directory and the line `7\.3\.4 v7.3.4`); `dkms.conf` with `@PKGVER@` replaced by `1`
-  and `@KVER_RE@` by `^(7\.3\.[0-3]|7\.3\.4)-`. Then run `sudo dkms install md-bitmap-ext/1`. This was tried only
+  (and so for each other base: its directory and line, as in `_mdbases`/`_mdkvers` of the PKGBUILD); `dkms.conf`
+  with `@PKGVER@` replaced by `1` and `@KVER_RE@` by the lines' expressions joined, e.g. `^(7\.3\.[0-3]|7\.3\.4)-`.
+  Then run `sudo dkms install md-bitmap-ext/1`. This was tried only
   with the Arch package. A distribution kernel may carry md changes of its own: use it only on a kernel whose
   `drivers/md` is the stable one (`packaging/dkms/md-bases.sh` lists which stable releases share these files).
 - **Other kernel versions:** apply `kernel/0001-*.patch` and `kernel/0002-*.patch` to the kernel and rebuild md.
-  They apply to 7.3, 7.4-rc1 and the mainline of 12 November 2026.
+  They apply to 6.18.63, 7.0.14, 7.1.13, 7.2.15, 7.3.1 to 7.3.4, 7.4-rc2 and the mainline of 14 November 2026.
 
 To check that the bitmap is in use:
 

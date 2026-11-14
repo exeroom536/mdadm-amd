@@ -1,5 +1,33 @@
 # Changes
 
+## 1.2 — 2026-11-14
+
+**New.**
+- After Linux crashed while writing and the Windows driver cleared the AMD bitmap without checking the volume
+  (9.5.0 does that; 9.3.3 leaves RAID5 parity unchecked), md now resyncs the volume at the next assembly: `mdmon`
+  keeps its own copy of the bitmap's state, in a sector of the volume's reserved area the AMD drivers do not write,
+  and `--examine` reports it (patch 25). Tried with the Windows driver 9.5.0-00201 in a VM on RAID1, RAID5 and
+  RAID10, and on a RAID1 with the md bitmap (resynced by its bits only); not tried with 9.3.3.
+
+**Fixed.**
+- A rebuild or an initialization started by the Windows driver 9.5.0 and finished by `mdmon` no longer leaves that
+  driver's flag `0x20000000` on the volume.
+- `/etc/mdadm.conf` of the Arch package said `DEVICE partitions`, so `mdadm --assemble --scan` assembled AMD
+  containers but not the volumes in them. It now says `DEVICE partitions containers`. Booting was not affected:
+  udev assembles the volumes. A changed `/etc/mdadm.conf` is kept by pacman (`.pacnew`): add `containers` by hand.
+
+**Tests.** Stages 41 (a crash, then the AMD bitmap cleared as Windows 9.5 does) and 42 (the flag of Windows 9.5 at the
+end of a transform mdmon finishes): 573 checks in 55 stages.
+
+**Packaging.**
+- The package version is now the mdadm-amd release (`1.2`; a build between releases `1.1.r<n>`) instead of the
+  mdadm version (`4.6.r112.g5542bf40`); `provides=mdadm` still gives the mdadm version. Pacman sees the change as
+  a downgrade once: install the new package with `pacman -U`, later releases upgrade as usual.
+- `replaces=raidtools` dropped (inherited from the Arch package, meaningless here).
+- `md-bitmap-ext-dkms` covers Linux 6.18.57 to 6.18.63 too (the `linux-lts` of Arch and CachyOS), with three more
+  bases: 6.18.57, 6.18.61, 6.18.63. Tried on Arch `linux-lts` 6.18.63 in a VM: the md bitmap runs, a crash
+  resyncs the dirty chunk only.
+
 ## 1.1 — 2026-11-14
 
 **Base.** The patch and the series now apply to upstream mdadm `5542bf40` (mdadm-4.6-112, 12 November 2026) instead

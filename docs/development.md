@@ -10,7 +10,7 @@
 | `mdadm/upstream/` | fixes of upstream mdadm on their own, one per patch, against `5542bf40` |
 | `packaging/arch/` | Arch Linux: one PKGBUILD for `mdadm-amd` (replaces `mdadm`; udev rule, mkinitcpio hooks) and the optional `md-bitmap-ext-dkms` |
 | `packaging/dracut/` | dracut module `90amdraid` |
-| `packaging/dkms/` | DKMS sources of `md_mod` with the md bitmap fix, for Linux 7.3.0–7.3.4, and `md-bases.sh`, which tells the stable releases that share these files |
+| `packaging/dkms/` | DKMS sources of `md_mod` with the md bitmap fix, for Linux 6.18.57–6.18.63 and 7.3.0–7.3.4, and `md-bases.sh`, which tells the stable releases that share these files |
 | `kernel/` | the md fix for the write-intent bitmap of external metadata (Intel IMSM too) on kernels 6.18 and later: two patches |
 | `kernel/blk-discard/` | a block layer fix: `discard_max_bytes` can be set again after it was set to 0 (kernels from 6.17, 6.12.42 on); for mainline, 7.3.1 and 6.12 |
 | `util-linux/` | an optional libblkid prober: `blkid` and udev then see the disks as `amd_raid_member` |
@@ -47,7 +47,7 @@ bitmap question for containers (patch 5).
 Build as in [install.md](install.md#building-mdadm-from-source). With the patch applied, upstream's own test suite
 runs as usual (`./test`); it needs devices of 1 GiB or more.
 
-The test suite of this project is in [tests/](../tests/README.md): 545 checks on loop devices, with the metadata of
+The test suite of this project is in [tests/](../tests/README.md): 573 checks on loop devices, with the metadata of
 real disks and of the emulated board as fixtures; `sudo tests/run.sh /path/to/upstream-mdadm` runs it in about 50
 minutes. Metadata dumps from other boards help most —
 `tools/amdraid_dump.py <disk> --brief --ring`, or the first 12 MiB of a member

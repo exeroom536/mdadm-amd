@@ -4,15 +4,17 @@
 # mdadm-amd.patch applies to.  Two packages from one build:
 #   mdadm-amd          - mdadm, mkinitcpio hooks, udev rule; replaces mdadm;
 #   md-bitmap-ext-dkms - optional: md_mod with the md fix for the write-intent bitmap of external
-#                        metadata (kernel/), for Linux 7.3.0-7.3.4, until it is upstream.
+#                        metadata (kernel/), for Linux 6.18.57-6.18.63 and 7.3.0-7.3.4, until it is upstream.
 # Build: cp ../../mdadm/mdadm-amd.patch ../dkms/* . && makepkg -s   (see docs/install.md)
 # (after changing a file here: updpkgsums)
 
 pkgbase=mdadm-amd
 pkgname=('mdadm-amd' 'md-bitmap-ext-dkms')
 _commit=5542bf40fab20f09ce3be80ae1cb42584e9fa2f7   # mdadm-4.6-112-g5542bf40, 2026-11-12 (GitHub main)
-pkgver=4.6.r112.g5542bf40
-pkgrel=30
+_mdadmver=4.6.r112.g5542bf40   # the mdadm it is built from (provides)
+# the mdadm-amd release; a build between releases: <last release>.r<n>
+pkgver=1.2
+pkgrel=1
 arch=('x86_64')
 license=('GPL-2.0-or-later')
 url='https://github.com/md-raid-utilities/mdadm'
@@ -21,8 +23,8 @@ makedepends=('git' 'man-db')
 # md-bitmap-ext-dkms: drivers/md of these stable tags (the bases), and for each the kernel releases whose
 # drivers/md files are the same (checked on a clone of stable: packaging/dkms/md-bases.sh); a kernel of any
 # other release keeps its own md_mod
-_mdbases=(7.3.1 7.3.4)
-_mdkvers=('7\.3\.[0-3]' '7\.3\.4')	# per base: regex of the kernel version up to its first "-"
+_mdbases=(6.18.57 6.18.61 6.18.63 7.3.1 7.3.4)
+_mdkvers=('6\.18\.(5[7-9]|60)' '6\.18\.6[12]' '6\.18\.63' '7\.3\.[0-3]' '7\.3\.4')	# per base: regex of the kernel version up to its first "-"
 _md="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/md"
 _mdfiles=(md.c md.h md-bitmap.c md-bitmap.h md-llbitmap.c md-cluster.h)
 
@@ -45,18 +47,36 @@ for _b in "${_mdbases[@]}"; do
 	done
 done
 sha256sums=('684060921e12f301334e4c8d0ca8a529f7276e4f185e168246115e843dacb11e'
-            '348050e29d0386aa93755f0d8ee9e66654f00f2f5bf7a8ff02f88b302dba0080'
+            'e80d7176ef44f36c2dfd767e2608ba2e605e4638999cb7505d17ea500c3e10ba'
             '52b7a3e7f6d4785234c79fd394f2009a9aa389230fa742250058bd1f310330d1'
             'c3bceb429eebe148f2ad37c29cc1f1edb4dacc6495b251df558db5f2618e3671'
             '1dfff7905e6db439a38f19deede2535e405387bda6d6d7e8ef5e71661ada019f'
             '8ec8981de87c277e5010f11c34ded14a2d38e1fc8e8c2e65e4c970ed31c70177'
             '86b24552bc2cc2436e91698f20798129c3c60bfb406445e0ae76314377147d1d'
-            '77d2cee69f9008318ddea60e253cd9416a3850e9e36d5bc55f51d9df4810544d'
+            'e9db5531d1ca8d4deecf4d08d65b2dfebf054fb3bc96a9adaa3c48ecfdbf9880'
             '02f8321b57857c698be3123ae625bccd07b8968ef40da49ed9610ae38d426504'
             'db4ca682da822c23eb06220035b02e2247d16a95eb1d359930535157260c5197'
             'b34a3d38e107de70583c4c70d8bd47131eaf56f28f431aa8b763a287793c22a6'
             'c491893084e4f1f288319b99ffb273ae1db2ea7a9e29fef7b728ad5d66d67ceb'
             '64be305f29103acedc7df3798b0bed1497dc0e92a30a2d75b2c771cf871ee626'
+            '5af1ae55dd47d38147c29409de2432bde40f067d2db8bec682381af3ab7bc88a'
+            '83efe5217555cd94878e2e8222e0f90f67b509a8590943d493fc78d758ddc7e5'
+            '91c180da1681dc014b368d37867653a92ecf3e8236df3ee8914684cd46cf1155'
+            '34027aede9ab068f3d08bd2c17a77b80d3506a468e81a7e5afd502e8c5a0b7a2'
+            '54e5ebce1be053bfa7575094f7b6efb5c85debcc752b348af73dba377bb3712d'
+            '1120a275736ab1d91931323e8a170380172bb71a98de48b998b36380edb1426a'
+            'd01cfa77d5b5e39006eeaf65b6d4fdc4f601c6db8644b4b7f73cc4d1bde90c72'
+            '83efe5217555cd94878e2e8222e0f90f67b509a8590943d493fc78d758ddc7e5'
+            '91c180da1681dc014b368d37867653a92ecf3e8236df3ee8914684cd46cf1155'
+            '34027aede9ab068f3d08bd2c17a77b80d3506a468e81a7e5afd502e8c5a0b7a2'
+            '54e5ebce1be053bfa7575094f7b6efb5c85debcc752b348af73dba377bb3712d'
+            '1120a275736ab1d91931323e8a170380172bb71a98de48b998b36380edb1426a'
+            '0d31ea84f12a0cb9bf153b51a868ac2beb3de4386ddb2d862e56a864b4cf4da4'
+            '83efe5217555cd94878e2e8222e0f90f67b509a8590943d493fc78d758ddc7e5'
+            '91c180da1681dc014b368d37867653a92ecf3e8236df3ee8914684cd46cf1155'
+            '34027aede9ab068f3d08bd2c17a77b80d3506a468e81a7e5afd502e8c5a0b7a2'
+            '54e5ebce1be053bfa7575094f7b6efb5c85debcc752b348af73dba377bb3712d'
+            '1120a275736ab1d91931323e8a170380172bb71a98de48b998b36380edb1426a'
             '5e9439bd8b4c42a721c992956b7c58cfbf13abf3414e5ac4cceb0c76a32f021a'
             'be037a9c3f0b063c731436507993680a5c77153c6bfb327a31f6a2e08d7e501e'
             'c732141180be5336afecd60e36290db60d2f4f1baf2395c7c4d9bcbb45ae0a23'
@@ -97,15 +117,14 @@ build() {
 }
 
 package_mdadm-amd() {
-	pkgdesc='mdadm with AMD RAIDXpert2 (RAIDCore) metadata support (mdadm-amd 1.1), plus the amdraid mkinitcpio hook'
+	pkgdesc='mdadm with AMD RAIDXpert2 (RAIDCore) metadata support, plus the amdraid mkinitcpio hook'
 	depends=('glibc' 'systemd')
 	optdepends=('bash: mdcheck'
-	            'md-bitmap-ext-dkms: md write-intent bitmap of AMD volumes on Linux 7.3.0-7.3.4 (resync after a crash only where md was writing)')
-	provides=("mdadm=${pkgver}")
+	            'md-bitmap-ext-dkms: md write-intent bitmap of AMD volumes on Linux 6.18.57-6.18.63 and 7.3.0-7.3.4 (resync after a crash only where md was writing)')
+	provides=("mdadm=${_mdadmver}")
 	# mkinitcpio 40: HOOKS of the shutdown ramfs come from /run/initramfs/mkinitcpio-shutdown.conf
 	# (tmpfiles 20-mkinitcpio.conf), which 60-amdraid-shutdown.conf appends to
 	conflicts=('mdadm' 'mkinitcpio<40')
-	replaces=('raidtools')
 	backup=('etc/mdadm.conf')
 	install=mdadm-amd.install
 
@@ -129,7 +148,7 @@ package_mdadm-amd() {
 }
 
 package_md-bitmap-ext-dkms() {
-	pkgdesc='md_mod with the write-intent bitmap fix for external metadata (DKMS, Linux 7.3.0-7.3.4), until it is upstream'
+	pkgdesc='md_mod with the write-intent bitmap fix for external metadata (DKMS, Linux 6.18.57-6.18.63, 7.3.0-7.3.4), until it is upstream'
 	arch=('any')
 	license=('GPL-2.0-only')
 	depends=('dkms')

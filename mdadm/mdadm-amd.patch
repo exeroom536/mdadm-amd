@@ -1179,10 +1179,10 @@ index f92a9a11..af1a26b8 100644
  int devpath_to_char(const char *dev_path, const char *entry, char *buf,
 diff --git a/super-amd.c b/super-amd.c
 new file mode 100644
-index 00000000..b0cb2764
+index 00000000..80a5303f
 --- /dev/null
 +++ b/super-amd.c
-@@ -0,0 +1,11325 @@
+@@ -0,0 +1,11429 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * mdadm - support for AMD RAIDXpert2 ("RAIDCore") metadata.
@@ -1293,6 +1293,8 @@ index 00000000..b0cb2764
 +/* write-intent bitmap: one sector, on element [0][0] */
 +#define AMD_BITMAP_OFFSET	0x80	/* from AllocatedSpace.SectorOffset */
 +#define AMD_BITMAP_BYTES	512
++/* mdmon's shadow of it (amd_shadow): in the first page of the md bitmap area */
++#define AMD_SHADOW_OFFSET	0x101
 +
 +/*
 + * Element flags for a member out of service, as the AMD driver records them
@@ -1328,11 +1330,15 @@ index 00000000..b0cb2764
 +/*
 + * RC_LogicalDevice.Flags set while RESTORE_SEGMENTS runs (the ring of an
 + * X399 RAID10); the LD a migration starts from has the same SRC flags
-+ * (rcraid 9.3.3 midway through RAIDABLE -> RAID1).
++ * (rcraid 9.3.3 midway through RAIDABLE -> RAID1).  rcraid.sys 9.5.0.201
++ * sets 0x20000000 too, in both LDs, while it creates, rebuilds or checks
++ * a volume, and clears it with the rest as it ends: of a transform mdmon
++ * ends, it keeps the bit until its own next one (Windows in a VM,
++ * q4-judge95).
 + */
 +#define AMD_LDF_RESTORE_SRC	0x20010
 +#define AMD_LDF_RESTORE_DST	0x10020000
-+#define AMD_LDF_TRANSFORM	0x10020094	/* cleared when it ends */
++#define AMD_LDF_TRANSFORM	0x30020094	/* cleared when it ends */
 +/* the source LD in the "100 %" packet (m1, m2): rcblob sets Flags = 0x80, then |= 4 */
 +#define AMD_LDF_TRANSFORM_DONE	0x84
 +
@@ -4387,9 +4393,94 @@ index 00000000..b0cb2764
 +}
 +
 +/*
++ * mdmon's shadow of the AMD bitmap: how it last wrote it, next to it on the
++ * same disk.  The AMD drivers do not always resync what mdmon left dirty:
++ * after Linux went down while writing, rcraid.sys 9.5.0.201 clears the
++ * bitmap at its start without checking the volume, and 9.3.3.218 checks
++ * the mirrors but not RAID5 parity (Windows in a VM, q4-judge95).  A shadow
++ * still dirty over a clean AMD bitmap tells so, and the volume is resynced
++ * as after a crash (amd_resync_start).  The sector is in the first page of
++ * the md bitmap area: the kernel writes only the bits after it, the AMD
++ * firmware and drivers nothing there (amd_mdbm).
++ */
++#define AMD_SHADOW_MAGIC	"mdadmAMB"	/* without the NUL */
++#define AMD_SHADOW_CLEAN	0xffffffffU
++
++struct amd_shadow {
++	__u64 checksum;		/* amd_sector_sum */
++	char magic[8];
++	__u64 volume_id;	/* the LD's: none of a volume deleted before */
++	__u32 dirty_from;	/* the bit the AMD bitmap is dirty from, or clean */
++	__u32 reserved[121];
++} __attribute__((packed));
++
++_Static_assert(sizeof(struct amd_shadow) == AMD_SECTOR, "AMD bitmap shadow");
++
++/* LBA of the shadow of @v's AMD bitmap, or 0 if element [0][0] has no room */
++static unsigned long long amd_shadow_lba(const struct amd_vol *v)
++{
++	unsigned long long at = __le64_to_cpu(v->el[0].allocated.offset);
++	unsigned long long data = __le64_to_cpu(v->el[0].user_data.offset);
++
++	return data > at && data - at > AMD_SHADOW_OFFSET ?
++	       at + AMD_SHADOW_OFFSET : 0;
++}
++
++/* Write the shadow (@buf: a sector) of the AMD bitmap: dirty from @from, or clean */
++static int amd_shadow_put(const struct amd_vol *v, int fd, void *buf,
++			  int dirty, unsigned int from)
++{
++	struct amd_shadow *s = buf;
++	unsigned long long lba = amd_shadow_lba(v);
++
++	if (!lba)
++		return 0;
++	memset(s, 0, sizeof(*s));
++	memcpy(s->magic, AMD_SHADOW_MAGIC, sizeof(s->magic));
++	s->volume_id = v->ld->id.id;
++	s->dirty_from = __cpu_to_le32(dirty ? from : AMD_SHADOW_CLEAN);
++	s->checksum = __cpu_to_le64(amd_sector_sum(s));
++	return pwrite(fd, s, AMD_SECTOR, (off_t)lba * AMD_SECTOR) == AMD_SECTOR ?
++	       0 : -1;
++}
++
++/*
++ * 1 if mdmon left @v's AMD bitmap dirty (from the bit in *@first) and
++ * another driver has cleared it since - call with the AMD bitmap clean.
++ * Reads into mmbuf, as amd_bitmap_read.
++ */
++static int amd_shadow_dirty(struct amd_super *super, struct amd_vol *v,
++			    unsigned int *first)
++{
++	struct amd_disk *d = amd_bitmap_disk(super, v);
++	struct amd_shadow *s = super->mmbuf;
++	unsigned long long lba = amd_shadow_lba(v);
++	int fd, rv;
++
++	if (v->single || !d || !s || !lba)
++		return 0;
++	fd = amd_disk_fd(d);
++	if (!is_fd_valid(fd))
++		return 0;
++	rv = amd_read(fd, lba, s, AMD_SECTOR);
++	if (fd != d->fd)
++		close(fd);
++	if (rv != 0 || memcmp(s->magic, AMD_SHADOW_MAGIC, sizeof(s->magic)) ||
++	    __le64_to_cpu(s->checksum) != amd_sector_sum(s) ||
++	    s->volume_id != v->ld->id.id ||
++	    __le32_to_cpu(s->dirty_from) >= amd_bitmap_bits(v))
++		return 0;
++	*first = __le32_to_cpu(s->dirty_from);
++	return 1;
++}
++
++/*
 + * Mark the volume dirty from bit @from to the end, or clean, in the AMD
 + * bitmap.  From 0 while md may write anywhere; later bits only while a
 + * resync after a crash runs and md is clean: what it has done is in step.
++ * Its shadow with it, under the same flush: before md writes, both are on
++ * the disk; a crash between the two writes as md goes clean leaves the
++ * shadow dirty at worst - a resync more if the AMD driver runs next.
 + */
 +static int amd_bitmap_write(struct amd_super *super, struct amd_vol *v,
 +			    int dirty, unsigned int from)
@@ -4404,6 +4495,7 @@ index 00000000..b0cb2764
 +	amd_bitmap_fill(v, buf, dirty, from);
 +	if (pwrite(d->fd, buf, AMD_BITMAP_BYTES,
 +		   (off_t)amd_bitmap_lba(v) * AMD_SECTOR) != AMD_BITMAP_BYTES ||
++	    amd_shadow_put(v, d->fd, buf, dirty, from) != 0 ||
 +	    fsync(d->fd) != 0)
 +		return -1;
 +	return 0;
@@ -5090,10 +5182,12 @@ index 00000000..b0cb2764
 +	 * after a resync that stopped cleanly, from where it stopped.
 +	 * A volume with the root file system on it must be left
 +	 * clean at shutdown (mdadm --wait-clean from the shutdown
-+	 * ramfs), or every reboot looks like a crash.
++	 * ramfs), or every reboot looks like a crash.  A bitmap the AMD
++	 * driver cleared after such a crash without a resync: from where
++	 * mdmon's shadow of it is dirty.
 +	 */
 +	bm = amd_bitmap_read(super, v, &first);
-+	if (bm == 1)
++	if (bm == 1 || (bm == 0 && amd_shadow_dirty(super, v, &first)))
 +		done = (unsigned long long)first * amd_bitmap_cover(v);
 +	if (v->init_pending) {
 +		unsigned long long logged = amd_init_resume_point(super, v);
@@ -5200,15 +5294,19 @@ index 00000000..b0cb2764
 + * a pattern there outlived rcraid, the Windows driver and the firmware -
 + * notes/agent-bitmap-space.md).  Counted from AllocatedSpace, not from the
 + * user data: a migration of the AMD driver moves that to +0x800.  Our
-+ * header takes the first page, the bits the rest.  The header alone says
-+ * that the volume has an md bitmap - AMD's metadata has no field for it -
-+ * and it has to be checked on each member: the AMD drivers neither copy
-+ * nor clear the area, a rebuild leaves on the new element what the disk
-+ * had there.
++ * header takes the first page (on element [0][0] its second sector is the
++ * shadow of the AMD bitmap, amd_shadow, on any volume), the bits the rest.
++ * The header alone says that the volume has an md bitmap - AMD's metadata
++ * has no field for it - and it has to be checked on each member: the AMD
++ * drivers neither copy nor clear the area, a rebuild leaves on the new
++ * element what the disk had there.
 + */
 +#define AMD_MDBM_OFFSET		0x100	/* from AllocatedSpace.SectorOffset */
 +#define AMD_MDBM_SECTORS	0x500
 +#define AMD_MDBM_HEADER		8	/* sectors: a page, the kernel writes the bits in pages */
++_Static_assert(AMD_SHADOW_OFFSET > AMD_MDBM_OFFSET &&
++	       AMD_SHADOW_OFFSET < AMD_MDBM_OFFSET + AMD_MDBM_HEADER,
++	       "the AMD bitmap's shadow is in the md bitmap header's page");
 +#define AMD_MDBM_ROOM		((AMD_MDBM_SECTORS - AMD_MDBM_HEADER) * AMD_SECTOR)
 +#define AMD_MDBM_CHUNK		(64 << 20)	/* bytes per bit, at least (as IMSM) */
 +#define AMD_MDBM_CHUNK_MAX	(1U << 21)	/* sectors: 1 GiB a bit, 5 PiB in all */
@@ -5859,6 +5957,7 @@ index 00000000..b0cb2764
 +	struct amd_ld *ld = v->ld;
 +	const struct amd_dev_id *sp = amd_ld_spares(ld);
 +	char name[AMD_NAME_LEN + 1], nbuf[64];
++	unsigned int from;
 +	int i, uuid[4];
 +
 +	amd_volume_uuid(super, vol, uuid);
@@ -5902,6 +6001,9 @@ index 00000000..b0cb2764
 +		       __le32_to_cpu(ld->last_operation),
 +		       __le32_to_cpu(ld->transform_state),
 +		       __le32_to_cpu(ld->transform_percent));
++	if (amd_bitmap_read(super, v, NULL) == 0 && amd_shadow_dirty(super, v, &from))
++		printf("        mdmon bitmap : dirty from bit %u, the AMD bitmap cleared since: resync at assembly\n",
++		       from);
 +	/*
 +	 * A migration (rcadm -T, the AMD driver): the LD as it was, then the
 +	 * one it becomes; the progress is in the transform log of the new
@@ -10201,6 +10303,8 @@ index 00000000..b0cb2764
 +
 +	if (ld->state == 0)
 +		ld->state = __cpu_to_le32(AMD_LD_STATE_NORMAL);
++	/* the AMD drivers set them for an initialization too (q5-judge) */
++	ld->flags &= ~__cpu_to_le32(AMD_LDF_TRANSFORM);
 +	super->vol[vol].mon.init_tlog = 2;	/* cleared once the end is written */
 +	amd_end_transform(super, vol, AMD_TRANSFORM_CREATE_REDUNDANCY,
 +			  AMD_TRANSFORM_COMPLETED);
