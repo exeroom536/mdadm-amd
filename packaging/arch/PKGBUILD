@@ -13,7 +13,7 @@ pkgname=('mdadm-amd' 'md-bitmap-ext-dkms')
 _commit=5542bf40fab20f09ce3be80ae1cb42584e9fa2f7   # mdadm-4.6-112-g5542bf40, 2026-11-12 (GitHub main)
 _mdadmver=4.6.r112.g5542bf40   # the mdadm it is built from (provides)
 # the mdadm-amd release; a build between releases: <last release>.r<n>
-pkgver=1.3
+pkgver=1.4
 pkgrel=1
 arch=('x86_64')
 license=('GPL-2.0-or-later')
@@ -22,7 +22,7 @@ makedepends=('git' 'man-db')
 
 # md-bitmap-ext-dkms: drivers/md of these stable tags (the bases), and for each the kernel releases whose
 # drivers/md files are the same (checked on a clone of stable: packaging/dkms/md-bases.sh); a kernel of any
-# other release keeps its own md_mod
+# other release keeps its own md_mod.  packaging/dkms/install.sh takes this table too.
 _mdbases=(6.18.57 6.18.61 6.18.63 7.3.1 7.3.4)
 _mdkvers=('6\.18\.(5[7-9]|60)' '6\.18\.6[12]' '6\.18\.63' '7\.3\.[0-3]' '7\.3\.4')	# per base: regex of the kernel version up to its first "-"
 _md="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/md"
@@ -49,7 +49,7 @@ for _b in "${_mdbases[@]}"; do
 	done
 done
 sha256sums=('684060921e12f301334e4c8d0ca8a529f7276e4f185e168246115e843dacb11e'
-            '79af69e54ce63cda92f4d61d65a5aab9b727dc4e7aededeb9c45919e698fce0a'
+            '97212d022ef3273adb502dcb8cd19c50b2fdef6679a34f1eb0f6f65a7e82cf87'
             '52b7a3e7f6d4785234c79fd394f2009a9aa389230fa742250058bd1f310330d1'
             'c1472503c7f6e4ece43dc139b6ab80a1b564631de96490b253e9f60e2dc6fb7b'
             '1dfff7905e6db439a38f19deede2535e405387bda6d6d7e8ef5e71661ada019f'
@@ -98,8 +98,13 @@ prepare() {
 	cd mdadm
 	git apply "$srcdir"/mdadm-amd.patch
 
-	# md-bitmap-ext-dkms: drivers/md of each base, with the fix
 	cd "$srcdir"
+	_md_tree
+}
+
+# md-bitmap-ext-dkms: drivers/md of each base, with the fix, from the sources in the current
+# directory (packaging/dkms/install.sh runs it too)
+_md_tree() {
 	rm -rf md-tree
 	local _b _f
 	for _b in "${_mdbases[@]}"; do
@@ -107,7 +112,7 @@ prepare() {
 		for _f in "${_mdfiles[@]}"; do
 			cp -L "v${_b}-${_f}" "md-tree/v$_b/drivers/md/$_f"
 		done
-		patch -d "md-tree/v$_b" -p1 --no-backup-if-mismatch -i "$srcdir/md-bitmap-ext.patch"
+		patch -d "md-tree/v$_b" -p1 --no-backup-if-mismatch -i "$PWD/md-bitmap-ext.patch"
 	done
 }
 

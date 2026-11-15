@@ -1,7 +1,7 @@
-From 7c24c9859478cf83c2e22f83b9f86710019c0539 Mon Sep 17 00:00:00 2001
+From 2a7587b62fd8d128509e73a9217aa0715a0c51ce Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Sat, 14 Nov 2026 01:34:30 +0500
-Subject: [PATCH 17/33] Assemble: look at every slotless device for the newest
+Date: Sun, 15 Nov 2026 11:17:58 +0500
+Subject: [PATCH 17/35] Assemble: look at every slotless device for the newest
  superblock
 
 Assemble() bases the array on the superblock of the newest device and

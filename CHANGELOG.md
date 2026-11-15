@@ -1,5 +1,59 @@
 # Changes
 
+## 1.4 — 2026-11-15
+
+**New.**
+- `mdadm --grow --size` makes a RAID1, RAID10 or RAID5 larger in place, and `mdadm --grow --level=10` makes a
+  RAID0 of n disks a RAID10 of 2n with n spares of the container, as the AMD migrations (`rcadm -T`) do. The
+  migration is recorded as the AMD driver records it: stopped midway, it goes on from where it was, under md or
+  under AMD's Linux driver 9.3.3-00302, both ways; such a migration that driver started is finished by `mdmon`.
+  Tried in emulation with that driver; not with Windows or the BIOS.
+- `mdadm --detail-platform -e amd` (and `--export`) shows what the AMD firmware takes for RAID: the EFI variable
+  `AMD_RAID`, the controllers it makes the firmware take with the disks behind them and their serial numbers, the
+  levels, chunk sizes and limits of `--create`. A controller path as the argument shows that one only.
+- `packaging/dkms/install.sh` installs the optional md bitmap module (the one of `md-bitmap-ext-dkms`) on
+  distributions without the Arch package; tried on openSUSE Tumbleweed in emulation. Fedora 45 and Ubuntu 26.04
+  build md into the kernel: there only a kernel rebuilt with `kernel/` gets the fix. With Secure Boot, the DKMS key
+  must be enrolled first, or no md array starts ([install.md](docs/install.md#the-dkms-module-without-the-arch-package)).
+
+**Fixed.**
+- Volumes that an AMD migration grew by adding disks (RAID0 or RAID5 onto more disks, RAID1 → RAID5) are now
+  assembled. Such a migration moves the data of each member down, to 1 MiB into its extent, and leaves them there;
+  mdadm took the volume for a broken one ("member extents are not where AMD puts them"). Tried in emulation with
+  `rcadm -T` of AMD's Linux driver 9.3.3-00302: the volumes read the same under md as under that driver, `md`
+  check clean. Not tried with RAIDXpert2 in Windows. A volume in the middle of such a migration is still not
+  assembled.
+- A rebuild target that lost the end of its rebuild (its write cache gone at a power loss, so that it holds
+  the configuration of the rebuild's middle) is rebuilt again from the start. Before, `mdmon` wrote it the
+  current configuration when it rebuilt another volume onto that disk, and the volume it had been rebuilt into
+  started in sync with mirrors that differ; the Windows driver does the same. Tried in emulation, and in a VM
+  with the Windows driver 9.3.3.329 and 9.3.3.218 after Linux: Windows boots, its volumes Normal, the data the same.
+- After `mdmon` took over a configuration the AMD driver wrote, disks that came after its first write (spares, for
+  one) kept the AMD driver's configuration; that driver then took its own configuration as the newer one and the
+  volume offline. Found in emulation with AMD's Linux driver after its migration; it can happen with any
+  configuration of the AMD driver whose spares come after the members.
+- `mdadm --grow --size` of a volume of a container that was assembled but not yet written to (md keeps it
+  read-only until the first write) failed with "Cannot set device size: Read-only file system". A fix of
+  mdadm's own `Grow.c`, as it already does when the number of disks changes.
+- `mdmon` tells the kernel log of a write of the configuration, the transform log or the AMD bitmap that keeps
+  failing once, and once more when it goes through again; before, it wrote the line at every write it tried.
+
+**Tests.** Stages 45 (`--detail-platform`), 46 (a write that keeps failing), 47 (volumes after AMD migrations;
+fixtures `tests/fixtures/2026-11-15-rcraid-migrations/`), 48 (growing in place), 49 (RAID0 → RAID10; fixtures
+`tests/fixtures/2026-11-15-rcraid-grow/`) and 50 (a rebuild target that lost the end of its rebuild): 639 checks in 63 stages.
+`tests/run.sh` unmounts the suite's work area when it ends (it stayed mounted, and the work directory could not be
+removed without `umount`).
+
+**Docs.**
+- `mdadm(8)` and [usage.md](docs/usage.md#growing-a-volume-raid0--raid10): growing a volume in place and
+  RAID0 → RAID10. The patch series has 35 patches: a new one of common code (21, `--grow --size` of a read-auto
+  member array) and a new stage of the handler (33, the migrations).
+- The Windows driver 9.3.3.329 tried in a VM against 1.3 ([testing.md](docs/testing.md#amd-drivers)): no difference
+  from 9.3.3.218 that matters to this mdadm. After a Linux crash 9.3.3.218 and 9.3.3.329 make the mirrors agree only
+  near the start of the volume (testing.md said they checked the mirrors); `mdmon` resyncs such volumes anyway.
+- The roadmap no longer lists DKMS modules: `md-bitmap-ext-dkms` is an optional package, and the TRIM
+  fix (`kernel/blk-discard/`) cannot be a module at all: it is in the block layer, which is built into the kernel.
+
 ## 1.3 — 2026-11-15
 
 **Fixed.**

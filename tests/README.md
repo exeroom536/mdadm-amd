@@ -1,6 +1,6 @@
 # Test suite
 
-Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 586 checks in 57
+Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 639 checks in 63
 stages, on images of real AMD RAID disks, of disks made by the board's own RAID firmware in emulation, and of
 disks this mdadm makes. Everything runs on loop devices of sparse files (plus LIO SCSI disks backed by files for
 the udev stages); no real disk is touched unless you provide the optional AMD controller disks below.
@@ -56,9 +56,9 @@ images elsewhere; `ALLOW_MD=1` runs although md arrays are active. The output al
 and every check is written to the kernel log (`amd-test: ok …`), so `dmesg` shows which check the kernel
 messages belong to.
 
-The whole suite takes about 48 minutes in a VM with 2 vCPUs and 2 GB (Debian 13, kernel 6.12), each of `PART=1`
-and `PART=2` about half of that; most of it is waiting for md (resync at chosen speeds, rebuilds stopped midway, the md
-bitmap daemon), not CPU. Without the AMD controller disks 519 checks run and three blocks (26 checks) are skipped.
+The whole suite takes about an hour in a VM with 2 vCPUs and 2 GB (Debian 13, kernel 6.12), `PART=1` about 35
+minutes and `PART=2` about 25; most of it is waiting for md (resync at chosen speeds, rebuilds stopped midway, the md
+bitmap daemon), not CPU. Without the AMD controller disks three blocks are skipped (in stages 21, 23 and 27).
 
 **After an interrupted run, reboot** (or stop the md arrays and detach the loop devices of `$WORKDIR` by hand):
 leftover arrays and loop devices of the suite's images make the next run fail or refuse to start.
@@ -113,6 +113,12 @@ about the X399 fixture (its dump has no LBA 0), printed by `-E` inside checks.
 | 42 | the bit rcraid.sys 9.5 sets in LD.Flags during a rebuild or an initialization is cleared when mdmon ends the transform |
 | 43 | a check of a volume cut short in Windows (CHECK_REDUNDANCY): the volume runs read-write, md resyncs from the AMD log's mark, the end is recorded as the AMD driver records it |
 | 44 | `-C` of a Volume (linear) on a kernel with no md linear (Debian 13, Ubuntu 24.04): refused before anything is written; on a kernel with it, created and running |
+| 45 | `--detail-platform -e amd`: the controllers `AMD_RAID` makes the firmware take, their disks, the limits; `--export`; a controller path; `-C` of images does not warn about the platform |
+| 46 | a write of mdmon that keeps failing (the AMD bitmap sector an error target, dm): one line in the kernel log, and one when it goes through again |
+| 47 | volumes after AMD migrations that moved the data to AllocatedSpace + 0x800 (`rcadm -T`): assembled; in the middle of one, not; mdmon writes nothing into AMD's data log |
+| 48 | `--grow --size` of a RAID1, RAID5, RAID10 in place, as `rcadm -T -s`: the start packet, the log, "100 %" and the final packet as AMD writes them; stopped midway and assembled again - goes on from the log; refused where there is no room, smaller, RAID0, the container; AMD's own growth midway (rcraid) ended by mdmon as the AMD driver ends it |
+| 49 | `--grow --level=10` of a RAID0 of 2, as `rcadm -T -r10`: the spares mirror the members, the packets and the log as AMD writes them; stopped midway, `-I` waits for the new disks, goes on from the log; refused with too few spares, another layout or number of disks; AMD's own RAID0 -> RAID10 midway (rcraid) ended by mdmon |
+| 50 | a rebuild target that lost the end of its rebuild (a power cut, the write cache gone): its member is recorded offline before mdmon writes it the live configuration and is rebuilt in place from 0; the rebuilds of other volumes onto it go on; md check 0 |
 
 Fixtures and where they come from: [fixtures/README.md](fixtures/README.md). `helpers/` has the scripts that
 forge metadata with valid checksums for some stages; `../tools/amdraid_dump.py` parses it.

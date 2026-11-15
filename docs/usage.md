@@ -34,9 +34,14 @@ mdadm --examine --scan                   # ARRAY lines for /etc/mdadm.conf
   configuration has the volume in the same place: such a volume cannot have been written without it. A RAID1,
   RAID10 or RAID5 treats such a disk as out of date: it starts without it only with `--run`, and the disk is then
   rebuilt.
-- A volume in the middle of an AMD migration other than RAIDABLE → RAID1 is not assembled.
+- A volume in the middle of an AMD migration that adds disks (RAID0 or RAID5 onto more disks, RAID1 → RAID5) is
+  not assembled; once the AMD driver has finished it, the volume is assembled as any other. A migration that grows
+  a volume in place or makes a RAID0 a RAID10 is assembled and finished by `mdmon`.
 
 ## Creating
+
+`sudo mdadm --detail-platform -e amd` shows what the firmware takes for RAID (the EFI variable `AMD_RAID`): the
+controllers, the disks behind them, the levels, chunk sizes and limits below.
 
 First the container: the disks are initialized as the BIOS menu does it (both ends zeroed, an MBR with AMD's one
 partition, the AMD label and configuration). Then volumes in it.
@@ -90,6 +95,21 @@ mdadm --grow /dev/md/single --raid-devices=2                                    
 
 The migration is recorded as the AMD driver records it, so the BIOS and Windows see it in progress, and an
 interrupted one goes on after a reboot. A migration that the AMD driver started is finished by `mdmon`.
+
+## Growing a volume, RAID0 → RAID10
+
+```sh
+mdadm --grow /dev/md/mirror --size=max          # RAID1, RAID10, RAID5: larger, in place (or --size=<size per disk>)
+mdadm /dev/md/amd0 --add /dev/sde /dev/sdf       # a RAID0 of 2 needs 2 spares
+mdadm --grow /dev/md/stripe --level=10           # RAID0 of n disks -> RAID10 of 2n, each disk mirrored onto a spare
+```
+
+As with the AMD migrations, a volume grows only into the free space right behind its members on each disk: a
+volume after it on the same disks leaves no room. The data stay where they are; md resyncs the new part, or copies
+each disk onto its new mirror. The migration is recorded as the AMD driver records it; stopped midway, it goes on
+from where it was at the next assembly. Not supported: growing a RAID0 or a Volume, other layouts and numbers
+of disks for RAID10, adding disks to a volume. Tried in emulation with AMD's Linux driver, which takes and
+finishes these migrations as its own; not yet with Windows or the BIOS.
 
 ## Changing and deleting volumes
 

@@ -1,7 +1,7 @@
-From 094b565814ad450b4bcdef768ae769576bee0443 Mon Sep 17 00:00:00 2001
+From 93578276df874c68f5964b11f55bbaa57b32dd1a Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Sat, 14 Nov 2026 01:34:23 +0500
-Subject: [PATCH 16/33] Manage: let metadata give a member array spares of its
+Date: Sun, 15 Nov 2026 11:17:53 +0500
+Subject: [PATCH 16/35] Manage: let metadata give a member array spares of its
  own
 
 Spares of an external container are the container's, for any of its

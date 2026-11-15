@@ -313,7 +313,7 @@ sudo mdadm --update-subarray=0 --update=no-bitmap /dev/md/amd0      # remove it
 Without the fix mdadm says the kernel cannot run the bitmap, and the volume runs without it, with a full resync
 after a crash.
 
-How to get the fix:
+How to get the fix (optional: everything else works without it):
 
 - **Arch Linux, kernel 6.18.57 to 6.18.63 or 7.3.0 to 7.3.4:** install the `md-bitmap-ext-dkms` package. It builds
   `md_mod` from the stable kernel's `drivers/md` with the fix (downloaded from kernel.org and checked by SHA-256)
@@ -322,17 +322,11 @@ How to get the fix:
   builds for. On any other kernel version it builds nothing, and the stock `md_mod` stays. It needs md built as a
   module (`CONFIG_BLK_DEV_MD=m`). If your kernel enforces module signatures, enroll the DKMS key first. The kernel's
   own `md-mod.ko.zst` stays in place, so `pacman -Qk` finds the kernel package whole.
-- **Other distributions, the same kernel versions:** lay out `/usr/src/md-bitmap-ext-1/` as
-  `package_md-bitmap-ext-dkms()` in `packaging/arch/PKGBUILD` does: `Kbuild` and the two scripts from
-  `packaging/dkms/`; a directory `v7.3.1/` with `md.c md.h md-bitmap.c md-bitmap.h md-llbitmap.c md-cluster.h` from
-  Linux v7.3.1 `drivers/md` with `md-bitmap-ext.patch` applied; a file `bases` with the line `7\.3\.[0-3] v7.3.1`
-  (and so for each other base: its directory and line, as in `_mdbases`/`_mdkvers` of the PKGBUILD); `dkms.conf`
-  with `@PKGVER@` replaced by `1` and `@KVER_RE@` by the lines' expressions joined, e.g. `^(7\.3\.[0-3]|7\.3\.4)-`.
-  Then run `sudo dkms install md-bitmap-ext/1`. This was tried only
-  with the Arch package. A distribution kernel may carry md changes of its own: use it only on a kernel whose
-  `drivers/md` is the stable one (`packaging/dkms/md-bases.sh` lists which stable releases share these files).
-- **Other kernel versions:** apply `kernel/0001-*.patch` and `kernel/0002-*.patch` to the kernel and rebuild md.
-  They apply to 6.18.63, 7.0.14, 7.1.13, 7.2.15, 7.3.1 to 7.3.4, 7.4-rc2 and the mainline of 14 November 2026.
+- **openSUSE Tumbleweed and other distributions with DKMS, the same kernel versions:** the same module, installed
+  by `packaging/dkms/install.sh` ([below](#the-dkms-module-without-the-arch-package)).
+- **Other kernel versions, and kernels with md built in** (`CONFIG_BLK_DEV_MD=y`: Fedora 45, Ubuntu 26.04): apply
+  `kernel/0001-*.patch` and `kernel/0002-*.patch` to the kernel and rebuild it. They apply to 6.18.63, 7.0.14,
+  7.1.13, 7.2.15, 7.3.1 to 7.3.4, 7.4-rc2 and the mainline of 14 November 2026.
 
 To check that the bitmap is in use:
 
@@ -342,6 +336,70 @@ sudo mdadm --examine /dev/sdX                  # "md Bitmap : … KiB a bit, …
 ```
 
 `tools/imsm-bitmap-probe.sh` checks the kernel side alone, with Intel IMSM on two loop files.
+
+### The DKMS module without the Arch package
+
+This step is optional. `packaging/dkms/install.sh` installs the module of `md-bitmap-ext-dkms` on other
+distributions: it downloads `drivers/md` of the bases listed in `packaging/arch/PKGBUILD` from kernel.org, checks them
+against the SHA-256 sums there, applies the fix, lays out `/usr/src/md-bitmap-ext-<version>/` as the package does,
+runs `dkms install` for the running kernel and rebuilds its initramfs (`update-initramfs -u` where there is one,
+otherwise `dracut -f`), from which `md_mod` is loaded when the root is on a volume. A version installed before is
+removed first.
+
+It builds for the same kernels as the package, 6.18.57 to 6.18.63 and 7.3.0 to 7.3.4, and needs md built as a
+module. openSUSE Tumbleweed has it so; Fedora 45 and Ubuntu 26.04 build md into the kernel, and there the script
+stops: only a kernel rebuilt with the fix helps. A distribution kernel of these versions may still carry md changes
+of its own: Tumbleweed 7.3.3 has the stable `drivers/md`; on another distribution compare its kernel's `drivers/md`
+first (`packaging/dkms/md-bases.sh` shows which stable releases share these files).
+
+**1. Packages:** DKMS, the headers of the running kernel, `patch` and `curl`. On openSUSE the devel package must be
+the version of the running kernel: after a kernel update, reboot first. Elsewhere, install the same with the
+distribution's package names.
+
+```sh
+sudo zypper install dkms kernel-default-devel patch curl     # openSUSE
+```
+
+**2. Install, then reboot:**
+
+```sh
+cd /path/to/mdadm-amd
+sudo packaging/dkms/install.sh
+```
+
+DKMS builds the module again for each new kernel; on a kernel without a base it builds nothing, and that kernel
+runs with its own `md_mod` (volumes then run without the bitmap) until a newer mdadm-amd has a base for it: update
+the sources and run the script again. The kernel's own `md-mod.ko` stays in place, so the package manager finds the
+kernel package whole.
+
+**3. Check** after the reboot, then add the bitmap to a volume as above:
+
+```sh
+modinfo -n md_mod                  # a file under /lib/modules/<kernel>/updates/
+cat /sys/module/md_mod/taint       # contains "O": the module from DKMS is loaded
+```
+
+**Secure Boot.** With Secure Boot on, the kernel loads only modules signed by a key it trusts. DKMS signs the module
+with a key of its own (`/var/lib/dkms/mok.pub`, made at the first build), and that key has to be enrolled into
+shim's MOK list before you reboot:
+
+```sh
+sudo mokutil --import /var/lib/dkms/mok.pub    # asks for a one-time password
+```
+
+At the next boot MokManager asks to enroll the key, with that password. Without the key the kernel rejects this
+`md_mod` and does not fall back to its own one: no md array starts, and a system with its root on a volume does not
+boot (in the initramfs: "Loading of module with unavailable key is rejected"). To get out of that, turn Secure Boot
+off for one boot, then enroll the key or uninstall. This was tried with `module.sig_enforce=1`, which makes the
+kernel check signatures as Secure Boot does, not with Secure Boot itself.
+
+**Uninstall:**
+
+```sh
+sudo packaging/dkms/install.sh --remove     # then reboot
+```
+
+The kernel's own `md_mod` comes back. A volume with a bitmap then runs without it, as on a kernel without the fix.
 
 ### Where it is stored and when it is not used
 

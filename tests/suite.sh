@@ -4337,6 +4337,468 @@ q44drop; rmdir $Q44
 fi
 # --- end of stage 44 ---
 
+# --- stage 45: --detail-platform: the controllers AMD RAID takes (the EFI variable AMD_RAID), their disks with serial
+# numbers, the limits of -C; --export; a controller path as the argument; without AMD_RAID, exit status 2.  Create asks
+# every metadata detail_platform(enumerate_only) and warns without a platform: AMD always answers 0 there, so -C of a
+# container of images (loop devices) does not say "unable to enumerate platform support".
+if want 45; then
+cd "$MDADM_DIR"
+stopall
+AV=/sys/firmware/efi/efivars/AMD_RAID-fe26a894-d199-47d4-8afa-070e3d54ba86
+if [ -e $AV ]; then
+RAW=$(od -An -tx1 -j4 -N1 $AV | tr -d ' '); RAW=$((16#$RAW))
+OUT=$(sudo $M --detail-platform -e amd 2>&1); RC=$?
+AMDD=$(lsblk -dno NAME,SERIAL | awk '$2 ~ /^AMD(SATA|NVME)/ {print $1 "(" $2 ")"}')
+q45has() { local d; for d in $AMDD; do echo "$OUT" | tr -d ' ' | grep -q "Disk:/dev/${d}\$" || return 1; done; }
+# each disk listed is behind the controller it is listed under
+q45behind() {
+	local c= l d
+	while IFS= read -r l; do
+		case "$l" in
+		*"I/O Controller : "*) c=$(echo "$l" | sed 's/.*I\/O Controller : \([^ ]*\) .*/\1/') ;;
+		*" Disk : /dev/"*) d=$(echo "$l" | sed 's/.* Disk : \/dev\/\([^ ]*\).*/\1/')
+			readlink -f /sys/block/$d | grep -q "^$c/" || return 1 ;;
+		esac
+	done <<< "$OUT"
+}
+check "45: --detail-platform -e amd: rc 0, Platform, AMD_RAID 0x$(printf %x $RAW), $(echo "$OUT" | grep -c 'I/O Controller') controllers, $(echo "$OUT" | grep -c ' Disk : ') disks, each behind its controller; the disks AMDSATA*/AMDNVME* with serials ($(echo $AMDD | wc -w))" "[ $RC = 0 ] && echo \"\$OUT\" | grep -q '^ *Platform : AMD RAIDXpert2' && echo \"\$OUT\" | grep -q '^ *AMD_RAID : 0x$(printf %x $RAW):' && [ \$(echo \"\$OUT\" | grep -c 'I/O Controller') -ge 1 ] && q45behind && q45has"
+EX=$(sudo $M --detail-platform -e amd --export 2>&1); RC=$?
+check "45: ... --export: MD_FIRMWARE_TYPE=amd, AMD_RAID, levels, chunk sizes" "[ $RC = 0 ] && echo \"\$EX\" | grep -qx 'MD_FIRMWARE_TYPE=amd' && echo \"\$EX\" | grep -qx 'AMD_RAID=0x$(printf %x $RAW)' && echo \"\$EX\" | grep -qx 'AMD_SUPPORTED_CHUNK_SIZES=64k 128k 256k'"
+C1=$(echo "$OUT" | sed -n 's/^ *I\/O Controller : \([^ ]*\) .*/\1/p' | head -1)
+O1=$(sudo $M --detail-platform -e amd $C1 2>&1); RC=$?
+check "45: ... the controller $C1 given: rc 0, only it" "[ $RC = 0 ] && [ \$(echo \"\$O1\" | grep -c 'I/O Controller') = 1 ] && echo \"\$O1\" | grep -q 'I/O Controller : $C1 '"
+VP=$(readlink -f /sys/bus/pci/devices/0000:00:00.0 2>/dev/null)	# the host bridge: no disks behind it
+O2=$(sudo $M --detail-platform -e amd -v $VP 2>&1); RC=$?
+check "45: ... a controller AMD RAID does not take ($VP): rc 2, said" "[ -n '$VP' ] && [ $RC = 2 ] && echo \"\$O2\" | grep -q 'no controller AMD RAID takes'"
+else
+OUT=$(sudo $M --detail-platform -e amd -v 2>&1); RC=$?
+check "45: no EFI variable AMD_RAID: --detail-platform -e amd: rc 2, said" "[ $RC = 2 ] && echo \"\$OUT\" | grep -q 'AMD RAID is off in the firmware'"
+fi
+Q45=$WQ/q45
+q45drop() { stopall; for l in $(sudo losetup -a | grep $Q45/ | cut -d: -f1); do sudo losetup -d $l; done; rm -f $Q45/*.img; }
+mkdir -p $Q45; q45drop
+QL=""; for n in 0 1; do truncate -s 1G $Q45/d$n.img; QL="$QL $(sudo losetup -f --show $Q45/d$n.img)"; done
+OUT=$($M -C /dev/md/q45c -e amd -n 2 $QL --run 2>&1); RC=$?
+check "45: -C of a container of images: no 'unable to enumerate platform support'" "[ $RC = 0 ] && ! echo \"\$OUT\" | grep -q 'unable to enumerate platform'"
+q45drop; rmdir $Q45
+fi
+# --- end of stage 45 ---
+
+# --- stage 46: a write of mdmon that keeps failing is told once in the kernel log, not once a pass of the monitor, and
+# once more when it goes through again.  A RAID1 on two dm-linear devices; the sector of the AMD bitmap (AllocatedSpace
+# + 0x80 of element [0][0]) is switched to an error target while it runs; 4 writes, each followed by a pause longer
+# than safe_mode_delay (each makes the volume dirty and mdmon write the AMD bitmap); then the table as it was, one more.
+if want 46; then
+cd "$MDADM_DIR"
+stopall
+Q46=$WQ/q46
+q46drop() { stopall; for n in 0 1; do sudo dmsetup remove q46d$n 2>/dev/null; done
+	for l in $(sudo losetup -a | grep $Q46/ | cut -d: -f1); do sudo losetup -d $l; done; rm -f $Q46/*.img; }
+mkdir -p $Q46; q46drop
+for n in 0 1; do
+	truncate -s 1G $Q46/d$n.img; L=$(sudo losetup -f --show $Q46/d$n.img); eval Q46L$n=$L
+	echo "0 $(sudo blockdev --getsz $L) linear $L 0" | sudo dmsetup create q46d$n
+done
+QS=$(sudo blockdev --getsz $Q46L0)
+$M -C /dev/md/q46c -e amd -n 2 /dev/mapper/q46d0 /dev/mapper/q46d1 --run >/dev/null 2>&1
+$M -C /dev/md/q46v -l1 -n2 -z 128M /dev/$(cont1) --run --assume-clean >/dev/null 2>&1; sleep 2
+V=$(mdof raid1)
+OFF=$($M -E /dev/mapper/q46d0 2>/dev/null | sed -n 's/.* Member *0 : .* offset \([0-9]*\) .*/\1/p' | head -1)
+# -E gives the user data offset; AllocatedSpace (AMD_SERVICE, 0x5000) is in front of it, the AMD bitmap at + 0x80
+BL=$(( ${OFF:-0} - 0x5000 + 0x80 ))
+# q46tab <n> <bad>: the table of q46d<n>, the sector of the AMD bitmap an error target if <bad> = 1
+q46tab() { local L; eval L=\$Q46L$1
+	if [ $2 = 1 ]; then printf '0 %d linear %s 0\n%d 1 error\n%d %d linear %s %d\n' $BL $L $BL $((BL + 1)) $((QS - BL - 1)) $L $((BL + 1))
+	else echo "0 $QS linear $L 0"; fi | sudo dmsetup reload q46d$1 && sudo dmsetup resume q46d$1; }
+# q46io <n>: <n> writes to the volume, each followed by a pause longer than its safe_mode_delay: md has it clean
+# again, so each write makes it dirty and mdmon write the AMD bitmap
+SMD=$(cut -d. -f1 /sys/block/$V/md/safe_mode_delay 2>/dev/null)
+q46io() { local i; for i in $(seq $1); do
+	sudo dd if=/dev/zero of=/dev/$V bs=64k count=8 seek=$((RANDOM % 1000)) oflag=direct conv=notrunc 2>/dev/null
+	sleep $(( ${SMD:-4} + 2 )); done; }
+sudo dmesg -C
+q46tab 0 1; q46tab 1 1
+q46io 4
+NB=$(sudo dmesg | grep -c 'amd: cannot write the bitmap of subarray')
+check "46: a write of the AMD bitmap failing at 4 writes ($V, LBA $BL, safe_mode_delay ${SMD}s): told once in the kernel log ($NB lines; was one a write)" "[ -n '$V' ] && [ -n '$OFF' ] && [ $NB = 1 ]"
+q46tab 0 0; q46tab 1 0
+q46io 1
+NA=$(sudo dmesg | grep -c 'amd: the bitmap of subarray-[0-9]* is written again')
+check "46: ... the write goes through again: told once ($NA), no more failures" "[ $NA = 1 ] && [ \$(sudo dmesg | grep -c 'amd: cannot write the bitmap of subarray') = $NB ]"
+q46drop; rmdir $Q46
+fi
+# --- end of stage 46 ---
+
+# --- stage 47: volumes after AMD migrations.  rcadm -T, adding disks, moves the data of each element from AllocatedSpace
+# + 0x5000 to + 0x800, and they stay there; 1.3 did not assemble such volumes ("member extents are not where AMD puts
+# them").  Snapshots of fixtures/2026-11-15-rcraid-migrations (rcraid 9.3.3-00302; metadata only, the data zeroes):
+# after a migration, the volumes are assembled, at + 0x800; in the middle of one, not assembled, as before; mdmon on
+# a RAID5 at + 0x800: written, stopped, assembled again - the data as written, AMD's data log (+ 0x600..+ 0x800 of
+# each element) untouched.
+if want 47; then
+cd "$MDADM_DIR"
+stopall
+Q47=$WQ/q47; Q47D=$FIXT/2026-11-15-rcraid-migrations
+q47drop() { stopall; for l in $(sudo losetup -a | grep $Q47/ | cut -d: -f1); do sudo losetup -d $l; done; rm -f $Q47/*.img; }
+mkdir -p $Q47
+# q47mk <snapshot>: its five disks (8 GiB) as loop devices in Q47L, the metadata and transform log sectors of the dump
+q47mk() { local f n b lba; q47drop; Q47L=""
+	for f in $Q47D/$1-sata*-lba0-6000.img.xz; do
+		n=$(basename $f | sed 's/.*-sata\([0-9]\)-.*/\1/')
+		truncate -s 8G $Q47/s$n.img; xz -dc $f | dd of=$Q47/s$n.img conv=notrunc status=none
+		for b in $Q47D/$1-sata$n-lba0x*.bin; do
+			[ -e "$b" ] || continue; lba=$(basename $b .bin | sed 's/.*-lba0x//')
+			dd if=$b of=$Q47/s$n.img bs=512 seek=$((16#$lba)) conv=notrunc status=none
+		done
+		Q47L="$Q47L $(sudo losetup -f --show $Q47/s$n.img)"
+	done
+	for l in $Q47L; do $M -I $l >/dev/null 2>&1; done; sleep 2; }
+# q47vol <level> <disks> [<offset>]: md of an assembled volume of <level> on <disks>, each member at <offset> if given
+q47vol() { local m; for m in $(mdof $1); do [ "$(cat /sys/block/$m/md/raid_disks)" = $2 ] || continue
+	[ -z "${3:-}" ] || [ "$(cat /sys/block/$m/md/dev-*/offset | sort -u)" = $3 ] || continue; echo $m; done; }
+q47mk q8m-e1post
+check "47: RAID0 2 -> 3 disks (rcadm -T -r0, data moved to + 0x800): assembled, members at 0x100800" "[ -n \"\$(q47vol raid0 3 $((0x100800)))\" ]"
+q47mk q8m-e1cpost
+check "47: ... grown again to 4 disks (data already at + 0x800): assembled" "[ -n \"\$(q47vol raid0 4 $((0x100800)))\" ]"
+q47mk q8m-e3apost
+check "47: RAID0 2 x 1 -> RAID10 2 x 2 (+ 0x5000 and new elements): assembled" "[ -n \"\$(q47vol raid10 4)\" ]"
+q47mk q8m-e3bpost
+check "47: RAID1 1 x 2 -> RAID5 3 disks (data to + 0x800): assembled" "[ -n \"\$(q47vol raid5 3)\" ]"
+q47mk q8m-e3dpost
+check "47: RAID1 1000 -> 2000 MB in place: assembled" "[ -n \"\$(q47vol raid1 2)\" ]"
+q47mk q8m-e2mid
+check "47: RAID5 3 -> 4 disks, in the middle of the migration: not assembled, as before (the migration is AMD's)" "[ -z \"\$(mdof raid5)\" ]"
+q47mk q8m-e1cmid
+check "47: RAID0 3 -> 4 disks, in the middle: not assembled" "[ -z \"\$(mdof raid0)\" ]"
+q47mk q8m-e2post
+V=$(q47vol raid5 4 $((0x2e2800)))
+check "47: RAID5 3 -> 4 disks, 2862 -> 5724 MiB (data to + 0x800): assembled, members at 0x2e2800 ($V)" "[ -n '$V' ]"
+# the AMD data log of each element: AllocatedSpace + 0x600 .. + 0x800 (0x2e2600..0x2e2800 on the four disks)
+q47log() { local l; for l in $(echo $Q47L | cut -d' ' -f1-4); do sudo dd if=$l bs=512 skip=$((0x2e2600)) count=512 status=none; done | md5sum | cut -c1-32; }
+L0=$(q47log)
+sudo dd if=/dev/urandom of=$Q47/pat bs=1M count=8 status=none
+sudo dd if=$Q47/pat of=/dev/$V bs=1M seek=100 oflag=direct status=none; sleep 3
+stopall; for l in $Q47L; do $M -I $l >/dev/null 2>&1; done; sleep 2; V=$(q47vol raid5 4 $((0x2e2800)))
+check "47: ... mdmon on it: written, stopped, assembled again: the data as written, clean, the AMD data log untouched" "[ -n '$V' ] && [ \"\$(sudo dd if=/dev/$V bs=1M skip=100 count=8 status=none | md5sum | cut -c1-32)\" = \"\$(md5sum < $Q47/pat | cut -c1-32)\" ] && [ \"\$(cat /sys/block/$V/md/resync_start)\" = none ] && [ \"\$(q47log)\" = $L0 ]"
+q47drop; rm -f $Q47/pat; rmdir $Q47
+fi
+# --- end of stage 47 ---
+
+# Helpers of stages 48, 49.
+# qgdrop / qgmk <dir> <disks> <GiB>: images d0...d<n-1> in $WQ/<dir> anew, loop devices in QGL (in order)
+qgdrop() { stopall; for l in $(sudo losetup -a | grep "$WQ/$1/" | cut -d: -f1); do sudo losetup -d $l; done; rm -rf $WQ/$1; }
+qgmk() { local n; qgdrop $1; mkdir -p $WQ/$1; QGL=""
+	for n in $(seq 0 $(($2 - 1))); do truncate -s ${3}G $WQ/$1/d$n.img; QGL="$QGL $(sudo losetup -f --show $WQ/$1/d$n.img)"; done; }
+qgl() { echo $QGL | cut -d' ' -f$(($1 + 1)); }	# loop device of disk d<n>
+# md of a volume by name: /dev/md/<name> after -C, /dev/md/<name>_0 after -I
+qgmd() { local p; for p in /dev/md/$1 /dev/md/${1}_0; do [ -e $p ] && { basename $(readlink -f $p); return; }; done; }
+qgasm() { local l; for l in $QGL; do $M -I $l >/dev/null 2>&1; done; sleep 2; }
+# qgld <image> <LD ID hex> [<packet number>]: the records of the LD of this ID in the live packet (or in the packet of the
+# ring with this number), a line a record: the transform fields and the elements id:alloc+size:data+size:flags (hex)
+qgld() {
+	python3 - "$@" <<'PY'
+import struct, sys
+img, ldid = sys.argv[1], int(sys.argv[2], 16)
+f = open(img, "rb")
+def packet(off, size):
+    f.seek(off * 512); return f.read(size)
+if len(sys.argv) > 3:
+    gen, p = int(sys.argv[3]), None
+    f.seek(0x5800 * 512); ring = f.read(0x800 * 512); lba = 0
+    while lba < 0x800:
+        o = lba * 512
+        if struct.unpack_from("<Q", ring, o + 0xc)[0] != 0xe1e10000: lba += 1; continue
+        size = struct.unpack_from("<I", ring, o + 0x18)[0]
+        if not 0x200 <= size <= 0x100000: lba += 1; continue
+        if struct.unpack_from("<Q", ring, o + 0x34)[0] == gen: p = ring[o:o + size]
+        lba += (size + 511) // 512
+    if p is None: sys.exit(0)
+else:
+    f.seek(0x5001 * 512); c = f.read(512); p = packet(*struct.unpack_from("<II", c, 8))
+q, end = struct.unpack_from("<II", p, 0x2c); end += q
+while q + 0x200 <= end and struct.unpack_from("<I", p, q)[0] == 0x25BD:
+    sz = struct.unpack_from("<I", p, q + 0x90)[0]
+    if not sz: break
+    ld = p[q:q + sz]; q += sz
+    if struct.unpack_from("<Q", ld, 0x2c)[0] != ldid: continue
+    u = lambda o: struct.unpack_from("<I", ld, o)[0]
+    Q = lambda o: struct.unpack_from("<Q", ld, o)[0]
+    fc, sc = u(0x6c), u(0x70)
+    out = ["type=%x" % u(0xc), "st=%x" % u(0x8), "tt=%x" % u(0x10), "lo=%x" % u(0x14), "ts=%x" % u(0x18),
+           "cap=%x" % Q(0x50), "ps=%x" % Q(0x58), "gen=%x" % Q(0x60), "fs=%dx%d" % (fc, sc), "tf=%x" % u(0x78),
+           "psz=%x" % u(0x7c), "fl=%x" % u(0x84), "lk=%x" % u(0x88), "pct=%x" % u(0x94), "at=%x" % u(0x98)]
+    for e in range(fc * sc):
+        b = ld[0x200 + 0x40 * e: 0x240 + 0x40 * e]
+        dev = struct.unpack_from("<Q", b, 0)[0]
+        at, size, data, dsize = struct.unpack_from("<QQQQ", b, 0x10)
+        out.append("e%d=%x:%x+%x:%x+%x:%x" % (e, dev & 0xffff, at, size, data, dsize, struct.unpack_from("<I", b, 0x30)[0]))
+    print(" ".join(out))
+PY
+}
+# qgfix <dir> <fixture dir> <snapshot>: the snapshot's five disks (metadata and transform log sectors, 8 GiB) in
+# $WQ/<dir>, loop devices in QGL
+qgfix() { local n b l; qgdrop $1; mkdir -p $WQ/$1; QGL=""
+	for n in 0 1 2 3 4; do truncate -s 8G $WQ/$1/d$n.img
+		xz -dc $2/$3-sata$n-lba0-6000.img.xz | dd of=$WQ/$1/d$n.img conv=notrunc status=none
+		for b in $2/$3-sata$n-lba0x*.bin; do [ -e "$b" ] || continue; l=${b##*-lba}; l=${l%.bin}
+			dd if=$b of=$WQ/$1/d$n.img bs=512 seek=$((l)) conv=notrunc status=none; done
+		QGL="$QGL $(sudo losetup -f --show $WQ/$1/d$n.img)"; done; }
+qgids() { python3 $TOOLS/amdraid_dump.py --brief $1 2>/dev/null | sed -n 's/^  Array [0-9]* \([0-9a-f]*\) .*/\1/p'; }	# volume IDs
+# qgtlog <loop> <LBA>: the transform log - type, ProtectStart, status, IOSize, flags, ProtectSize, DynProtStripe (hex)
+qgtlog() { sudo dd if=$1 bs=512 skip=$(($2)) count=1 status=none | python3 -c '
+import sys, struct
+b = sys.stdin.buffer.read()
+print("%x %x %x %x %x %x %x" % (struct.unpack_from("<I", b, 0x18)[0], struct.unpack_from("<Q", b, 0x1c)[0], struct.unpack_from("<I", b, 0x44)[0], struct.unpack_from("<I", b, 0x2c)[0], struct.unpack_from("<I", b, 0x30)[0], struct.unpack_from("<I", b, 0x34)[0], struct.unpack_from("<I", b, 0x3c)[0]))'; }
+qgring() { python3 $TOOLS/amdraid_dump.py --brief --ring $1 2>/dev/null | grep -o 'seq [0-9]*' | cut -d' ' -f2; }	# packet numbers of the ring
+
+# --- stage 48: growing the capacity in place: mdadm --grow <volume> --size=<KiB>|max - as rcadm -T -s does it
+# (fixtures 2026-11-15-rcraid-migrations, q8m-e3dpost): the elements grow in place, the data stay where they are; a start
+# packet (two LDs: the volume NORMAL, 0x2024241, protect 0x4800, Flags 0x20010, Link 1; the new one, larger, the packet's
+# generation), the progress log (from the old capacity), "100 %", the log zeroed, the final packet. md resyncs the
+# grown part (from the old size), an interrupted growth goes on from the log. Refused: no room (another volume right
+# behind), smaller, RAID0, the container.
+if want 48; then
+cd "$MDADM_DIR"
+stopall
+qgmk q48 4 2
+$M -C /dev/md/amd48 -e amd -n 4 $QGL --run >/dev/null 2>&1; CN=$(cont1)
+$M -C /dev/md/a48 -e amd -l1 -n2 -z 256M $(qgl 0) $(qgl 1) --run >/dev/null 2>&1
+$M -C /dev/md/b48 -e amd -l1 -n2 -z 256M $(qgl 0) $(qgl 1) --run >/dev/null 2>&1
+$M -C /dev/md/z48 -e amd -l0 -n2 -z 64M $(qgl 2) $(qgl 3) --run >/dev/null 2>&1
+sleep 1; waitrec
+A=$(qgmd a48); B=$(qgmd b48); Z=$(qgmd z48)
+BID=$(python3 $TOOLS/amdraid_dump.py --brief $WQ/q48/d0.img 2>/dev/null | sed -n 's/^  Array 2 \([0-9a-f]*\) .*/\1/p')
+check "48: a RAID1 with the next volume right behind its members: refused, no room in place" "$M --grow /dev/$A --size=max 2>&1 | grep -q 'AMD makes a volume larger only, .*no more room where they are' && $M --grow /dev/$A --size=1G 2>&1 | grep -q '256 MiB a member at most: AMD grows the members in place'"
+check "48: smaller, RAID0, the container: refused" "$M --grow /dev/$B --size=128M 2>&1 | grep -q 'AMD makes a volume larger only' && $M --grow /dev/$Z --size=128M 2>&1 | grep -q 'not supported for RAID0' && refused $M --grow /dev/$CN --size=128M >/dev/null 2>&1"
+head -c 32M /dev/urandom > $WQ/q48/pat; sudo dd if=$WQ/q48/pat of=/dev/$B bs=1M oflag=direct status=none
+# a migration the volume is read-auto for: md takes the size of a writable array only (Grow.c)
+stopall; qgasm; B=$(qgmd b48)
+G0=$(qgring $WQ/q48/d0.img | tail -1)
+echo 3000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+OUT=$($M --grow /dev/$B --size=1200M 2>&1); sleep 3
+check "48: --size=1200M of the RAID1 behind it (read-auto): md 1200 MiB a member, resyncing from 256 MiB" "echo \"\$OUT\" | grep -q '256 -> 1200 MiB a member' && [ \$(cat /sys/block/$B/md/component_size) = $((1200 * 1024)) ] && [ \$(cat /sys/block/$B/md/sync_action) = resync ] && [ \$(cut -d' ' -f1 /sys/block/$B/md/sync_completed) -ge $((256 * 2048)) ]"
+S1=$(qgld $WQ/q48/d0.img $BID $((G0 + 1)))
+check "48: start packet (the next one): the RAID1 NORMAL 0x2024241, protect 0x4800, Flags 0x20010, Link 1; the one it becomes - TransformType 0, LastOperation NORMAL, 0x2024241, 1200 MiB, generation of the packet, extents grown in place (as rcadm -T -s, q8m-e3dpost)" "[ \$(echo \"\$S1\" | wc -l) = 2 ] && echo \"\$S1\" | head -1 | grep -q 'tt=5354 lo=5354 ts=0 cap=80000 ps=0 .* tf=2024241 psz=4800 fl=20010 lk=1 pct=0 at=1' && echo \"\$S1\" | tail -1 | grep -q \"tt=0 lo=5354 ts=0 cap=258000 ps=0 gen=$(printf %x $((G0 + 1))) fs=1x2 tf=2024241 psz=0 fl=0 lk=0 pct=0 at=1 e0=[0-9a-f]*:185000+25d000:18a000+258000:0 e1=[0-9a-f]*:185000+25d000:18a000+258000:0\""
+check "48: the log first: NORMAL, STARTED from the old capacity (its region), I/O 0x600, 12 to the region, on both members" "T=\$(qgtlog $(qgl 0) 0x185000); [ \"\$T\" = \"\$(qgtlog $(qgl 1) 0x185000)\" ] && echo \"\$T\" | grep -qE '^5354 [0-9a-f]+ 1 600 2024241 4800 c$' && [ \$((0x\$(echo \$T | cut -d' ' -f2))) -ge $((0x7e000)) ]"
+sleep 6; $M -S /dev/$B >/dev/null 2>&1; sleep 1
+T=$(qgtlog $(qgl 0) 0x185000); D=$((0x$(echo $T | cut -d' ' -f2)))
+check "48: stopped midway: the log is on, past the old capacity, at a region; -E says the migration" "[ \"\$T\" = \"\$(qgtlog $(qgl 1) 0x185000)\" ] && [ $D -gt $((0x7e000)) ] && [ $((D % 0x4800)) = 0 ] && $M -E $(qgl 0) | grep -q 'Migration : RAID10N 1 x 2, 256 MiB -> RAID10N 1 x 2, 1200 MiB; [0-9]*% done'"
+echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+$M -I /dev/$CN >/dev/null 2>&1; sleep 1; B=$(qgmd b48)
+check "48: assembled again: 1200 MiB a member, md resyncs from the log ($D)" "[ \$(cat /sys/block/$B/md/component_size) = $((1200 * 1024)) ] && [ \$(cut -d' ' -f1 /sys/block/$B/md/sync_completed) -ge $D ]"
+waitrec; sleep 3
+G1=$(qgring $WQ/q48/d0.img | tail -1)
+P100=$(qgld $WQ/q48/d0.img $BID $((G1 - 1))); PF=$(qgld $WQ/q48/d0.img $BID $G1)
+check "48: \"100 %\" packet (the RAID1 COMPLETED at 1200 MiB, 100000, Flags 0x84; the new one NORMAL STARTED as far), then the final one: one LD, 1200 MiB, LastOperation NORMAL COMPLETED, generation as made; log cleared on both" "echo \"\$P100\" | head -1 | grep -q 'tt=5354 lo=5354 ts=a1a6 cap=80000 ps=258000 .* psz=0 fl=84 lk=1 pct=186a0' && echo \"\$P100\" | tail -1 | grep -q 'tt=5354 lo=5354 ts=a1a1 cap=258000 ps=258000 .* pct=186a0' && [ \$(echo \"\$PF\" | wc -l) = 1 ] && echo \"\$PF\" | grep -q \"st=200 tt=0 lo=5354 ts=a1a6 cap=258000 ps=0 gen=$(printf %x $((G0 + 1))) fs=1x2 tf=0 psz=0 fl=0 lk=0 pct=0 at=1\" && [ \"\$(qgtlog $(qgl 0) 0x185000)\" = '0 0 0 0 0 0 0' ] && [ \"\$(qgtlog $(qgl 1) 0x185000)\" = '0 0 0 0 0 0 0' ]"
+echo check | sudo tee /sys/block/$B/md/sync_action >/dev/null; sleep 1; waitrec
+check "48: done: the data as written, md check 0" "cmp -s $WQ/q48/pat <(sudo dd if=/dev/$B bs=1M count=32 iflag=direct status=none) && [ \$(cat /sys/block/$B/md/mismatch_cnt) = 0 ]"
+stopall; qgasm; B=$(qgmd b48)
+check "48: assembled again: 1200 MiB, no resync" "[ \$(cat /sys/block/$B/size) = $((1200 * 2048)) ] && ! grep -A3 \"^$B \" /proc/mdstat | grep -qE 'resync|recovery'"
+# RAID5 of 3, RAID10 of 4: --size=max, to the end of the disks
+qgmk q48 4 2
+$M -C /dev/md/amd48 -e amd -n 4 $QGL --run >/dev/null 2>&1; CN=$(cont1)
+$M -C /dev/md/c48 -e amd -l5 -n3 -z 128M $(qgl 0) $(qgl 1) $(qgl 2) --run >/dev/null 2>&1; sleep 1; waitrec
+C5=$(qgmd c48); head -c 32M /dev/urandom > $WQ/q48/pat; sudo dd if=$WQ/q48/pat of=/dev/$C5 bs=1M oflag=direct status=none
+OUT=$($M --grow /dev/$C5 --size=max 2>&1); sleep 2; waitrec; sleep 3
+CID=$(qgids $WQ/q48/d0.img | head -1)
+check "48: RAID5 of 3 --size=max: 128 -> 1526 MiB a member (the disks' end), synced, one LD NORMAL, 3052 MiB, data as written" "echo \"\$OUT\" | grep -q '128 -> 1526 MiB a member' && [ \$(cat /sys/block/$C5/size) = $((3052 * 2048)) ] && qgld $WQ/q48/d0.img $CID | grep -q 'st=200 tt=0 lo=5354 ts=a1a6 cap=5f6000 .* fs=1x3 tf=0' && cmp -s $WQ/q48/pat <(sudo dd if=/dev/$C5 bs=1M count=32 iflag=direct status=none)"
+echo check | sudo tee /sys/block/$C5/md/sync_action >/dev/null; sleep 1; waitrec
+check "48: RAID5: md check 0" "[ \$(cat /sys/block/$C5/md/mismatch_cnt) = 0 ]"
+qgmk q48 4 2
+$M -C /dev/md/amd48 -e amd -n 4 $QGL --run >/dev/null 2>&1; CN=$(cont1)
+$M -C /dev/md/d48 -l10 -n4 -z 128M /dev/$CN --run >/dev/null 2>&1; sleep 1; waitrec
+R10=$(qgmd d48); head -c 32M /dev/urandom > $WQ/q48/pat; sudo dd if=$WQ/q48/pat of=/dev/$R10 bs=1M oflag=direct status=none
+OUT=$($M --grow /dev/$R10 --size=max 2>&1); sleep 2; waitrec; sleep 3
+DID=$(qgids $WQ/q48/d0.img | head -1)
+echo check | sudo tee /sys/block/$R10/md/sync_action >/dev/null; sleep 1; waitrec
+check "48: RAID10 2 x 2 --size=max: 1526 MiB a member, synced, one LD NORMAL, 3052 MiB, data as written, md check 0" "echo \"\$OUT\" | grep -q '128 -> 1526 MiB a member' && [ \$(cat /sys/block/$R10/size) = $((3052 * 2048)) ] && qgld $WQ/q48/d0.img $DID | grep -q 'st=200 tt=0 lo=5354 ts=a1a6 cap=5f6000 .* fs=2x2 tf=0' && cmp -s $WQ/q48/pat <(sudo dd if=/dev/$R10 bs=1M count=32 iflag=direct status=none) && [ \$(cat /sys/block/$R10/md/mismatch_cnt) = 0 ]"
+# the AMD driver's own growth, midway (q9g-b1mid: rcadm -T -r1 -s 2000 of a RAID1 of 1000 MiB the mdadm here made,
+# rcraid 9.3.3-00302, the log at 0x213000, 53 %): mdmon ends it, its final LD = the AMD driver's own end of it (q9g-b)
+Q9=$FIXT/2026-11-15-rcraid-grow
+qgfix q48 $Q9 q9g-b1mid
+xz -dc $Q9/q9g-b-sata0-lba0-6000.img.xz > $WQ/q48/rc.img
+check "48: q9g-b1mid (AMD's RAID1 growth midway): -E - raid1 read-write, the migration and its progress" "$M -E $(qgl 0) 2>/dev/null | grep -q 'md support : read-write' && $M -E $(qgl 0) 2>/dev/null | grep -q 'Migration : RAID10N 1 x 2, 1000 MiB -> RAID10N 1 x 2, 1907 MiB; 55% done'"
+echo 3000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+qgasm; R1=$(mdof raid1)
+check "48: q9g-b1mid assembled: 1907 MiB, md resyncs from the log's 0x213000" "[ -n '$R1' ] && [ \$(cat /sys/block/$R1/size) = $((0x3b9800)) ] && [ \$(cut -d' ' -f1 /sys/block/$R1/md/sync_completed) -ge $((0x213000)) ] && [ \$(cut -d' ' -f1 /sys/block/$R1/md/sync_completed) -lt $((0x213000 + 0x20000)) ]"
+echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+waitrec; sleep 3; stopall
+check "48: q9g-b1mid ended by mdmon: its LD = the one the AMD driver ends it with (q9g-b), the log cleared, the configuration on all five disks" "[ -n \"\$(qgld $WQ/q48/rc.img 4631ee854d76)\" ] && [ \"\$(qgld $WQ/q48/d0.img 4631ee854d76)\" = \"\$(qgld $WQ/q48/rc.img 4631ee854d76)\" ] && [ \"\$(qgtlog $(qgl 0) 0x100000)\" = '0 0 0 0 0 0 0' ] && [ \$(for n in 0 1 2 3 4; do python3 $TOOLS/amdraid_dump.py --brief $WQ/q48/d\$n.img 2>/dev/null | head -1 | grep -oE '[0-9]+$'; done | sort -u | wc -l) = 1 ]"
+qgdrop q48
+fi
+# --- end of stage 48 ---
+
+# --- stage 49: RAID0 -> RAID10: mdadm --grow <RAID0 of N> --level=10 - as rcadm -T -r10 does it (q8m-e3amid,
+# q8m-e3apost): md takes the RAID0 as a raid10 near-2 (slots 2i are its disks), mdmon puts spares of the container into
+# all slots 2i+1 at once (recorded in the target LD before md starts), md recovers them, the data on the old disks do
+# not move. Start packet: the RAID0 NORMAL, its elements 0x10000, 0x2022241, protect 0x8000; a RAID10 N x 2 (its
+# elements as [i][0], the spares as [i][1]); the log (IO 0x400, 0x20 to the region) on [0][0] and [0][1]. Interrupted -
+# goes on from the log; -I waits for the new disks too. A migration the AMD driver began (q8m-e3amid, 3 % of the log):
+# mdmon ends it.
+if want 49; then
+cd "$MDADM_DIR"
+stopall
+qgmk q49 4 2
+$M -C /dev/md/amd49 -e amd -n 2 $(qgl 0) $(qgl 1) --run >/dev/null 2>&1; CN=$(cont1)
+$M -C /dev/md/z49 -e amd -l0 -n2 -z 256M $(qgl 0) $(qgl 1) --run >/dev/null 2>&1
+$M -C /dev/md/k49 -e amd -l1 -n2 -z 32M $(qgl 0) $(qgl 1) --run >/dev/null 2>&1	# mdmon runs for it
+sleep 1; waitrec; Z=$(qgmd z49); K=$(qgmd k49)
+ZID=$(python3 $TOOLS/amdraid_dump.py --brief $WQ/q49/d0.img 2>/dev/null | sed -n 's/^  Array 1 \([0-9a-f]*\) .*/\1/p')
+$M /dev/$CN --add $(qgl 2) >/dev/null 2>&1; sleep 1
+check "49: one spare for a RAID0 of 2: refused, two needed" "$M --grow /dev/$Z --level=10 2>&1 | grep -q '2 AMD spares with 266 MiB free are needed' && [ \$(cat /sys/block/$Z/md/level) = raid0 ]"
+$M /dev/$CN --add $(qgl 3) >/dev/null 2>&1; sleep 1
+check "49: another layout, another number of disks, RAID1 to RAID10: refused" "$M --grow /dev/$Z --level=10 --layout=f2 2>&1 | grep -q 'RAID10 of 4, near 2' && $M --grow /dev/$Z --level=10 --raid-devices=6 2>&1 | grep -qE 'RAID10 of 4, near 2|Impossible number of devices|Need 4 spares' && $M --grow /dev/$K --level=10 2>&1 | grep -qE 'makes a RAID10 of a RAID0 only|RAID1 can only be converted|can only be changed' && [ \$(cat /sys/block/$Z/md/level) = raid0 ]"
+head -c 32M /dev/urandom > $WQ/q49/pat; sudo dd if=$WQ/q49/pat of=/dev/$Z bs=1M oflag=direct status=none
+G0=$(qgring $WQ/q49/d0.img | tail -1)
+echo 3000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+OUT=$($M --grow /dev/$Z --level=10 2>&1); sleep 4
+check "49: --grow --level=10: md raid10 near-2 of 4, the spares in slots 1 and 3 at 0x105000, recovering" "echo \"\$OUT\" | grep -q 'mdmon will mirror each member onto a spare' && [ \$(cat /sys/block/$Z/md/level) = raid10 ] && [ \$(cat /sys/block/$Z/md/layout) = 258 ] && [ \$(basename \$(readlink -f /sys/block/$Z/md/rd1/block)) = \$(basename $(qgl 2)) ] && [ \$(basename \$(readlink -f /sys/block/$Z/md/rd3/block)) = \$(basename $(qgl 3)) ] && [ \$(cat /sys/block/$Z/md/rd1/offset) = $((0x105000)) ] && [ \$(cat /sys/block/$Z/md/sync_action) = recover ]"
+S1=$(qgld $WQ/q49/d0.img $ZID $((G0 + 1)))
+check "49: start packet (the next one): the RAID0 NORMAL, its elements 0x10000, 0x2022241, protect 0x8000, Flags 0x20010, Link 1; the RAID10 2 x 2 - its elements as [i][0], the spares as [i][1], 0x2022241, a bitmap, generation of the packet (as rcadm -T -r10, q8m-e3amid)" "[ \$(echo \"\$S1\" | wc -l) = 2 ] && echo \"\$S1\" | head -1 | grep -qE 'tt=5354 lo=5354 ts=0 cap=100000 ps=0 .* fs=2x1 tf=2022241 psz=8000 fl=20010 lk=1 pct=0 at=0 e0=[0-9a-f]+:100000\\+85000:105000\\+80000:10000 e1=[0-9a-f]+:100000\\+85000:105000\\+80000:10000' && echo \"\$S1\" | tail -1 | grep -qE \"tt=0 lo=5354 ts=0 cap=100000 ps=0 gen=$(printf %x $((G0 + 1))) fs=2x2 tf=2022241 psz=0 fl=0 lk=0 pct=0 at=1( e[0-3]=[0-9a-f]+:100000\\\\+85000:105000\\\\+80000:0){4}\""
+check "49: the log on [0][0] and [0][1]: NORMAL STARTED, I/O 0x400, 0x20 to the 0x8000 region" "T=\$(qgtlog $(qgl 0) 0x100000); [ \"\$T\" = \"\$(qgtlog $(qgl 2) 0x100000)\" ] && echo \"\$T\" | grep -qE '^5354 [0-9a-f]+ 1 400 2022241 8000 20$'"
+sleep 6; $M -S /dev/$Z >/dev/null 2>&1; sleep 1
+T=$(qgtlog $(qgl 0) 0x100000); D=$((0x$(echo $T | cut -d' ' -f2)))
+check "49: stopped midway: the log on, at a region; -E: raid10, the new mirrors being copied onto" "[ \"\$T\" = \"\$(qgtlog $(qgl 2) 0x100000)\" ] && [ $D -gt 0 ] && [ $((D % 0x8000)) = 0 ] && $M -E $(qgl 0) | grep -A12 '^\[z49\]' | grep -q 'RAID Level : raid10' && [ \$($M -E $(qgl 0) | grep -A20 '^\[z49\]' | grep -c 'a new mirror: the migration copies onto it') = 2 ]"
+stopall
+for i in 0 1 2; do $M -I $(qgl $i) >/dev/null 2>&1; done; sleep 2
+check "49: -I without a new mirror's disk: the volume waits for it" "[ \$(grep -c 'active raid10' /proc/mdstat) = 0 ]"
+$M -I $(qgl 3) >/dev/null 2>&1; sleep 1; Z=$(mdof raid10)
+# 3 MB/s: from 0 a mirror would take seconds to get as far as the mark
+check "49: ... it comes: both new mirrors go on from the log ($D volume sectors = $((D / 2)) a member)" "[ \$(cat /sys/block/$Z/md/rd1/recovery_start) -ge $((D / 2)) ] && [ \$(cat /sys/block/$Z/md/rd3/recovery_start) -ge $((D / 2)) ]"
+echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+waitrec; sleep 3
+G1=$(qgring $WQ/q49/d0.img | tail -1)
+P100=$(qgld $WQ/q49/d0.img $ZID $((G1 - 1))); PF=$(qgld $WQ/q49/d0.img $ZID $G1)
+check "49: \"100 %\" packet, then the final one: one LD RAID10 2 x 2 NORMAL, LastOperation NORMAL COMPLETED, elements flags 0; log cleared on both" "echo \"\$P100\" | head -1 | grep -q 'tt=5354 lo=5354 ts=a1a6 cap=100000 ps=100000 .* fl=84 lk=1 pct=186a0' && echo \"\$P100\" | tail -1 | grep -q 'tt=5354 lo=5354 ts=a1a1 .* fs=2x2 .* pct=186a0' && [ \$(echo \"\$PF\" | wc -l) = 1 ] && echo \"\$PF\" | grep -qE 'st=200 tt=0 lo=5354 ts=a1a6 cap=100000 ps=0 gen=[0-9a-f]+ fs=2x2 tf=0 psz=0 fl=0 lk=0 pct=0 at=1( e[0-3]=[0-9a-f]+:100000\\+85000:105000\\+80000:0){4}' && [ \"\$(qgtlog $(qgl 0) 0x100000)\" = '0 0 0 0 0 0 0' ] && [ \"\$(qgtlog $(qgl 2) 0x100000)\" = '0 0 0 0 0 0 0' ]"
+echo check | sudo tee /sys/block/$Z/md/sync_action >/dev/null; sleep 1; waitrec
+check "49: done: [4/4], the data as written, md check 0" "grep -A1 \"^$Z \" /proc/mdstat | grep -q '\[UUUU\]' && cmp -s $WQ/q49/pat <(sudo dd if=/dev/$Z bs=1M count=32 iflag=direct status=none) && [ \$(cat /sys/block/$Z/md/mismatch_cnt) = 0 ]"
+stopall; qgasm; Z=$(qgmd z49)
+check "49: assembled again: raid10 [4/4], no recovery" "[ \$(cat /sys/block/$Z/md/level) = raid10 ] && grep -A1 \"^$Z \" /proc/mdstat | grep -q '\[UUUU\]' && ! grep -A3 \"^$Z \" /proc/mdstat | grep -qE 'resync|recovery'"
+qgdrop q49
+# the AMD driver's own RAID0 -> RAID10, midway (q8m-e3amid: rcraid 9.3.3-00302, the log at 0x20000): mdmon ends it
+qgfix q49 $FIXT/2026-11-15-rcraid-migrations q8m-e3amid
+check "49: q8m-e3amid (AMD's RAID0 -> RAID10 midway): -E - raid10 read-write, the migration and its progress" "$M -E $(qgl 0) 2>/dev/null | sed -n '/Volume ID : f3b0509c1022ccd7/,/Member/p' | grep -q 'RAID Level : raid10' && $M -E $(qgl 0) 2>/dev/null | sed -n '/Volume ID : f3b0509c1022ccd7/,/Member/p' | grep -q 'md support : read-write' && $M -E $(qgl 0) 2>/dev/null | grep -q 'Migration : RAID10N 2 x 1, 1908 MiB -> RAID10N 2 x 2, 1908 MiB; 3% done'"
+qgasm
+E3=$(for m in $(mdof raid10); do [ $(cat /sys/block/$m/size) = $((0x3ba000)) ] && echo $m; done)
+check "49: q8m-e3amid assembled: raid10 2 x 2, its new mirrors (SATA4, SATA3) from the log's 0x20000 (0x10000 a member)" "[ -n '$E3' ] && [ \$(basename \$(readlink -f /sys/block/$E3/md/rd1/block)) = \$(basename $(qgl 4)) ] && [ \$(basename \$(readlink -f /sys/block/$E3/md/rd3/block)) = \$(basename $(qgl 3)) ] && [ \$(cut -d' ' -f1 /sys/block/$E3/md/sync_completed) -ge $((0x10000)) ] 2>/dev/null"
+waitrec; sleep 3; stopall
+check "49: q8m-e3amid ended by mdmon: one LD RAID10 2 x 2 NORMAL, the AMD driver's elements, flags 0; log cleared on [0][0] and [0][1]" "qgld $WQ/q49/d0.img f3b0509c1022ccd7 | grep -qE '^type=1bf6 st=200 tt=0 lo=5354 ts=a1a6 cap=3ba000 ps=0 gen=1a fs=2x2 tf=0 psz=0 fl=0 lk=0 pct=0 at=1 e0=8f38:6a1000\\+1e2000:6a6000\\+1dd000:0 e1=d96f:100000\\+1e2000:105000\\+1dd000:0 e2=1aad:6a1000\\+1e2000:6a6000\\+1dd000:0 e3=3186:a5f800\\+1e2000:a64800\\+1dd000:0$' && [ \"\$(qgtlog $(qgl 0) 0x6a1000)\" = '0 0 0 0 0 0 0' ] && [ \"\$(qgtlog $(qgl 4) 0x100000)\" = '0 0 0 0 0 0 0' ]"
+qgdrop q49
+fi
+# --- end of stage 49 ---
+
+# --- stage 50: a rebuild target that lost the end of the rebuild - its write cache was gone at a power cut (the AMD
+# Windows driver 9.3.3.329 rebuilt a RAID10 onto SATA4; SATA4 kept the packet of the rebuild's middle, the others its
+# end). md rebuilds other volumes onto this disk, mdmon writes the live configuration to it, and the disk would be
+# up to date with it: a RAID10 the live configuration has it in service in would be assembled [4/4] without a
+# rebuild (and its mirrors differ). Now its element is offline before the write, md rebuilds it in place from 0; the
+# recorded rebuilds of other volumes onto it go on as they went (an element offline in another volume does not hold
+# them). Five loop devices of 1 GiB: RAID10 q50t (d0-d3), RAID1 q50m (d0, d1), RAID5 q50p (d0-d2), random data; d4 a
+# spare; d1 failed in all three: q50t rebuilt onto d4, the rebuilds of q50m and q50p onto d4 recorded (1 KiB/s, then
+# frozen), hardly begun. A snapshot; the control - as it is (d4 up to date: nothing offline, q50t [4/4] without a
+# rebuild); the forgery - d4's commit block on the packet of its ring where the rebuild of q50t is still recorded, the
+# data of d4's element of q50t zeroed (the whole rebuild lost). Assembled: -A of the container without d1, -I (the
+# volumes that have enough disks), until mdmon has written d4, then -IR.
+if want 50; then
+cd "$MDADM_DIR"
+stopall
+Q50=$WQ/q50
+q50drop() { stopall; for l in $(sudo losetup -a | grep "$Q50/" | cut -d: -f1); do sudo losetup -d $l; done; }
+q50att() { local n; Q50L=(); for n in 0 1 2 3 4; do Q50L[$n]=$(sudo losetup -f --show $Q50/$1/d$n.img); done; }
+q50md() { local p; for p in /dev/md/$1 /dev/md/${1}_0; do [ -e $p ] && { basename $(readlink -f $p); return; }; done; }
+q50vol() { $M -E $2 2>/dev/null | sed -n "/^\[$1\]:/,/^\[/p"; }
+q50gen() { $M -E $1 2>/dev/null | sed -n 's/^ *Generation : //p' | head -1; }
+q50sum() { sudo md5sum /dev/$(q50md $1) | cut -c1-32; }
+q50mm() { local m=$(q50md $1); echo check | sudo tee /sys/block/$m/md/sync_action >/dev/null; sleep 1
+	while ! grep -q idle /sys/block/$m/md/sync_action; do sleep 1; done; cat /sys/block/$m/md/mismatch_cnt; }
+# all three volumes in service (up to 90 rounds: the rebuilds go one at a time - the volumes share disks)
+q50whole() { local i; for i in $(seq 1 90); do waitrec 120 >/dev/null
+	[ "$(grep -A1 "^$(q50md q50t) " /proc/mdstat | grep -o '\[[0-9]/[0-9]\]')" = '[4/4]' ] &&
+	[ "$(grep -A1 "^$(q50md q50m) " /proc/mdstat | grep -o '\[[0-9]/[0-9]\]')" = '[2/2]' ] &&
+	[ "$(grep -A1 "^$(q50md q50p) " /proc/mdstat | grep -o '\[[0-9]/[0-9]\]')" = '[3/3]' ] && return 0; sleep 1; done; return 1; }
+# q50asm <dir>: -A of the container without d1, -I, wait until d4 has the live configuration (d0's generation), -IR
+q50asm() { local i; q50att $1; sudo dmesg -C
+	$M -A /dev/md/q50c -e amd ${Q50L[0]} ${Q50L[2]} ${Q50L[3]} ${Q50L[4]} >/dev/null 2>&1
+	$M -I /dev/md/q50c >/dev/null 2>&1
+	for i in $(seq 1 40); do [ "$(q50gen ${Q50L[4]})" = "$(q50gen ${Q50L[0]})" ] && break; sleep 0.5; done; sleep 1
+	Q50OFF=$(q50vol q50t ${Q50L[0]} | grep -c "Member *[0-9]* : $Q50ID4 .*(out of service: offline)")
+	$M -IR /dev/md/q50c >/dev/null 2>&1; sleep 2; q50whole; sleep 3; }
+q50drop; rm -rf $Q50; mkdir -p $Q50/s
+for n in 0 1 2 3 4; do truncate -s 1G $Q50/s/d$n.img; done
+q50att s
+$M -C /dev/md/q50c -e amd -n4 ${Q50L[@]:0:4} --run >/dev/null 2>&1
+$M -C /dev/md/q50t -e amd -l10 -n4 -z 64M ${Q50L[@]:0:4} --run --assume-clean >/dev/null 2>&1
+$M -C /dev/md/q50m -e amd -l1 -n2 -z 128M ${Q50L[0]} ${Q50L[1]} --run --assume-clean >/dev/null 2>&1
+$M -C /dev/md/q50p -e amd -l5 -n3 -z 64M ${Q50L[@]:0:3} --run --assume-clean >/dev/null 2>&1; sleep 2
+for v in q50t q50m q50p; do m=$(q50md $v)
+	sudo dd if=/dev/urandom of=/dev/$m bs=1M count=$(( $(sudo blockdev --getsize64 /dev/$m) / 1048576 )) oflag=direct status=none; done
+Q50T=$(q50sum q50t); Q50M=$(q50sum q50m); Q50P=$(q50sum q50p)
+$M /dev/$(cont1) --add ${Q50L[4]} >/dev/null 2>&1; sleep 2
+# d1 fails in all three, d4 is taken for each (the rebuilds recorded); q50m and q50p at 1 KiB/s, then frozen once
+# recorded, so that q50t (they share disks: one recovery at a time) gets to run and end (an array frozen before
+# takes no spare: managemon)
+for v in q50m q50p; do for f in sync_speed_min sync_speed_max; do echo 1 | sudo tee /sys/block/$(q50md $v)/md/$f >/dev/null; done; done
+for v in q50t q50m q50p; do $M /dev/$(q50md $v) --fail ${Q50L[1]} >/dev/null 2>&1; done
+Q50ID4=$($M -E ${Q50L[4]} 2>/dev/null | sed -n 's/^ *Device ID : //p' | head -1)
+for i in $(seq 1 60); do q50vol q50m ${Q50L[0]} | grep -q 'Transform : 0x5358,' && q50vol q50p ${Q50L[0]} | grep -q 'Transform : 0x5358,' && break; sleep 1; done
+for v in q50m q50p; do echo frozen | sudo tee /sys/block/$(q50md $v)/md/sync_action >/dev/null; done
+q50setup() { q50vol q50t ${Q50L[0]} | grep -q "Member *[0-9]* : $Q50ID4 handle [0-9]* offset [0-9]* size [0-9]*\$" &&
+	q50vol q50t ${Q50L[0]} | grep -q 'Transform : 0x0,' && q50vol q50m ${Q50L[0]} | grep -q 'Transform : 0x5358,' &&
+	q50vol q50p ${Q50L[0]} | grep -q 'Transform : 0x5358,'; }
+for i in $(seq 1 60); do q50setup && break; sleep 1; done
+check "50: set-up: q50t rebuilt onto d4 ($Q50ID4, in service), the rebuilds of q50m and q50p onto d4 recorded, hardly begun" q50setup
+# the data of d4's element of q50t (user data, sectors) and the LD ID of q50t, as the live packet has them
+read Q50DATA Q50SIZE <<< "$(q50vol q50t ${Q50L[0]} | sed -n "s/.* Member *[0-9]* : $Q50ID4 handle [0-9]* offset \([0-9]*\) size \([0-9]*\).*/\1 \2/p")"
+Q50DATA=${Q50DATA:-0}; Q50SIZE=${Q50SIZE:-0}
+Q50TID=$(printf %x 0x$(q50vol q50t ${Q50L[0]} | sed -n 's/^ *Volume ID : //p'))
+stopall; q50drop
+for c in ctl forge; do mkdir $Q50/$c; cp --reflink=auto $Q50/s/*.img $Q50/$c/; done
+
+q50asm ctl
+check "50: control (d4 up to date): nothing recorded offline, q50t [4/4] without a recovery, q50m and q50p rebuilt onto d4" "[ $Q50OFF = 0 ] && ! sudo dmesg | grep -q 'missed configurations' && ! sudo dmesg | grep -q 'recover of RAID array $(q50md q50t)\$' && q50whole"
+check "50: ... the data as written, md check 0 (q50t, q50m, q50p)" "[ \$(q50sum q50t) = $Q50T ] && [ \$(q50sum q50m) = $Q50M ] && [ \$(q50sum q50p) = $Q50P ] && [ \$(q50mm q50t) = 0 ] && [ \$(q50mm q50m) = 0 ] && [ \$(q50mm q50p) = 0 ]"
+q50drop
+
+# the forgery: d4's commit block on the newest packet of its ring where the rebuild of q50t is recorded (two
+# records of its LD), as a disk that lost what it wrote since; the user data of its element of q50t zeroed
+Q50SEQ=$(python3 - $Q50/forge/d4.img $Q50TID <<'PY'
+import os, struct, sys
+sys.path.insert(0, os.environ["TOOLS"])
+import amdraid_dump as ad
+img, ldid = sys.argv[1], int(sys.argv[2], 16)
+dk = ad.Disk(img)
+rc = ad.parse_raidcore(dk.read(ad.LBA_RAIDCORE))
+c = bytearray(dk.read(rc["commit_lba"]))
+for lba, h in reversed(ad.scan_ring(dk)):
+    _, _, lds = ad.parse_gen(ad.read_gen(dk, lba, h["length"]))
+    if sum(ld["ld_id"] == ldid for ld in lds) == 2:
+        break
+else:
+    sys.exit(1)
+struct.pack_into("<IIQQ", c, 8, lba, h["length"], h["sum"], h["config_seq"] + 1)
+struct.pack_into("<Q", c, 0, ad.rc_sum(bytes(c), 8, 0x1F8))
+with open(img, "r+b") as f:
+    f.seek(rc["commit_lba"] * 512)
+    f.write(c)
+print(h["config_seq"])
+PY
+)
+[ $Q50SIZE != 0 ] && fallocate -p -o $((Q50DATA * 512)) -l $((Q50SIZE * 512)) $Q50/forge/d4.img
+# 10 MB/s: the rebuild in place of q50t lasts some seconds, mdmon records it (one md ends before the monitor's
+# next pass is not recorded at all - it need not be)
+echo 10000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+q50asm forge
+echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+check "50: forged (d4 back with packet $Q50SEQ, its rebuild of q50t lost): as d4 takes the live configuration, its member of q50t is recorded offline (-E), mdmon says so once" "[ -n '$Q50SEQ' ] && [ $Q50SIZE != 0 ] && [ $Q50OFF = 1 ] && [ \$(sudo dmesg | grep -c 'amd: subarray-[0-9]*: member [0-9]* (disk [0-9:]*) missed configurations, recorded as offline') = 1 ]"
+check "50: ... q50t rebuilt onto d4 in place, from 0: [4/4], the data as written, md check 0" "sudo dmesg | grep -q 'recover of RAID array $(q50md q50t)\$' && [ \$(q50sum q50t) = $Q50T ] && [ \$(q50mm q50t) = 0 ]"
+check "50: ... q50m and q50p rebuilt onto d4 as recorded (its member of q50t offline does not hold them), the data as written, md check 0" "q50whole && [ \$(q50sum q50m) = $Q50M ] && [ \$(q50sum q50p) = $Q50P ] && [ \$(q50mm q50m) = 0 ] && [ \$(q50mm q50p) = 0 ]"
+stopall
+D4S=$(echo $Q50ID4 | tail -c 5)
+check "50: ... in the configuration as AMD records a rebuild: q50t CRITICAL with d4 offline (0x30), then RESTORE_SEGMENTS (two LD records), then NORMAL; every disk on one generation" "python3 $TOOLS/amdraid_dump.py --brief --ring $Q50/forge/d0.img 2>/dev/null | awk -v t=' $Q50TID ' -v d='$D4S' 'index(\$0, \"Array \") && index(\$0, t) { if (s == 0 && index(\$0, \"CRITICAL\") && index(\$0, d \"/f30\")) s = 1; else if (s == 1 && index(\$0, \" x2 \")) s = 2; else if (s == 2 && index(\$0, \"NORMAL\")) s = 3 } END { exit s != 3 }' && [ \"\$(q50gen ${Q50L[4]})\" = \"\$(q50gen ${Q50L[0]})\" ] && [ \"\$(q50gen ${Q50L[2]})\" = \"\$(q50gen ${Q50L[0]})\" ] && q50vol q50t ${Q50L[0]} | grep -q 'State : 0x200 (normal)'"
+q50drop; rm -rf $Q50
+fi
+# --- end of stage 50 ---
+
 # the ASRock and X399 snapshots are untouched: attached before stage 7, assembled only in stage 1
 if want 1; then
 # reg <image> <fixture> <LBA>: the image has the fixture (xz or raw) at that LBA

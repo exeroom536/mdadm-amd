@@ -1,7 +1,7 @@
-From 2c759df851a239412b06f440e50dd11e4a2b1cb0 Mon Sep 17 00:00:00 2001
+From 3c85dd37d1b31ecf00f2df27241bad2e5293f0fc Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Sat, 14 Nov 2026 01:33:55 +0500
-Subject: [PATCH 10/33] sysfs: set up linear arrays from external metadata
+Date: Sun, 15 Nov 2026 11:17:32 +0500
+Subject: [PATCH 10/35] sysfs: set up linear arrays from external metadata
 
 sysfs_set_array() returns early for every level below 0, so for a linear
 member array of an external container (DDF CONCAT, AMD Volume) neither

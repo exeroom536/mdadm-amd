@@ -75,7 +75,9 @@ sudo mkdir -p $UR
 sed -n '1,/SYMLINK+="md\/$env{MD_DEVNAME}"/p' "$MDADM_DIR/udev-md-raid-arrays.rules" |
 	sed "s,BINDIR/mdadm,$MDADM_DIR/mdadm," | { cat; echo 'LABEL="md_end"'; } | sudo tee $UR/63-md-raid-arrays.rules >/dev/null
 echo '# masked by the mdadm-amd test suite (tests/run.sh) while it runs' | sudo tee $UR/64-md-raid-assembly.rules >/dev/null
-trap 'sudo rm -f $UR/63-md-raid-arrays.rules $UR/64-md-raid-assembly.rules; sudo udevadm control --reload' EXIT
+# the suite's work area ($WQ, a btrfs image on a loop device) is mounted again by the next run
+trap 'sudo rm -f $UR/63-md-raid-arrays.rules $UR/64-md-raid-assembly.rules; sudo udevadm control --reload
+	mountpoint -q $WQ && sudo umount $WQ' EXIT
 sudo udevadm control --reload
 echo "mdadm: $MDADM_DIR ($(cd "$MDADM_DIR" && md5sum mdadm mdmon | cut -c1-12 | tr '\n' ' '))"
 echo "kernel $(uname -r); work dir $WK; STAGES='$STAGES' PART='$PART'"

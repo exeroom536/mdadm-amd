@@ -1,7 +1,7 @@
-From 797fc724fee584aed7fa55e8c38ed4a6f7ebd3ab Mon Sep 17 00:00:00 2001
+From 2ea3a9117b8b7376466c1ab47022fba8fd846f75 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Sat, 14 Nov 2026 01:34:07 +0500
-Subject: [PATCH 13/33] mdadm: tell metadata handlers about --quiet for --add
+Date: Sun, 15 Nov 2026 11:17:41 +0500
+Subject: [PATCH 13/35] mdadm: tell metadata handlers about --quiet for --add
  and --remove
 
 A metadata handler may print notices of its own when a disk is added or
