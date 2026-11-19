@@ -3,6 +3,7 @@
 What we found in RAIDCoreDxe, the UEFI driver of AMD RAID, as shipped in the MSI MPG X870E EDGE TI WIFI BIOS
 1.A93 (RAIDCoreDxe 9.3.3-00277). Function addresses are offsets in that module, from our disassembly, done for
 interoperability only. "Emulation" means QEMU with the board's real RAIDCoreDxe on emulated AMD controllers.
+How AMD's drivers, firmware and menu otherwise differ from md: [amd-drivers.md](amd-drivers.md).
 
 ## 1. The NVMe pass-through disk gets a second record and stops booting
 

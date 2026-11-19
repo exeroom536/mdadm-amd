@@ -3,7 +3,8 @@
 **Массивы AMD RAIDXpert2 в Linux через штатный md ядра — без блоба `rcraid`.**
 
 [English](README.md) · [Установка](docs/install.md) · [Работа с массивами](docs/usage.md) ·
-[Проверки](docs/testing.md) · [Формат](docs/format.md)
+[Проверки](docs/testing.md) · [Формат](docs/format.md) ·
+[Драйверы AMD](docs/amd-drivers.md)
 
 AMD RAIDXpert2 («RAIDCore») — RAID, встроенный в чипсеты AMD (X399, X570, X670, X870…). Массивы создаются в меню
 BIOS или драйвером для Windows, метаданные на дисках не документированы; для Linux у AMD есть только `rcraid` —

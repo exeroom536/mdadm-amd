@@ -97,6 +97,7 @@ More — spares, RAIDABLE, the md bitmap, failed disks, booting — in [docs/usa
 | [Tests](tests/README.md) | the test suite (791 checks on loop devices) and how to run it |
 | [Format](docs/format.md) | the on-disk format, with a source for each statement (in Russian) |
 | [Firmware bugs](docs/firmware-bugs.md) | known problems of the AMD RAID firmware |
+| [AMD drivers](docs/amd-drivers.md) | how AMD's drivers, firmware and menu behave differently from md, and what mdadm does about it |
 | [Benchmark](docs/benchmark.md) | md against AMD's own Linux and Windows drivers on the same volumes |
 
 ## Roadmap

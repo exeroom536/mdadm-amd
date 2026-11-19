@@ -184,6 +184,8 @@ Sources:
 - **rcraid.sys / rcbottom.sys** — AMD's Windows driver 9.3.3.218, disassembled; functions are given by address.
 - **Runs** — fio under md and under AMD's Linux driver, DiskSpd under an installed Windows 10 LTSC 1809 (not WinPE)
   on the SSD RAID0; 20–30 s per job, the regions of the tables above.
+- **Counts** — every call of the core's SATA command function under AMD's Linux driver, on new volumes of the same
+  disks (19.11.2026); see [Counting the core's commands](#counting-the-cores-commands).
 
 ## One sequential stream on a RAID1
 
@@ -204,10 +206,15 @@ Sources:
   core `RC_GenericIoGenChild`). The 64 KiB pieces are not what the cache costs.
 - On an SSD array the core does not use the cache for random reads or short streams (`RC_SetCacheStrategy`), which is
   why "Read Cache" barely changes the SSD figures.
-- On the HDD RAID1 the cache costs about 20 % of a stream: 171 MB/s with it, 220 without, measured again under AMD's
-  Linux driver. Why was not traced: kprobe events (tracefs, bpftrace, perf) refuse a function without an ftrace
-  call site (Linux `kernel/trace/trace_kprobe.c`, `__within_notrace_func()`), and AMD's binary core is built without
-  one.
+- On the HDD RAID1 the cache costs about 20 % of a stream: 171 MB/s with it, 207–220 without, measured again under
+  AMD's Linux driver.
+- **It does not read more than it returns, and it does not unbalance the mirrors.** During one sequential stream on
+  the HDD RAID1 with the cache on, the disks gave as many bytes as fio got (52 461 commands of 64 KiB, 3.28 GiB,
+  against 3 275 MiB), half from each mirror. The loss is time: the mean latency at QD8 was 49 ms with the cache
+  and 40.5 ms without.
+- **With the cache on, a random 4 KiB read on the HDD array reads 16 KiB** from the disk: all 5 779 commands at QD32
+  were 16 KiB, against 4 KiB with the cache off. On HDDs this costs little (287 against 303 IOPS). On the SSD RAID0
+  random reads stay at 4 KiB, as `RC_SetCacheStrategy` has it.
 
 ## AMD's Linux driver: random reads and SSD sequential reads
 
@@ -229,9 +236,14 @@ Only AMD's Linux driver is lower here; the Windows driver runs the same core and
   The gap is largest at QD1 and at QD32 and small in between: the fixed cost per request at QD1, the one busy CPU at
   QD32.
 - The AMD core also drives the SATA ports itself and takes the NCQ slots strictly in turn (`ahciSataRequest`); the
-  Windows driver leaves the ports to `rcbottom.sys`, which takes any free slot. Whether that costs anything could not
-  be measured (no kprobe events in the binary core, see above), and the depth sweep does not point to it: a slot rule would cost more the
-  deeper the queue.
+  Windows driver leaves the ports to `rcbottom.sys`, which takes any free slot. **At depth the core often fails to
+  issue a command and tries again.** On the SSD RAID0 at QD32, `ahciSataRequest` returned "not issued" 594 034 times
+  for 1 285 960 commands issued (0.46 per command) on random 4 KiB reads, and 0.74 per command on sequential 1 MiB
+  reads; at QD1 it never did. Each retry is another pass through the core, on the one busy CPU and under the one lock
+  above, so it adds to the cost where the gap is widest. The count does not tell how much of the gap it is, nor why
+  a slot is refused.
+- No command to a disk is larger than 64 KiB: 1 MiB reads reached the SSDs as 64 KiB commands (524 805 of 537 239;
+  the rest 4 and 32 KiB), which is the 64 KiB cutting above, measured.
 - On the HDDs the difference is small: 310 IOPS at QD32 against 348 under md.
 
 ## Windows
@@ -262,3 +274,31 @@ installed Windows 10 LTSC with the same driver:
 
 The three stacks are 2–10 % apart at QD1 on the HDDs (94–112 IOPS). The drivers' own costs are tens of microseconds
 against about 10 ms per request, so this is not explained.
+
+## Counting the core's commands
+
+kprobe events (tracefs, bpftrace, perf) refuse a function without an ftrace call site (Linux
+`kernel/trace/trace_kprobe.c`, `__within_notrace_func()`), and AMD's binary core is built without one. So a small
+kernel module of ours registers a kretprobe on `ahciSataRequest` itself and counts, per fio job: the calls, the
+returns of 0 (the command was not issued), the command length and the SATA port, read from the request at the
+offsets of the core's own debug information.
+
+- AMD's Linux driver 9.3.3-00302 without NVMe, Linux 7.3.5; fio for 20 s per job, no ramp.
+- Volumes made by this mdadm for the run: a RAID0 of the two SSDs (2 × 8 GiB, 64 KiB stripe) and a RAID1 of two
+  HDDs (40 GiB), both filled with random data first.
+- Lengths and ports are counted on every call, issued or not, so the per-port figures are shares of calls, not bytes.
+- Other virtual machines were running on the machine meanwhile, so the absolute speeds are a little lower than in
+  the tables above; the counts do not depend on it.
+
+| Job | fio | Calls | Not issued | Issued | Not issued per issued | Command sizes |
+|---|---|---:|---:|---:|---:|---|
+| SSD RAID0, rand read 4K QD32 | 64 295 IOPS | 1 879 994 | 594 034 | 1 285 960 | 0.46 | 4 KiB |
+| SSD RAID0, seq read 1M QD8 | 994 MB/s | 537 239 | 228 843 | 308 396 | 0.74 | 64 KiB (some 4 and 32) |
+| SSD RAID0, rand read 4K QD1 | 5 063 IOPS | 100 947 | 0 | 100 947 | 0 | 4 KiB |
+| HDD RAID1, rand read 4K QD32, Read Cache on | 287 IOPS | 8 555 | 2 776 | 5 779 | 0.48 | 16 KiB |
+| HDD RAID1, rand read 4K QD32, Read Cache off | 303 IOPS | 9 020 | 2 922 | 6 098 | 0.48 | 4 KiB |
+| HDD RAID1, seq read 1M QD8, Read Cache on | 171 MB/s | 97 960 | 45 499 | 52 461 | 0.87 | 64 KiB |
+| HDD RAID1, seq read 1M QD8, Read Cache off | 207 MB/s | 112 426 | 48 106 | 64 320 | 0.75 | 64 KiB (some 16 and 32) |
+
+Calls per mirror on the HDD RAID1 stream: 48 914 and 49 046 with the cache on, 51 657 and 60 769 with it off. On the
+SSD RAID0 the two disks took half each in every job.
