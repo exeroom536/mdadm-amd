@@ -85,6 +85,30 @@ started. No SELinux denials. The tree the script lays out is the same, file for 
   clean; a 2 GiB file Windows wrote had the same SHA-256 under Linux and again under Windows.
 - AMD's Windows driver (9.3.3, from WinPE) and Linux driver (rcraid 9.3.3-00302) read and wrote a RAID0 made and a
   RAID1 grown by this mdadm. Speed against them on the same volumes: [benchmark.md](benchmark.md).
+- 1.4: `--detail-platform` lists the board's controllers and disks. A RAID1 of two HDDs grown in place by this
+  mdadm, 50 to 100 GiB: the BIOS menu shows it Normal at the new size, and the installed Windows (driver
+  9.3.3.218) sees a 100 GiB disk and reads the same data. Grown again to 200 GiB and stopped at 62 %, then
+  Windows booted: the Windows driver finished the migration from that mark; Linux then assembled the volume
+  without a resync, `md` check clean, the data the same.
+- 1.5, on two HDDs and two SATA SSDs, volumes of 4 to 8 GiB per disk with random data at their start and end: the
+  stripe size of a RAID5 of 3 disks 64 → 128 KiB and of a RAID10 of 4 disks 64 → 256 KiB; a RAID5 of 3 → 4 disks
+  (a dedicated spare on a disk of the container); a RAID1 of two SSDs → a RAID5 of 3; a RAID0 of 2 → 3 disks (a
+  global spare). Each time `md` check clean and the data the same; the BIOS menu shows the volume Normal at its
+  new stripe size, size or level, and Windows (driver 9.3.3.218) reads the same data. A RAID5 stripe size change,
+  a RAID5 of 3 → 4 and a RAID0 of 2 → 3, each stopped about halfway by this mdadm: the BIOS menu shows
+  "Transform", Windows reads the volume right and finishes the migration; Linux then finds it Normal, the data the
+  same. A RAID5 stripe size change and a RAID0 of 2 → 3 stopped before md moved anything went on from the start at
+  the next assembly. A disk one configuration behind, which md kept in sync, got the current one from `mdmon`
+  within seconds, and the next migration of its volume went through. The reshape runs under systemd
+  (`mdadm-grow-continue@`) on this distribution.
+- 1.5 fixes, kernel 7.3.5: an SSD failed in md in a RAID5 (HDD + two SSDs) that shares it with a RAID0 (two SSDs
+  + HDD): `mdmon` failed it in the RAID5 alone; the RAID0 stayed Normal with it and the disk online, also after
+  the container was stopped and assembled again. The BIOS menu shows the RAID5 Critical with all three disks
+  online and the RAID0 Normal; Windows (driver 9.3.3.218, booted from its RAID1 volume) reads the same data from
+  both and leaves the RAID5 as it was. The RAID5 then rebuilt onto a dedicated spare (an HDD of the container):
+  Normal, `md` check clean, the data the same. Linux booted twice from its RAID1 volume with this release (kernel
+  7.3.1): `mdmon` took over from the initramfs, no resync, shutdown without waiting for `mdmon`, `md` check of the
+  Linux and the Windows volume clean.
 
 ## Emulation
 
@@ -122,6 +146,13 @@ The board's RAIDCoreDxe in QEMU with emulated AMD SATA and NVMe controllers:
   crash it starts its check of the mirrors, which leaves them unchecked past the start of the volume; `mdmon`
   resyncs such volumes at the next assembly. 1.4, with 9.3.3.329 and 9.3.3.218: a rebuild target that lost the
   end of its rebuild, rebuilt again by `mdmon`: Windows boots after Linux, its volumes normal, the data the same.
+- **Windows drivers** 9.3.3.329 and 9.5 (in a VM) and the 1.5 migrations of this mdadm: a RAID5 of 3 → 4, a
+  RAID1 of two → a RAID5 of 3, a RAID0 of 2 → 3, the stripe size of a RAID5 and of a RAID10. Finished, the
+  volume is normal in Windows at its new size, level and stripe size, with the same data; stopped about halfway,
+  Windows reads it right and finishes the migration, and Linux then assembles it without a resync, `md` check
+  clean, the data the same. Reading a RAID10 while Windows finished its stripe size change stalled the volume
+  with 9.3.3.218, 9.3.3.329 and 9.5 alike (disks slowed down in the VM); after a hard power-off, mdadm went on
+  from the mark Windows had written and finished, the data the same.
 - **Linux driver** rcraid (9.3.3-00302 and 9.3.2): takes the arrays made by this mdadm with the data intact; on a
   member failing, missing at start and coming back, it and `mdmon` pick the same spares and placements. A RAIDABLE →
   RAID1 migration started by one and interrupted is finished by the other. Interrupted rebuilds and
@@ -129,6 +160,13 @@ The board's RAIDCoreDxe in QEMU with emulated AMD SATA and NVMe controllers:
   RAID10) or made a RAID10 from a RAID0 are normal under it with the data intact; such a migration stopped midway
   goes on under the other, both ways; for the same RAID1 `rcadm -T` writes the records `mdmon` writes. Volumes its
   migrations gave more disks (RAID0, RAID5, RAID1 → RAID5) are assembled by this mdadm and read the same data.
+  1.5: the same migrations made by this mdadm (more disks for a RAID0 or RAID5, RAID1 → RAID5) and its stripe size
+  changes (RAID5, RAID10) write the records `rcadm -T` writes; stopped midway or before the first region, they are
+  finished by the driver, and the driver's own ones in the middle by `mdmon`, the data the same both ways; the
+  driver takes a stripe size change, which its tools do not offer, through to the end too. Two migrations the
+  driver left in one container are finished by mdadm one after the other. A volume the driver recorded offline,
+  whose disks went away together and came back, is taken back by mdadm without a rebuild and is normal under the
+  driver again.
 
 ## Metadata only
 
@@ -137,13 +175,14 @@ An ASRock X670E RAID0 of two NVMe drives (our dump) and an ASUS X399 RAID10 (pub
 ## Test suites
 
 - The test suite in [tests/](../tests/README.md), on loop devices with metadata of real disks and of the emulated
-  board: 639 checks, all pass on a VM with the emulated AMD controllers (1.4; 586 for 1.3, 573 for 1.2, 545 for
+  board: 791 checks, all pass on a VM with the emulated AMD controllers (1.5; 639 for 1.4, 586 for 1.3, 573 for 1.2, 545 for
   1.1; for 1.0: 530 checks, 504 of them also on a plain VM without the controllers).
 - The same suite with mdadm and mdmon built with AddressSanitizer and UBSan: no reports. A fuzzer on the metadata
   parser: no crashes. (Both for 1.0.)
-- The upstream mdadm test suite: no regressions (1.1: 67 pass, 0 fail, 1 skipped, the same as upstream `5542bf40`
-  alone). The upstream CI build matrix; no new compiler warnings on the distributions above and on i686, s390x,
-  powerpc and musl (for 1.0; for 1.1 each patch of the series builds with gcc and clang without new warnings).
+- The upstream mdadm test suite: no regressions (1.5 and 1.1: 67 pass, 0 fail, 1 skipped, the same as upstream
+  `5542bf40` alone). The upstream CI build matrix; no new compiler warnings on the distributions above and on i686, s390x,
+  powerpc and musl (for 1.0; for 1.1 to 1.5 each patch of the series builds with gcc and clang without new
+  warnings).
 
 ## Not tested
 
@@ -152,12 +191,21 @@ started degraded); the md bitmap with the AMD drivers on real hardware; the
 controller check refusing a disk on real hardware; distributions other than the test machine's on real hardware;
 GRUB with shim; root file systems other than ext4 on a volume; booting from a volume on Manjaro, EndeavourOS, Linux
 Mint and the distributions checked by build only; RHEL itself; the md bitmap module under Secure Boot (with the
-DKMS key enrolled) and its rebuild by DKMS on a kernel update outside Arch; growing a volume in place and
-RAID0 → RAID10 with the Windows driver and the BIOS menu; other boards and BIOS versions.
+DKMS key enrolled) and its rebuild by DKMS on a kernel update outside Arch; growing a RAID5 or RAID10 in place and
+RAID0 → RAID10 on real hardware, with the Windows driver or the BIOS menu (a RAID1 was, see Hardware); a RAID1 →
+RAID5 or a RAID10 stripe size change stopped midway and finished by Windows, and migrations with the Windows
+driver 9.5 or 9.3.3.329, on real hardware (in a VM they were); reading a RAID10 on real disks while Windows
+finishes its stripe size change; two migrations left in one container, and a volume the AMD driver recorded offline taken back,
+on real hardware; a migration of the volume that holds the root file system (going on from the initramfs);
+a disk that does not take the transform log (a write error on that sector; in emulation and with the Windows
+drivers in a VM it was), and a disk that goes away or fails in every volume it serves with this release, on real
+hardware (it needs a disk unplugged; SATA hot plug was tried with an earlier release, see Hardware);
+other boards and BIOS versions.
 
 ## Not supported
 
-`--grow` other than RAIDABLE → RAID1, growing a RAID1, RAID5 or RAID10 in place and RAID0 → RAID10; AMD
-migrations that add disks to a volume (a volume in the middle of one is not assembled; after it, it is); RAID6, RAID50 and distributed spares (no AMD platform we know of enables them; such volumes are not
+`--grow` other than RAIDABLE → RAID1, growing a RAID1, RAID5 or RAID10 in place, RAID0 → RAID10, more disks for a
+RAID0 or RAID5, RAID1 → RAID5 and the stripe size of a RAID5 or RAID10; a second such migration of a volume whose
+data a migration already moved (refused: AMD needs its log of the data for it); RAID6, RAID50 and distributed spares (no AMD platform we know of enables them; such volumes are not
 assembled); 4Kn disks (AMD has no format for them); creating a volume with `missing` disks (refused, as for IMSM);
 a second AMD RAID disk set in one system (all RAID disks of a system share one configuration).

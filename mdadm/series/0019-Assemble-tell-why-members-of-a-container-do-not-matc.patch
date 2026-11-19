@@ -1,0 +1,89 @@
+From 23217ef9eadba445a7b4cd2c82985173e2624d60 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:52:50 +0500
+Subject: [PATCH 19/48] Assemble: tell why members of a container do not match
+ only if none does
+
+Assembling an array of a container by --uuid or --name with the
+container given (mdadm -A /dev/md/vol --uuid=<uuid of vol> /dev/md/imsm0,
+or any scan with -v), select_devices() looks for the array among the
+members of the container, and ident_matches() prints "has wrong uuid"
+(or "has wrong name") for each member it passes over before the one
+asked for:
+
+  mdadm: /dev/md/imsm0 has wrong uuid.
+  mdadm: /dev/md/vol has been assembled with 2 devices and started.
+
+The container is the right one; only the other arrays in it are not
+the array asked for.  IMSM lists the arrays of a container last one
+first, so assembling its first array prints it; any format with
+several arrays in a container does the same.
+
+Keep ident_matches() quiet while looking among the members, and if no
+member matches, tell for each member why, as before.  A member that
+matches but is busy or blocked still says so, and the other members
+then stay quiet: the reason is already given.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Assemble.c | 27 ++++++++++++++++++++-------
+ 1 file changed, 20 insertions(+), 7 deletions(-)
+
+diff --git a/Assemble.c b/Assemble.c
+index fa8bb113..e9f973ff 100644
+--- a/Assemble.c
++++ b/Assemble.c
+@@ -350,6 +350,9 @@ static int select_devices(struct mddev_dev *devlist,
+ 		}
+ 
+ 		if (found_container) {
++			struct mdinfo *members;
++			bool matched = false;
++
+ 			/* tmpdev is a container.  We need to be either
+ 			 * looking for a member, or auto-assembling
+ 			 */
+@@ -386,16 +389,15 @@ static int select_devices(struct mddev_dev *devlist,
+ 				pr_err("looking in container %s\n",
+ 				       devname);
+ 
+-			for (content = tst->ss->container_content(tst, NULL);
+-			     content;
+-			     content = content->next) {
++			members = tst->ss->container_content(tst, NULL);
++			for (content = members; content; content = content->next) {
+ 
+ 				if (!ident_matches(ident, content, tst,
+ 						   c->homehost, c->require_homehost,
+-						   c->update,
+-						   report_mismatch ? devname : NULL))
+-					/* message already printed */;
+-				else if (is_member_busy(content->text_version)) {
++						   c->update, NULL))
++					continue;
++				matched = true;
++				if (is_member_busy(content->text_version)) {
+ 					if (report_mismatch)
+ 						pr_err("member %s in %s is already assembled\n",
+ 						       content->text_version,
+@@ -409,6 +411,17 @@ static int select_devices(struct mddev_dev *devlist,
+ 					break;
+ 			}
+ 			if (!content) {
++				/* A container holds other arrays besides the one
++				 * looked for: tell why its members do not match
++				 * only when none of them does.
++				 */
++				if (!matched && report_mismatch)
++					for (content = members; content;
++					     content = content->next)
++						ident_matches(ident, content, tst,
++							      c->homehost,
++							      c->require_homehost,
++							      c->update, devname);
+ 				tmpdev->used = 2;
+ 				goto loop; /* empty container */
+ 			}
+-- 
+2.47.3
+

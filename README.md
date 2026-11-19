@@ -22,8 +22,11 @@ keeps the metadata where the BIOS and Windows expect it.
 - **Create** containers and volumes that the BIOS menu and the Windows driver show as Normal.
 - **mdmon** keeps the volumes' state, initializes them, and rebuilds onto spares or a returning disk the way the AMD
   driver does; an interrupted rebuild goes on after a reboot from where it stopped.
-- **Migrate** as AMD does: a RAIDABLE volume into a RAID1, a RAID1, RAID10 or RAID5 to a larger size in place,
-  a RAID0 into a RAID10.
+- **Migrate** as AMD does: a RAIDABLE volume into a RAID1; a RAID1, RAID10 or RAID5 to a larger size in place; a
+  RAID0 into a RAID10; more disks for a RAID0 or a RAID5; a RAID1 of two into a RAID5. A migration stopped midway
+  goes on at the next assembly; the AMD drivers finish one this mdadm started, and the other way round.
+- **Change the stripe size** of a RAID5 or RAID10 in place (`--grow --chunk`), which AMD's own tools cannot do; the
+  BIOS menu and the Windows driver take the result.
 - **Boot from a volume**: mkinitcpio, initramfs-tools and dracut, with a clean shutdown of the root volume.
 - **md write-intent bitmap** for RAID1, RAID10 and RAID5: after a crash only the parts being written are resynced.
 - **Repairs** the Legacy record of the system disk that the BIOS menu can break.
@@ -72,12 +75,15 @@ More — spares, RAIDABLE, the md bitmap, failed disks, booting — in [docs/usa
 ## Limitations
 
 - One AMD board tested so far; NVMe arrays only in emulation. See [docs/testing.md](docs/testing.md).
-- No AMD migrations that add disks to a volume; a volume in the middle of one is not assembled. Growing in place
-  and RAID0 → RAID10 are tried in emulation only.
+- Migrations tried on real hardware, with the BIOS menu and Windows: growing a RAID1 in place, more disks for a
+  RAID0 or a RAID5, a RAID1 of two into a RAID5, the stripe size of a RAID5 and of a RAID10. Growing a RAID5 or a
+  RAID10 in place and RAID0 → RAID10 only in emulation.
+- After a migration that moved a volume's data (more disks, RAID1 → RAID5, stripe size), mdadm starts no other one
+  of that kind on it: AMD does the next one in place with a log of the data, which mdadm does not write.
 - No 4Kn disks (AMD has no format for them), no `missing` disks at create, one AMD disk set per system.
 - `--create` stays within what the BIOS menu allows (8 disks per volume, 12 arrays); `--force` goes past it.
 - The md bitmap on kernels 6.18 and later needs an md fix from `kernel/`. The optional `md-bitmap-ext-dkms` package
-  carries it for Linux 6.18.57–6.18.63 and 7.3.0–7.3.4; without it volumes run without the md bitmap
+  carries it for Linux 6.18.57–6.18.64 and 7.3.0–7.3.5; without it volumes run without the md bitmap
   ([details](docs/install.md#the-md-bitmap)).
 
 ## Documentation
@@ -88,7 +94,7 @@ More — spares, RAIDABLE, the md bitmap, failed disks, booting — in [docs/usa
 | [Usage](docs/usage.md) | creating and managing arrays, spares, failures, compatibility with the BIOS and Windows |
 | [Testing](docs/testing.md) | what was tested where, what was not, what is not supported |
 | [Development](docs/development.md) | repository layout, the patch series, the kernel and util-linux patches |
-| [Tests](tests/README.md) | the test suite (639 checks on loop devices) and how to run it |
+| [Tests](tests/README.md) | the test suite (791 checks on loop devices) and how to run it |
 | [Format](docs/format.md) | the on-disk format, with a source for each statement (in Russian) |
 | [Firmware bugs](docs/firmware-bugs.md) | known problems of the AMD RAID firmware |
 | [Benchmark](docs/benchmark.md) | md against AMD's own Linux and Windows drivers on the same volumes |
@@ -102,8 +108,9 @@ More — spares, RAIDABLE, the md bitmap, failed disks, booting — in [docs/usa
 - [x] Detect XFS, btrfs, LUKS and LVM on a disk at `--add` and `--create`, as ext2/3/4 and ReiserFS
 - [x] Start a volume that the boot does not need, left inactive after booting with a disk missing
 - [x] Growing a volume in place, RAID0 → RAID10
-- [ ] Other AMD migrations: more disks, level changes
-- [ ] Stripe size change, which AMD's own tools do not offer (AMD's Linux driver carries such a change through: tried in emulation)
+- [x] More disks for a RAID0 or a RAID5, RAID1 → RAID5
+- [x] Stripe size change, which AMD's own tools do not offer
+- [ ] A second migration of a volume whose data a migration already moved (AMD's log of the data)
 
 ## How it was made
 

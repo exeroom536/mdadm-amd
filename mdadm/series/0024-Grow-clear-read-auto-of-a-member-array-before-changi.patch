@@ -1,0 +1,62 @@
+From e790b71f72eec0b24723f4bc11839cf2d142e38a Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:53:04 +0500
+Subject: [PATCH 24/48] Grow: clear read-auto of a member array before changing
+ its size
+
+md changes the component size of a writable array only (update_size()
+returns -EROFS otherwise).  As with raid_disks, freeze() leaves read-auto
+behind for a native array, but for a member of a container it freezes
+the container and leaves the member array as it was, often read-auto
+after assembly.  --grow --size of such a member array then fails once
+the metadata handler has recorded the new size - "Cannot set device size
+for ...: Read-only file system" - and Grow_reshape() rolls the metadata
+back.
+
+In Grow_reshape(), clear read-auto of a member array of external
+metadata before setting its size, as the previous patch does in
+reshape_array() before setting raid_disks.  A readonly set by the user
+stays, and the change is refused as before.  Native arrays, and member
+arrays that are writable already, go on as before.
+
+An AMD RAIDXpert2 volume (later in this series) just assembled and grown
+with --grow --size: before, the size change failed so and was rolled
+back; with the change the volume grows.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Grow.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/Grow.c b/Grow.c
+index 0609d45c..2764a2ff 100644
+--- a/Grow.c
++++ b/Grow.c
+@@ -2033,6 +2033,7 @@ int Grow_reshape(char *devname, int fd,
+ 	/* ========= set size =============== */
+ 	if (s->size > 0 && (s->size == MAX_SIZE || s->size != (unsigned)array.size)) {
+ 		unsigned long long orig_size = get_component_size(fd) / 2;
++		char buf[SYSFS_MAX_BUF_SIZE];
+ 		unsigned long long min_csize;
+ 		struct mdinfo *mdi;
+ 		int raid0_takeover = 0;
+@@ -2079,6 +2080,16 @@ int Grow_reshape(char *devname, int fd,
+ 			}
+ 		}
+ 
++		/*
++		 * md changes the size of a writable array only; freeze()
++		 * clears read-auto of a native array, not of a member of a
++		 * container (as for raid_disks in reshape_array).
++		 */
++		if (st->ss->external &&
++		    sysfs_get_str(sra, NULL, "array_state", buf, sizeof(buf)) > 0 &&
++		    strncmp(buf, "read-auto", 9) == 0)
++			ioctl(fd, RESTART_ARRAY_RW, 0);
++
+ 		/* Update the size of each member device in case
+ 		 * they have been resized.  This will never reduce
+ 		 * below the current used-size.  The "size" attribute
+-- 
+2.47.3
+

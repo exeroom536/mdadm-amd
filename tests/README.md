@@ -1,6 +1,6 @@
 # Test suite
 
-Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 639 checks in 63
+Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 791 checks in 74
 stages, on images of real AMD RAID disks, of disks made by the board's own RAID firmware in emulation, and of
 disks this mdadm makes. Everything runs on loop devices of sparse files (plus LIO SCSI disks backed by files for
 the udev stages); no real disk is touched unless you provide the optional AMD controller disks below.
@@ -56,8 +56,8 @@ images elsewhere; `ALLOW_MD=1` runs although md arrays are active. The output al
 and every check is written to the kernel log (`amd-test: ok …`), so `dmesg` shows which check the kernel
 messages belong to.
 
-The whole suite takes about an hour in a VM with 2 vCPUs and 2 GB (Debian 13, kernel 6.12), `PART=1` about 35
-minutes and `PART=2` about 25; most of it is waiting for md (resync at chosen speeds, rebuilds stopped midway, the md
+The whole suite takes about 80 minutes in a VM with 2 vCPUs and 2 GB (Debian 13, kernel 6.12), `PART=2` about 35
+minutes and `PART=1` the rest; most of it is waiting for md (resync at chosen speeds, rebuilds stopped midway, the md
 bitmap daemon), not CPU. Without the AMD controller disks three blocks are skipped (in stages 21, 23 and 27).
 
 **After an interrupted run, reboot** (or stop the md arrays and detach the loop devices of `$WORKDIR` by hand):
@@ -115,10 +115,21 @@ about the X399 fixture (its dump has no LBA 0), printed by `-E` inside checks.
 | 44 | `-C` of a Volume (linear) on a kernel with no md linear (Debian 13, Ubuntu 24.04): refused before anything is written; on a kernel with it, created and running |
 | 45 | `--detail-platform -e amd`: the controllers `AMD_RAID` makes the firmware take, their disks, the limits; `--export`; a controller path; `-C` of images does not warn about the platform |
 | 46 | a write of mdmon that keeps failing (the AMD bitmap sector an error target, dm): one line in the kernel log, and one when it goes through again |
-| 47 | volumes after AMD migrations that moved the data to AllocatedSpace + 0x800 (`rcadm -T`): assembled; in the middle of one, not; mdmon writes nothing into AMD's data log |
+| 47 | volumes after AMD migrations that moved the data to AllocatedSpace + 0x800 (`rcadm -T`): assembled, also in the middle of one (md goes on with it: stages 51, 54); mdmon writes nothing into AMD's data log |
 | 48 | `--grow --size` of a RAID1, RAID5, RAID10 in place, as `rcadm -T -s`: the start packet, the log, "100 %" and the final packet as AMD writes them; stopped midway and assembled again - goes on from the log; refused where there is no room, smaller, RAID0, the container; AMD's own growth midway (rcraid) ended by mdmon as the AMD driver ends it |
 | 49 | `--grow --level=10` of a RAID0 of 2, as `rcadm -T -r10`: the spares mirror the members, the packets and the log as AMD writes them; stopped midway, `-I` waits for the new disks, goes on from the log; refused with too few spares, another layout or number of disks; AMD's own RAID0 -> RAID10 midway (rcraid) ended by mdmon |
 | 50 | a rebuild target that lost the end of its rebuild (a power cut, the write cache gone): its member is recorded offline before mdmon writes it the live configuration and is rebuilt in place from 0; the rebuilds of other volumes onto it go on; md check 0 |
+| 51 | `--grow --raid-devices=N` of a RAID5 and `--level=5 --layout=right-asymmetric` of a RAID1 of 2, as `rcadm -T -r5`: the packets and the log as AMD writes them, md held behind the log; stopped midway or before the first region - goes on from the mark; a member failed midway; refused with no spare, another chunk or layout, a backup file, an md bitmap, data moved already; AMD's own migrations midway ended by mdmon as the AMD driver ends them |
+| 52 | two disks away together: a volume on both of them taken back without a rebuild when they come back with one packet, not with different ones; a free disk with the packet mdmon took over from the AMD driver gets the live configuration after mdmon restarts |
+| 53 | `--grow --chunk` of a RAID5 (also with `--raid-devices`) and of a RAID10, recorded as an AMD migration: the packets and the log, md held behind the log, goes on from the mark or from 0; one such migration in a container at a time; refused for other levels, sizes, layouts; AMD's own chunk changes of two volumes at once (rcraid) ended one after the other as the AMD driver ends them |
+| 54 | `--grow --raid-devices=N` of a RAID0, as `rcadm -T -r0` (md: raid4 without parity, then raid0 again): the packets and the log as AMD writes them, md held behind the log, goes on from the mark or from 0; AMD's own RAID0 migrations midway ended by mdmon; one in its first stripes not assembled |
+| 55 | migrations stopped before their first region (log at 0, or no log at all) go on from 0 as the AMD driver does: RAID5 + a disk, RAID1 -> RAID5, a chunk change, RAID0 + a disk; two migrations the AMD driver left in a container (midway, and both at 0): all assembled, carried out one after the other, the waiting one held even when writable, both ended as rcraid ends them |
+| 56 | volumes the AMD driver recorded OFFLINE (both members missing, nothing written): taken back without a rebuild when their disks come back together with one packet, at once or disk by disk, not with different packets or a member missing; a member left missing (0x20) is recorded offline before the first write; a disk md runs in sync but mdmon left behind gets the live configuration, a chunk change then runs |
+| 57 | a transform log one member does not take (an error target on its log sector): the other members still get it, and that member is failed in md as the AMD driver fails it (0x10); an initialization stops with the volume degraded, a RAID5 of 3 → 4 goes on without it and, stopped and assembled again, goes on from the copy of the other member with the data written meanwhile intact |
+| 58 | a container whose mdmon is a zombie (the shutdown ramfs emulated in a pid namespace whose pid 1 does not reap), IMSM and AMD: `-I` of the container starts a new mdmon for the volume, `--stop` takes no 5 s and says no "still running" |
+| 59 | `-A` of a volume by `--uuid` or `--name` with its container, IMSM and AMD: no "has wrong uuid" about the other volumes of the container, nor next to "already assembled"; a UUID no volume has, a foreign container and a foreign member are still refused with it; `-As` by mdadm.conf |
+| 60 | a member that does not take the transform log is failed in md where the volume runs on without it: a RAID5 of 3 → 4 goes on degraded to its end and is rebuilt onto a spare, an initialization degrades; a RAID0 of 2 → 3 (no member to spare) waits with the writes to the region held until the log goes through; md frozen midway through a region: the region held; the data as written, md check 0 |
+| 61 | md fails a disk in one volume (a write error, `--fail`): failed there alone as the AMD driver does - the disk's RAID0 or RAID1 in service, its PD ONLINE, configurations go on to it; assembled again without it in that volume, a spare rebuilt instead; a disk that goes away (`mdadm -If`) is failed everywhere and its PD OFFLINE, as is a disk a configuration write fails on |
 
 Fixtures and where they come from: [fixtures/README.md](fixtures/README.md). `helpers/` has the scripts that
 forge metadata with valid checksums for some stages; `../tools/amdraid_dump.py` parses it.

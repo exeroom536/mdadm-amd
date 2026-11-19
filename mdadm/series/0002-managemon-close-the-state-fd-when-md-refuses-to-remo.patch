@@ -1,7 +1,7 @@
-From ac6f355c1811afd350012b7818746c25fa118033 Mon Sep 17 00:00:00 2001
+From bd5107d5e3164b01bb97f268eecab081614a8dfb Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
-Date: Sun, 15 Nov 2026 11:17:21 +0500
-Subject: [PATCH 02/35] managemon: close the state fd when md refuses to remove
+Date: Thu, 19 Nov 2026 12:51:54 +0500
+Subject: [PATCH 02/48] managemon: close the state fd when md refuses to remove
  a device
 
 managemon_disk_remove() opens a new fd for the "state" attribute of a

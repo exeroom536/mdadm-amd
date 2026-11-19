@@ -1,5 +1,76 @@
 # Changes
 
+## 1.5 — 2026-11-19
+
+**New.**
+- `mdadm --grow --raid-devices` gives a RAID0 or a RAID5 more disks, and `mdadm --grow --level=5
+  --layout=right-asymmetric --raid-devices=N` makes a RAID1 of two a RAID5, as the AMD migrations (`rcadm -T`) do:
+  md reshapes the volume and moves the data of each member 9 MiB down, as AMD does. The new disks come from the
+  container's spares as with AMD: the volume's dedicated spares (`--add-spare`, also a disk of the container with
+  room) first, then the global ones; a RAID0 takes global spares only.
+- `mdadm --grow --chunk` changes the stripe size of a RAID5 or a RAID10 in place (64, 128 or 256 KiB), which AMD's
+  own tools do not offer; it is recorded as an AMD migration, and the AMD drivers take it.
+- Tried on real hardware with the BIOS menu and Windows (driver 9.3.3.218): RAID5 of 3 → 4 disks, RAID0 of 2 → 3,
+  RAID1 of two → RAID5 of 3, the stripe size of a RAID5 and of a RAID10. Stopped midway by mdadm, the BIOS menu
+  shows the volume as "Transform" and the Windows driver finishes the migration; the same both ways with AMD's
+  Linux driver in emulation. In a VM, the Windows drivers 9.3.3.329 and 9.5 take them the same way. A RAID10
+  stripe size change stopped midway is best finished before the volume is read under Windows: reading it while
+  the Windows driver carries the change on may stall it (all three driver versions; the data stay safe).
+- A volume in the middle of such an AMD migration is now assembled, and `mdmon` finishes the migration.
+- A migration stopped before md moved anything goes on from the start at the next assembly, as with the AMD driver
+  and IMSM; before, a RAID5 dropped it and a RAID0 kept it recorded until the next `--grow`. A fix of mdadm's own
+  `Assemble.c` and `Grow.c`: a reshape that moves the data, at its start, is continued like one in the middle.
+- Several migrations the AMD driver left in one container are finished one after the other, without a new
+  assembly; a volume that waits for its turn is assembled read-only. A fix of `Assemble.c` and `Grow.c` too.
+- A volume the AMD driver recorded offline because all its disks went away together is taken back without a
+  rebuild when they come back with the same configuration, also one at a time, as the AMD driver does; not when
+  they bring different ones (the AMD driver takes it then, with mirrors that differ). Volumes whose members all
+  fell behind together are assembled from them. Tried in emulation with AMD's Linux driver.
+- `md-bitmap-ext-dkms` covers Linux 6.18.64 and 7.3.5 too: their `drivers/md` is that of 6.18.63 and 7.3.4.
+  Built for CachyOS 7.3.5.
+
+**Fixed.**
+- A disk that did not take the AMD transform log (a write error on that one sector) kept the log from the disks after
+  it: an initialization or a rebuild went on from the start after a restart, and the AMD driver could read no mark.
+  The log now goes on every disk that takes it, and the disk that did not take it is failed in md where the volume
+  runs on without it, as the AMD driver fails it: its copy, left behind, is read by no one. Where the volume cannot
+  do without it (a RAID0 being reshaped, a volume degraded already) the reshape waits at its region, and so do the
+  writes to the region; they wait too while md does not reshape (frozen, interrupted). (With the migrations that
+  move data, new in this release, it would have lost data written meanwhile.) Tried with AMD's Linux driver in
+  emulation: it fails such a disk's element the same way; the Windows drivers 9.3.3.218, 9.3.3.329 and 9.5 (in a
+  VM) take the degraded volume, finished by Linux or stopped midway and finished by Windows, with the same data.
+- A disk md failed in one volume was failed by `mdmon` in every volume of the container, recorded offline and
+  written to no more: a RAID1 or RAID5 sharing the disk lost it for no reason, and the metadata differed from what
+  the AMD driver writes. It is now failed in that volume alone, as the AMD driver records it (tried with AMD's
+  Linux driver in emulation, and with the Windows drivers 9.3.3.218, 9.3.3.329 and 9.5 in a VM: the other volumes
+  normal, the disk online, the data the same; on real hardware the BIOS menu and Windows 9.3.3.218 see it so
+  too, see [docs/testing.md](docs/testing.md#hardware)); a disk failed in every volume it serves, one a configuration write
+  failed on, and one that goes away are recorded offline, as IMSM does. If the Windows driver then rebuilds a
+  volume onto such a disk, mdadm resyncs that volume once. The change in mdmon's own code is used by no other
+  format.
+- With an `mdmon` that had exited but was not reaped (the shutdown ramfs of systemd), mdadm took it for running:
+  `--stop` of a container waited 5 s and said "still running", and `-I` of a container left its volume read-only
+  without mdmon. mdadm also no longer holds the container while it starts mdmon, which could cost about 4 s when an
+  mdmon was coming up at the same time. Both in mdadm's own code, for IMSM as well.
+- `mdadm -A <volume> --uuid=... <container>` (or `--name`) no longer says "<container> has wrong uuid" for each
+  other volume of the container before the one it assembles; for IMSM as well.
+- A member the AMD driver had recorded as away (its disk not found, the volume not written since) stayed so while
+  md wrote the volume without it: had the disk come back under the AMD driver, the driver would have taken its
+  stale copy without a rebuild. It is now recorded as failed before the first write, as the AMD driver does.
+- A disk that joined the container after `mdmon` had written the configuration, and that md runs in sync, now
+  gets the current configuration at once; a migration of its volume no longer refuses to start.
+
+**Tests.** Stages 51 (RAID5 + disks, RAID1 → RAID5), 52 (two disks away together), 53 (the chunk), 54 (RAID0 +
+disks), 55 (migrations stopped before their first region), 56 (volumes recorded offline), 57 and 60 (a member
+that does not take the transform log), 58 (a zombie `mdmon`), 59 (`-A --uuid`, `--name`) and 61 (a member failed
+in one volume); fixtures `tests/fixtures/2026-11-15-rcraid-chunk/`, `2026-11-16-rcraid-chunk-begun/`,
+`2026-11-15-rcraid-away/` and two more snapshots in `2026-11-15-rcraid-migrations/`: 791 checks in 74 stages.
+
+**On real hardware** (the board, its BIOS menu and Windows with driver 9.3.3.218): the migrations and a member
+failed in one volume, booting Linux and Windows from volumes with this release ([docs/testing.md](docs/testing.md#hardware)).
+Not there yet: a disk that does not take the transform log (emulation and a VM only), a disk that goes away or
+fails in every volume it serves, and two disks away together (they need the disks unplugged).
+
 ## 1.4 — 2026-11-15
 
 **New.**

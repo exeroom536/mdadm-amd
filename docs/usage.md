@@ -8,6 +8,8 @@ container. `mdmon` runs for the container and keeps the AMD metadata up to date.
 - [Creating](#creating)
 - [Spares](#spares)
 - [RAIDABLE → RAID1](#raidable--raid1)
+- [Growing a volume, RAID0 → RAID10](#growing-a-volume-raid0--raid10)
+- [More disks, RAID1 → RAID5, stripe size](#more-disks-raid1--raid5-stripe-size)
 - [Changing and deleting volumes](#changing-and-deleting-volumes)
 - [When a disk fails or goes missing](#when-a-disk-fails-or-goes-missing)
 - [Working with the BIOS and Windows](#working-with-the-bios-and-windows)
@@ -108,8 +110,44 @@ As with the AMD migrations, a volume grows only into the free space right behind
 volume after it on the same disks leaves no room. The data stay where they are; md resyncs the new part, or copies
 each disk onto its new mirror. The migration is recorded as the AMD driver records it; stopped midway, it goes on
 from where it was at the next assembly. Not supported: growing a RAID0 or a Volume, other layouts and numbers
-of disks for RAID10, adding disks to a volume. Tried in emulation with AMD's Linux driver, which takes and
-finishes these migrations as its own; not yet with Windows or the BIOS.
+of disks for RAID10. Growing a RAID1 in place was tried on real hardware: the BIOS menu shows the new size, and
+the Windows driver reads the volume and finishes such a growth stopped midway. RAID5, RAID10 and RAID0 → RAID10
+were tried in emulation with AMD's Linux driver, which takes and finishes these migrations as its own.
+
+## More disks, RAID1 → RAID5, stripe size
+
+```sh
+mdadm /dev/md/amd0 --add /dev/sde                # a spare: a new disk (a global spare) ...
+mdadm /dev/md/r5 --add-spare /dev/sdd            # ... or a disk of the container with room (a dedicated spare)
+mdadm --grow /dev/md/r5 --raid-devices=4         # RAID5 of 3 -> 4 disks
+mdadm --grow /dev/md/stripe --raid-devices=3     # RAID0 of 2 -> 3 disks (a global spare only)
+mdadm --grow /dev/md/mirror --level=5 --layout=right-asymmetric --raid-devices=3   # RAID1 of two -> RAID5 of 3
+mdadm --grow /dev/md/r5 --chunk=128              # RAID5 or RAID10: stripe size 64, 128 or 256 KiB
+```
+
+These are AMD's own migrations (`rcadm -T`), recorded as the AMD driver records them; the stripe size change is
+recorded the same way, although AMD's tools do not offer it. md reshapes the volume and moves the data of each
+member 9 MiB down, as AMD does; the new disks come from the spares, as with AMD: a volume's dedicated spares
+first, then the global ones. A dedicated spare must be no smaller than the disks of the volume (AMD drops a
+smaller one), and a RAID0 has none: it takes a global spare, a disk in no volume. A spare keeps its role after a
+migration used part of it, as with AMD. For a RAID5, `--chunk` goes with `--raid-devices` too.
+
+- Stopped midway (a reboot, `mdadm --stop`), the migration goes on from where it was at the next assembly; one
+  stopped before md moved anything goes on from the start. The BIOS menu shows such a volume as "Transform", and
+  the Windows driver finishes it.
+- A RAID10 stripe size change stopped midway: let mdadm finish it, or let Windows finish it before using the
+  volume there. Reading the volume while the Windows driver (9.3.3 or 9.5) carries the change on may stall its
+  I/O (seen in a VM with slowed-down disks). The data stay safe; mdadm goes on from where Windows stopped.
+- One migration at a time in a container. Volumes the AMD driver left midway are finished one after another; a
+  volume that waits for its turn is assembled read-only.
+- After one of these migrations, mdadm starts no other one of them on the same volume: AMD does the next in place
+  with a log of the data, which mdadm does not write. Growing in place still works.
+- Not supported: fewer disks, more disks for a RAID10, the stripe size of a RAID0.
+
+Tried on real hardware with the BIOS menu and Windows: RAID5 of 3 → 4 disks, RAID0 of 2 → 3 disks, RAID1 of two
+→ RAID5 of 3, the stripe size of a RAID5 (64 → 128 KiB) and of a RAID10 (64 → 256 KiB). RAID5 of 3 → 4, RAID0 of
+2 → 3 and the RAID5 stripe size stopped midway by mdadm were finished by the Windows driver. In a VM, the
+Windows drivers 9.3.3.329 and 9.5 took all five, finished or stopped midway, the same way.
 
 ## Changing and deleting volumes
 
@@ -126,7 +164,11 @@ use under Windows; md itself does not cache. Names are at most 31 characters, an
 ## When a disk fails or goes missing
 
 - **A member fails while running:** md drops it, `mdmon` records it as the AMD driver does and rebuilds onto a
-  spare if there is one. Replace the disk with `--add`, as above.
+  spare if there is one. Replace the disk with `--add`, as above. It is failed in that volume alone: the other
+  volumes on the disk keep it, and the disk stays online until it fails in all of them.
+- **Being told:** `mdmonitor.service` (`mdadm --monitor --scan`) needs `MAILADDR` or `PROGRAM` in
+  `/etc/mdadm.conf`; without either it exits ("No mail address or alert command") and systemd lists it as
+  failed, as with any mdadm.
 - **A disk is pulled:** the udev rule takes it out of the container (`mdadm -If`), its volumes fail it first. With a
   udev older than systemd 257, run `mdadm -If sdc` yourself after pulling the disk.
 - **A disk comes back:** a member that was missing is rebuilt into its own place on that disk. A disk that failed
@@ -134,6 +176,10 @@ use under Windows; md itself does not cache. Names are at most 31 characters, an
 - **Booting with a disk missing:** the volumes start degraded after about 30 seconds (mdadm's last-resort timer, as
   for native md): the volume with the root file system still in the initramfs, the others in the running system, 30
   to 90 seconds after boot. When the disk is back, they are rebuilt onto it.
+- **All disks of a volume gone and back:** a volume the AMD driver recorded offline because all its disks went
+  away together is taken back without a rebuild when they come back with the same configuration, also one at a
+  time, as the AMD driver does. If they bring different configurations it is not: the AMD driver would take it
+  with mirrors that differ. Tried in emulation with AMD's Linux driver.
 - **A reboot during a rebuild or an initialization:** it goes on from the point recorded in the metadata. A rebuild
   target that comes only after its volume has started is copied from the start.
 

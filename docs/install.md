@@ -43,7 +43,7 @@ How each distribution was checked is in [testing.md](testing.md#distributions).
 | Package | What it is |
 |---|---|
 | `mdadm-amd` | mdadm and mdmon with the AMD handler, the udev rule, the `amdraid` mkinitcpio hook and a shutdown hook. Replaces `mdadm`. |
-| `md-bitmap-ext-dkms` | optional: `md_mod` with the md bitmap fix, for Linux 6.18.57 to 6.18.63 and 7.3.0 to 7.3.4 ([details](#the-md-bitmap)) |
+| `md-bitmap-ext-dkms` | optional: `md_mod` with the md bitmap fix, for Linux 6.18.57 to 6.18.64 and 7.3.0 to 7.3.5 ([details](#the-md-bitmap)) |
 
 Manjaro and EndeavourOS build and install them the same way. New EndeavourOS installs build their initramfs with
 dracut, not mkinitcpio: for booting from a volume there, use the dracut module (step 3 of
@@ -315,10 +315,10 @@ after a crash.
 
 How to get the fix (optional: everything else works without it):
 
-- **Arch Linux, kernel 6.18.57 to 6.18.63 or 7.3.0 to 7.3.4:** install the `md-bitmap-ext-dkms` package. It builds
+- **Arch Linux, kernel 6.18.57 to 6.18.64 or 7.3.0 to 7.3.5:** install the `md-bitmap-ext-dkms` package. It builds
   `md_mod` from the stable kernel's `drivers/md` with the fix (downloaded from kernel.org and checked by SHA-256)
   and installs it under `/updates/dkms`. The package carries `drivers/md` of 6.18.57 (the same files as in 6.18.57
-  to 6.18.60), 6.18.61 (to 6.18.62), 6.18.63, 7.3.1 (7.3.0 to 7.3.3) and 7.3.4, and takes the one of the kernel it
+  to 6.18.60), 6.18.61 (to 6.18.62), 6.18.63 (and 6.18.64), 7.3.1 (7.3.0 to 7.3.3) and 7.3.4 (and 7.3.5), and takes the one of the kernel it
   builds for. On any other kernel version it builds nothing, and the stock `md_mod` stays. It needs md built as a
   module (`CONFIG_BLK_DEV_MD=m`). If your kernel enforces module signatures, enroll the DKMS key first. The kernel's
   own `md-mod.ko.zst` stays in place, so `pacman -Qk` finds the kernel package whole.
@@ -326,7 +326,7 @@ How to get the fix (optional: everything else works without it):
   by `packaging/dkms/install.sh` ([below](#the-dkms-module-without-the-arch-package)).
 - **Other kernel versions, and kernels with md built in** (`CONFIG_BLK_DEV_MD=y`: Fedora 45, Ubuntu 26.04): apply
   `kernel/0001-*.patch` and `kernel/0002-*.patch` to the kernel and rebuild it. They apply to 6.18.63, 7.0.14,
-  7.1.13, 7.2.15, 7.3.1 to 7.3.4, 7.4-rc2 and the mainline of 14 November 2026.
+  7.1.13, 7.2.15, 7.3.1 to 7.3.5, 7.4-rc3 and the mainline of 15 November 2026.
 
 To check that the bitmap is in use:
 
@@ -346,7 +346,7 @@ runs `dkms install` for the running kernel and rebuilds its initramfs (`update-i
 otherwise `dracut -f`), from which `md_mod` is loaded when the root is on a volume. A version installed before is
 removed first.
 
-It builds for the same kernels as the package, 6.18.57 to 6.18.63 and 7.3.0 to 7.3.4, and needs md built as a
+It builds for the same kernels as the package, 6.18.57 to 6.18.64 and 7.3.0 to 7.3.5, and needs md built as a
 module. openSUSE Tumbleweed has it so; Fedora 45 and Ubuntu 26.04 build md into the kernel, and there the script
 stops: only a kernel rebuilt with the fix helps. A distribution kernel of these versions may still carry md changes
 of its own: Tumbleweed 7.3.3 has the stable `drivers/md`; on another distribution compare its kernel's `drivers/md`
