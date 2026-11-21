@@ -271,7 +271,7 @@ Everything except the Arch package builds upstream mdadm at the commit the patch
 ```sh
 git clone https://github.com/md-raid-utilities/mdadm.git upstream-mdadm
 cd upstream-mdadm
-git checkout 5542bf40fab20f09ce3be80ae1cb42584e9fa2f7
+git checkout 4cd7d33c1d2672c40ee3653006c36fe84cd1a545
 git apply /path/to/mdadm-amd/mdadm/mdadm-amd.patch
 make mdadm mdmon
 ```
@@ -282,7 +282,7 @@ same tree.
 ## Checking the installation
 
 ```sh
-mdadm --version                          # mdadm - v4.6-112-g5542bf40
+mdadm --version                          # mdadm - v4.6-132-g4cd7d33c
 sudo mdadm --examine /dev/sdX            # "Magic : RAIDCore" on an AMD disk
 sudo mdadm --assemble --scan             # or reboot: udev assembles the volumes
 cat /proc/mdstat

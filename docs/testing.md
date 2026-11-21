@@ -116,6 +116,12 @@ started. No SELinux denials. The tree the script lays out is the same, file for 
   volume never ran again, after assembly md went on from where it was, every sector right, `md` check clean. Stopped
   at 31 %, assembled (md went on at 32 %), stopped again at 60 %: Windows (driver 9.3.3.218) read the volume right
   and finished the change; Linux then found it at 128 KiB, every sector right, `md` check clean.
+- 1.6, kernel 7.3.5, the same disks: a RAID10 2 × 2 whose data a first stripe size change had moved down changed
+  back to 64 KiB - backwards, from the end, the data 9 MiB up -, stopped with `mdadm -S` twice and assembled
+  (`mdadm-grow-continue@` went on from the AMD log), every sector right, stopped at 60 %: Windows (driver
+  9.3.3.218) finished it; Linux then found 64 KiB, every sector right, `md` check clean. A RAID5 of two HDDs and an
+  SSD (64 → 128 KiB, its data moved down) got the fourth disk in place, stopped at 30 % and 60 % the same way;
+  Windows finished it: 3 GiB, every sector right, `md` check clean. The BIOS menu was not looked at.
 
 ## Emulation
 
@@ -182,14 +188,14 @@ An ASRock X670E RAID0 of two NVMe drives (our dump) and an ASUS X399 RAID10 (pub
 ## Test suites
 
 - The test suite in [tests/](../tests/README.md), on loop devices with metadata of real disks and of the emulated
-  board: 797 checks, all pass on a VM with the emulated AMD controllers (1.5.1; 791 for 1.5, 639 for 1.4, 586 for 1.3, 573 for 1.2, 545 for
+  board: 842 checks, all pass on a VM with the emulated AMD controllers (1.6; 797 for 1.5.1, 791 for 1.5, 639 for 1.4, 586 for 1.3, 573 for 1.2, 545 for
   1.1; for 1.0: 530 checks, 504 of them also on a plain VM without the controllers).
 - The same suite with mdadm and mdmon built with AddressSanitizer and UBSan: no reports. A fuzzer on the metadata
   parser: no crashes. (Both for 1.0.)
-- The upstream mdadm test suite: no regressions (1.5 and 1.1: 67 pass, 0 fail, 1 skipped, the same as upstream
-  `5542bf40` alone). The upstream CI build matrix; no new compiler warnings on the distributions above and on i686, s390x,
-  powerpc and musl (for 1.0; for 1.1 to 1.5.1 each patch of the series builds with gcc and clang without new
-  warnings).
+- The upstream mdadm test suite: no regressions (1.6: 69 pass, 0 fail, 1 skipped on upstream `4cd7d33c`; 1.5 and
+  1.1: 67 pass, 0 fail, 1 skipped, the same as upstream `5542bf40` alone). The upstream CI build matrix; no new
+  compiler warnings on the distributions above and on i686, s390x, powerpc and musl (for 1.0; for 1.1 to 1.6 each
+  patch of the series builds with gcc and clang without new warnings).
 
 ## Not tested
 
@@ -207,12 +213,15 @@ on real hardware; a migration of the volume that holds the root file system (goi
 a disk that does not take the transform log (a write error on that sector; in emulation and with the Windows
 drivers in a VM it was), and a disk that goes away or fails in every volume it serves with this release, on real
 hardware (it needs a disk unplugged; SATA hot plug was tried with an earlier release, see Hardware);
+the BIOS menu with the second migration of a volume whose data a migration moved already and with the stripe size
+change of such a volume (1.6; on real hardware the Windows driver finished both, see Hardware);
 other boards and BIOS versions.
 
 ## Not supported
 
 `--grow` other than RAIDABLE → RAID1, growing a RAID1, RAID5 or RAID10 in place, RAID0 → RAID10, more disks for a
-RAID0 or RAID5, RAID1 → RAID5 and the stripe size of a RAID5 or RAID10; a second such migration of a volume whose
-data a migration already moved (refused: AMD needs its log of the data for it); RAID6, RAID50 and distributed spares (no AMD platform we know of enables them; such volumes are not
+RAID0 or RAID5, RAID1 → RAID5 and the stripe size of a RAID5 or RAID10 (of a volume whose data a migration moved
+already too); more disks and another stripe size at once for such a volume (AMD would move the data in place,
+in regions md cannot keep to); RAID6, RAID50 and distributed spares (no AMD platform we know of enables them; such volumes are not
 assembled); 4Kn disks (AMD has no format for them); creating a volume with `missing` disks (refused, as for IMSM);
 a second AMD RAID disk set in one system (all RAID disks of a system share one configuration).

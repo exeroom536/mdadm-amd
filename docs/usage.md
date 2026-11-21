@@ -140,14 +140,18 @@ migration used part of it, as with AMD. For a RAID5, `--chunk` goes with `--raid
   I/O (seen in a VM with slowed-down disks). The data stay safe; mdadm goes on from where Windows stopped.
 - One migration at a time in a container. Volumes the AMD driver left midway are finished one after another; a
   volume that waits for its turn is assembled read-only.
-- After one of these migrations, mdadm starts no other one of them on the same volume: AMD does the next in place
-  with a log of the data, which mdadm does not write. Growing in place still works.
+- After one of these migrations the data stay 1 MiB into their extents: more disks for the volume again go in
+  place, the first stripes through the log of their data AMD keeps in front of each member, and a stripe size
+  change moves them back up 9 MiB, from the end of the volume, as AMD would. More disks and another stripe size
+  at once are refused then: one, then the other. Growing in place still works.
 - Not supported: fewer disks, more disks for a RAID10, the stripe size of a RAID0.
 
 Tried on real hardware with the BIOS menu and Windows: RAID5 of 3 → 4 disks, RAID0 of 2 → 3 disks, RAID1 of two
 → RAID5 of 3, the stripe size of a RAID5 (64 → 128 KiB) and of a RAID10 (64 → 256 KiB). RAID5 of 3 → 4, RAID0 of
 2 → 3 and the RAID5 stripe size stopped midway by mdadm were finished by the Windows driver. In a VM, the
-Windows drivers 9.3.3.329 and 9.5 took all five, finished or stopped midway, the same way.
+Windows drivers 9.3.3.329 and 9.5 took all five, finished or stopped midway, the same way. A second migration of
+moved data (RAID5 of 3 → 4) and the stripe size change of such a volume (RAID10 128 → 64 KiB), stopped midway by
+mdadm (1.6), were finished by the Windows driver too; AMD's Linux driver takes both, both ways, in emulation.
 
 ## Changing and deleting volumes
 

@@ -1,7 +1,7 @@
-From 904eab5fb4a6fd0a8fd5ced1e58cc4686d20042c Mon Sep 17 00:00:00 2001
+From 88d72ac6af5891b449dc10858df576a92d666d68 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:52:04 +0500
-Subject: [PATCH 09/49] util: an mdmon that is a zombie is not running
+Subject: [PATCH 09/53] util: an mdmon that is a zombie is not running
 
 mdmon_running() takes an mdmon for running while kill(pid, 0) finds it.
 A zombie it still finds.  In the shutdown ramfs (systemd's exitrd,
@@ -32,10 +32,10 @@ Written by Claude Opus 5.5, an AI model by Anthropic.
  3 files changed, 31 insertions(+), 30 deletions(-)
 
 diff --git a/mdadm.h b/mdadm.h
-index 0f94fe2b..71911114 100644
+index 2f07d600..e3fb4e5f 100644
 --- a/mdadm.h
 +++ b/mdadm.h
-@@ -1672,6 +1672,7 @@ extern int open_subarray(char *dev, char *subarray, struct supertype *st, int qu
+@@ -1664,6 +1664,7 @@ extern int open_subarray(char *dev, char *subarray, struct supertype *st, int qu
  extern struct superswitch *version_to_superswitch(char *vers);
  
  extern mdadm_status_t wait_for_mdmon_control_socket(const char *container_devnm);
@@ -44,10 +44,10 @@ index 0f94fe2b..71911114 100644
  extern int mdmon_pid(const char *devnm);
  extern mdadm_status_t wait_for_mdmon(const char *devnm);
 diff --git a/mdmon.c b/mdmon.c
-index aa047591..b49d6fb1 100644
+index 81b79493..2fc92bb8 100644
 --- a/mdmon.c
 +++ b/mdmon.c
-@@ -166,35 +166,6 @@ static int make_pidfile(char *devname)
+@@ -167,35 +167,6 @@ static int make_pidfile(char *devname)
  	return 0;
  }
  
@@ -84,10 +84,10 @@ index aa047591..b49d6fb1 100644
  {
  	char buf[100];
 diff --git a/util.c b/util.c
-index d5405548..6363b6de 100644
+index 8b614ce8..0d91a7ff 100644
 --- a/util.c
 +++ b/util.c
-@@ -1929,12 +1929,41 @@ int mdmon_pid(const char *devnm)
+@@ -1930,12 +1930,41 @@ int mdmon_pid(const char *devnm)
  	return atoi(pid);
  }
  

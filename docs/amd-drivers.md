@@ -31,7 +31,7 @@ Function names below are from those symbols. Dates are of 2026.
 | Takes a mirror member that missed a configuration update without a rebuild | stricter: `--run` and a full rebuild | [5](#a-member-that-missed-a-configuration-update) |
 | Takes back a volume whose disks bring different configurations | refuses | [6](#disks-that-went-away-together) |
 | TRIM only where every mirror reads zeroes after it | the same rule, a little wider | [7](#trim) |
-| Moves data of an already moved volume with a log of the data | refuses that second migration | [8](#migrations) |
+| Moves data of an already moved volume with a log of the data | the same (since 1.6) | [8](#migrations) |
 | Menu and `rcadm` create at most 8 disks per volume, 12 arrays | the same unless `--force` | [9](#limits-of-the-menu-and-rcadm) |
 | Windows forgets a disk that was away | `--add` needed, as with AMD | [10](#windows-forgets-a-disk-that-was-away) |
 | Windows clears or half-checks the bitmap after a Linux crash | resyncs at the next assembly | [11](#windows-after-a-linux-crash) |
@@ -174,7 +174,9 @@ it on a RAID1 of two SATA SSDs ([usage.md](usage.md#working-with-the-bios-and-wi
   (18.11). This mdadm makes it (`--grow --chunk`) and records it as an AMD migration.
 - **A second migration that moves data.** After a migration that moved a volume's data, AMD does the next one in
   place with a log of the data (the disassembly, `RC_SetupTransformParams`; volumes AMD's Linux driver migrated
-  twice in emulation). This mdadm does not write that log and refuses such a second migration
+  twice in emulation). This mdadm writes that log as AMD does and carries such a second migration out in place
+  (since 1.6); a stripe size change of such a volume moves the data back up from the end, as the AMD driver would
+  (`RC_SetupTransformParams`; AMD's Linux driver takes both, both ways, in emulation; on real hardware the Windows driver finishes both)
   ([usage.md](usage.md#more-disks-raid1--raid5-stripe-size)).
 
 ## Limits of the menu and rcadm

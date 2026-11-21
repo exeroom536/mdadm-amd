@@ -1,7 +1,7 @@
-From 80458d920a740a254bffc29ce6ce886d70869b1b Mon Sep 17 00:00:00 2001
+From efac13c4b36a450f13decd00424efccd8a124d2b Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:51:55 +0500
-Subject: [PATCH 03/49] managemon: take a faulty device that is gone from the
+Subject: [PATCH 03/53] managemon: take a faulty device that is gone from the
  array as removed
 
 managemon_disk_remove() fails when it cannot open the "state" attribute

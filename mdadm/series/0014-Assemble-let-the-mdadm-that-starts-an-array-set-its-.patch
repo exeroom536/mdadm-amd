@@ -1,7 +1,7 @@
-From 1eec92a084e2a59d805f0be2dc36de5e7d95aec1 Mon Sep 17 00:00:00 2001
+From e2d52c9da7e32a25268bd20ab49fdd04034d89dc Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:52:17 +0500
-Subject: [PATCH 14/49] Assemble: let the mdadm that starts an array set its
+Subject: [PATCH 14/53] Assemble: let the mdadm that starts an array set its
  resync point
 
 With incremental assembly (mdadm -I per disk, run by udev in parallel at
@@ -30,10 +30,10 @@ Written by Claude Opus 5.5, an AI model by Anthropic.
  1 file changed, 14 insertions(+)
 
 diff --git a/Assemble.c b/Assemble.c
-index 5a039f2b..fa8bb113 100644
+index a4ae2707..abaaeb56 100644
 --- a/Assemble.c
 +++ b/Assemble.c
-@@ -2015,6 +2015,7 @@ int assemble_container_content(struct supertype *st, int mdfd,
+@@ -2016,6 +2016,7 @@ int assemble_container_content(struct supertype *st, int mdfd,
  	int err;
  	int is_clean, all_disks;
  	bool is_raid456;
@@ -41,7 +41,7 @@ index 5a039f2b..fa8bb113 100644
  
  	if (sysfs_init(content, mdfd, NULL)) {
  		pr_err("Unable to initialize sysfs\n");
-@@ -2035,6 +2036,8 @@ int assemble_container_content(struct supertype *st, int mdfd,
+@@ -2036,6 +2037,8 @@ int assemble_container_content(struct supertype *st, int mdfd,
  			sysfs_free(sra);
  			return 1;
  		}
@@ -50,7 +50,7 @@ index 5a039f2b..fa8bb113 100644
  	}
  
  	/* There are two types of reshape: container wide or sub-array specific
-@@ -2180,6 +2183,17 @@ int assemble_container_content(struct supertype *st, int mdfd,
+@@ -2181,6 +2184,17 @@ int assemble_container_content(struct supertype *st, int mdfd,
  		return 1;
  	}
  

@@ -1,5 +1,57 @@
 # Changes
 
+## 1.6 — 2026-11-22
+
+**Base.** The patch and the series now apply to upstream mdadm `4cd7d33c` (mdadm-4.6-132, 20 November 2026) instead
+of `5542bf40`. Upstream renamed `mdopen.c` to `mddev.c` (one line of the `Makefile` in the patch follows it),
+dropped `raid5extend.c` and the static build, and added tests and an IMSM `--data-offset`; the AMD handler relies on
+none of it. The package gives mdadm `4.6.r132.g4cd7d33c` (`provides=mdadm`).
+
+**New.**
+- A volume whose data a migration moved already (more disks, RAID1 → RAID5, stripe size) gets more disks again
+  with `mdadm --grow --raid-devices` (a RAID0 or a RAID5), as AMD does it: in place, the first stripes through the
+  log of their data AMD keeps in front of each member. A migration stopped in those first stripes, by mdadm or by
+  the AMD driver, is finished there as the volume is assembled, before md runs it; before, such a volume was not
+  assembled, or ran as it was with the migration left recorded.
+- `mdadm --grow --chunk` of such a volume (a RAID5 or a RAID10): the data go back up 9 MiB, from the end of the
+  volume, as the AMD driver would move them; md reshapes it backwards. More disks and another stripe size at once
+  stay refused for such a volume: one, then the other. Two fixes of mdadm's own `Grow.c` and `sysfs.c` (patches 32
+  and 33 of `mdadm/series/`): a reshape whose data move up is held from its end - also where `mdadm --grow --continue`, as the
+  `mdadm-grow-continue@` unit runs it under systemd, takes it on -, and md is given the new data
+  offsets the way it takes higher ones.
+- Both tried in emulation with AMD's Linux driver (rcraid 9.3.3), both ways: it finishes ours stopped midway,
+  mdadm finishes its own, the final records the same as the AMD driver's; on real hardware the Windows driver
+  finishes ours (below).
+
+**Fixed.**
+- Going on with the AMD driver's own second migration of a RAID0 (more disks again, stopped midway) could hang for
+  good (1.5 and 1.5.1): md was held across a stripe of the old layout, a read of that stripe waited for md, and
+  mdadm, moving the window of writes it holds, waited for that read. The window now moves only where stripes of
+  both layouts end, and assembly takes such a migration on to that point first. Reproduced on loop devices from
+  the AMD driver's own marks (RAID0 of 3 → 4 and 4 → 5 disks); gone with the fix.
+- A safeguard: mdadm refuses a migration whose record would not read back as one md reshapes — mdadm would then
+  reshape the volume its own way, without the AMD log. No such case is known.
+
+**Tests.** Stages 65 (a second migration of a RAID0 and a RAID5 in place, ours and the AMD driver's, stopped in
+the first stripes), 66 (the stripe size of such a volume changed backwards, ours and the AMD driver's, stopped
+midway), 67 (no hang with a reader where md is held midway through a stripe of the old layout), 68 (stripe
+size changes one after another without a pause) and 69 (that change backwards carried on by `mdadm --grow
+--continue`, its manager killed at the start, midway and after assembly), with two new fixtures of the AMD driver's snapshots
+(`2026-11-19-rcraid-second-migration/`, `2026-11-20-rcraid-chunk-backwards/`); stages 51, 53 and 54 check what
+changed for data moved already. 842 checks in 82 stages, all pass in a VM with the emulated AMD controllers.
+mdadm's own tests on `4cd7d33c`: 69 pass, 0 fail,
+1 skipped (two more tests upstream).
+
+**On real hardware** (MSI X870E, BIOS 1.A93, kernel 7.3.5; two HDDs and two SATA SSDs, 1 GiB of each, every sector
+holding its own number). A RAID10 2 × 2 whose data a first stripe size change had moved down: `--grow --chunk=64`,
+backwards; stopped with `mdadm -S` twice, it went on after assembly under systemd from the AMD log, every sector
+right while md reshaped; stopped at 60 %, the Windows driver (9.3.3.218) finished it: 64 KiB, the data 9 MiB
+higher, every sector right, `md` check clean. A RAID5 of three disks (64 → 128 KiB first, the data moved down) got
+a fourth disk in place (`--add-spare`, `--raid-devices=4`), stopped at 30 % and 60 % the same way: Windows finished
+it, 3 GiB, every sector right, `md` check clean. The first run of the RAID10 change stood at 0: `mdadm --grow
+--continue`, which carries a reshape on under systemd, read the progress of a reshape md runs backwards as counted
+from the start (fixed before the release, patch 32; stage 69). Not looked at with this release: the BIOS menu.
+
 ## 1.5.1 — 2026-11-21
 
 **Fixed.**

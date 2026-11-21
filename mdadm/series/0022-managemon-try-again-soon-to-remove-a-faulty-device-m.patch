@@ -1,7 +1,7 @@
-From 84b85b771f4c71c62981a7aac303f09c0b3134e3 Mon Sep 17 00:00:00 2001
+From da0be7769bfb6f15939cee5a8f1ea7b5831951f0 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:52:54 +0500
-Subject: [PATCH 22/49] managemon: try again soon to remove a faulty device md
+Subject: [PATCH 22/53] managemon: try again soon to remove a faulty device md
  refused
 
 A faulty member of an external-metadata array is removed by managemon

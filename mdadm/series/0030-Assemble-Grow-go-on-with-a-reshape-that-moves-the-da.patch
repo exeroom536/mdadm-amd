@@ -1,7 +1,7 @@
-From a7d8272d250447a578df3f054ff98a1a5fe4459a Mon Sep 17 00:00:00 2001
+From 74efabb03278bf1fe41872a0895355810b664007 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:14 +0500
-Subject: [PATCH 30/49] Assemble, Grow: go on with a reshape that moves the
+Subject: [PATCH 30/53] Assemble, Grow: go on with a reshape that moves the
  data from its start
 
 assemble_container_content() starts an array whose reshape is at 0 as
@@ -37,10 +37,10 @@ Written by Claude Opus 5.5, an AI model by Anthropic.
  2 files changed, 39 insertions(+), 1 deletion(-)
 
 diff --git a/Assemble.c b/Assemble.c
-index 59f945b8..71b45e73 100644
+index b4f7e1f6..b117c717 100644
 --- a/Assemble.c
 +++ b/Assemble.c
-@@ -2025,6 +2025,23 @@ static void mdmon_take_array(char *container_devnm)
+@@ -2026,6 +2026,23 @@ static void mdmon_take_array(char *container_devnm)
  	close_fd(&fd);
  }
  
@@ -64,7 +64,7 @@ index 59f945b8..71b45e73 100644
  int assemble_container_content(struct supertype *st, int mdfd,
  			       struct mdinfo *content, struct context *c,
  			       char *chosen_name, int *result)
-@@ -2243,7 +2260,14 @@ int assemble_container_content(struct supertype *st, int mdfd,
+@@ -2244,7 +2261,14 @@ int assemble_container_content(struct supertype *st, int mdfd,
  				   spare, &c->backup_file, c->verbose) == 1)
  			return 1;
  

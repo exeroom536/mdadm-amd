@@ -4860,7 +4860,7 @@ echo check | sudo tee /sys/block/$C/md/sync_action >/dev/null; sleep 1; waitrec
 check "51: done: md raid5 of 4, 384 MiB, data at 0x100800 (offset), not blocked; the data as written, md check 0" "[ \$(cat /sys/block/$C/md/raid_disks) = 4 ] && [ \$(cat /sys/block/$C/size) = $((0xc0000)) ] && [ \"\$(q51offs $C offset)\" = '$((0x100800)) ' ] && grep -q 'external:/' /sys/block/$C/md/metadata_version && cmp -s $WQ/q51/pat <(sudo dd if=/dev/$C bs=1M count=64 iflag=direct status=none) && [ \$(cat /sys/block/$C/md/mismatch_cnt) = 0 ]"
 stopall; qgasm; C=$(qgmd c51)
 check "51: assembled again: raid5 of 4 at 0x100800, no reshape" "[ \$(cat /sys/block/$C/md/raid_disks) = 4 ] && [ \"\$(cat /sys/block/$C/md/reshape_position)\" = none ] && [ \"\$(q51offs $C offset)\" = '$((0x100800)) ' ]"
-check "51: data moved by a migration already: AMD moves them on with a log of the data - refused" "$M /dev/$CN --add $(qgl 4) >/dev/null 2>&1; sleep 1; $M --grow /dev/$C --raid-devices=5 2>&1 | grep -q 'an AMD migration moved its data already'"
+check "51: data moved by a migration already: another chunk with the disk refused (AMD would go in place, regions md cannot keep to; more disks alone - stage 65, the chunk alone - stage 66)" "$M /dev/$CN --add $(qgl 4) >/dev/null 2>&1; sleep 1; $M --grow /dev/$C --raid-devices=5 --chunk=128 2>&1 | grep -q 'an AMD migration moved its data already: AMD would take them onto more disks and to another chunk in place' && [ \$(cat /sys/block/$C/md/raid_disks) = 4 ]"
 # RAID1 of two -> RAID5 of 3, at full speed, written to meanwhile
 R1=$(qgmd m51); head -c 64M /dev/urandom > $WQ/q51/pat; sudo dd if=$WQ/q51/pat of=/dev/$R1 bs=1M oflag=direct status=none
 cp $WQ/q51/pat $WQ/q51/model; G0=$(qgring $WQ/q51/d0.img | tail -1)
@@ -4932,7 +4932,8 @@ fi
 # driver's own migrations midway: q8m-e1mid (the data from + 0x5000 to + 0x800) and q8m-e1cmid (a second growth, the
 # data at + 0x800 already stay, the regions moved in place between the layouts) - md ends them, the final packet as
 # AMD's (q8m-e1post, q8m-e1cpost); a second growth in its first stripes (AMD moves those with a log of their data) -
-# not assembled. 1.4 refused such a --grow and did not assemble RAID0 volumes in the middle of such a migration.
+# finished there as the volume is assembled (stage 65; 1.5.1 did not assemble it). 1.4 refused such a --grow and
+# did not assemble RAID0 volumes in the middle of such a migration.
 if want 54; then
 stopall
 Q54D=$FIXT/2026-11-15-rcraid-migrations
@@ -4978,7 +4979,7 @@ check "54: \"100 %\" packet (the RAID0 2 x 1 COMPLETED at 192 MiB, 100000, Flags
 check "54: done: md raid0 of 3 again, 192 MiB, data at 0x100800, not blocked; the data as written" "[ \$(cat /sys/block/$Z/md/level) = raid0 ] && [ \$(cat /sys/block/$Z/size) = $((0x60000)) ] && [ \"\$(q54offs $Z offset)\" = '$((0x100800)) ' ] && grep -q 'external:/' /sys/block/$Z/md/metadata_version && cmp -s $WQ/q54/pat <(sudo dd if=/dev/$Z bs=1M count=128 iflag=direct status=none)"
 stopall; qgasm; Z=$(qgmd z54)
 check "54: assembled again: raid0 of 3 at 0x100800, the data as written" "[ \$(cat /sys/block/$Z/md/level) = raid0 ] && [ \$(cat /sys/block/$Z/md/raid_disks) = 3 ] && [ \"\$(q54offs $Z offset)\" = '$((0x100800)) ' ] && cmp -s $WQ/q54/pat <(sudo dd if=/dev/$Z bs=1M count=128 iflag=direct status=none)"
-check "54: data moved by a migration already: AMD moves them on with a log of the data - refused" "$M /dev/$CN --add $(qgl 4) >/dev/null 2>&1; sleep 1; $M --grow /dev/$Z --raid-devices=4 2>&1 | grep -q 'an AMD migration moved its data already' && [ \$(cat /sys/block/$Z/md/level) = raid0 ]"
+check "54: data moved by a migration already: no backup file either (AMD keeps its own log of the data; the second migration - stage 65)" "$M /dev/$CN --add $(qgl 4) >/dev/null 2>&1; sleep 1; $M --grow /dev/$Z --raid-devices=4 --backup-file=$WQ/q54/bk 2>&1 | grep -q 'AMD keeps what it backs up in its own log of the data: no backup file' && [ \$(cat /sys/block/$Z/md/level) = raid0 ]"
 # nothing moved yet (the log at 0): md goes on from 0, as the AMD driver (stage 55) - a raid4 from 0, then a
 # RAID0 again
 $M -C /dev/md/n54 -e amd -l0 -n2 -z 64M $(qgl 0) $(qgl 1) --run >/dev/null 2>&1; sleep 1; N0=$(qgmd n54)
@@ -5028,12 +5029,12 @@ for F in e1mid:0x7e000:3:e1post:4800:22211 e1cmid:0x29c00:4:e1cpost:0:12141; do
 	q54wait; q54raid0 $V $ND; sleep 2; SZ=$(cat /sys/block/$V/size 2>/dev/null); stopall
 	check "54: q8m-$S ended by mdmon: its LD = the one the AMD driver ends it with (q8m-$POST), md at its capacity ($SZ), the log cleared" "[ -n \"\$(qgld $WQ/q54/rc.img $ID)\" ] && [ \"\$(qgld $WQ/q54/d0.img $ID)\" = \"\$(qgld $WQ/q54/rc.img $ID)\" ] && [ $((SZ)) = $((0x774000)) ] && [ \"\$(qgtlog $(qgl 0) 0x100000)\" = '0 0 0 0 0 0 0' ]"
 done
-# ... q8m-e1cmid with its mark in the first stripes (the log made so: 0x600, as at the end of AMD's log of the data):
-# md cannot go on there - not assembled, said so
+# ... q8m-e1cmid with its mark in the first stripes (the log made so: the stripe at 0x400 whole in AMD's log of the
+# data, 0x512141; LogDataRange 0x600): md cannot go on there - mdadm moves them as the volume is assembled
 qgfix q54 $Q54D q8m-e1cmid
-sudo python3 $HLP/tlog-patch.py $(qgl 0) 0x100000 ProtectStart=0x600 IOStart=0x600 Flags=0x112141 --write >/dev/null; sudo blockdev --flushbufs $(qgl 0)
+sudo python3 $HLP/tlog-patch.py $(qgl 0) 0x100000 ProtectStart=0x400 IOStart=0x400 Flags=0x512141 --write >/dev/null; sudo blockdev --flushbufs $(qgl 0)
 OUT=$(for l in $QGL; do $M -I $l 2>&1; done); sleep 2
-check "54: q8m-e1cmid at 0x600 (AMD's first stripes, with their data logged): not assembled, said so" "[ -z \"\$(mdof raid4)\" ] && [ -z \"\$(mdof raid0)\" ] && echo \"\$OUT\" | grep -q 'AMD moves its first stripes with a log of their data'"
+check "54: q8m-e1cmid at 0x400 (AMD's first stripes, with their data logged): assembled - the first stripes moved as the AMD driver moves them, md raid4 goes on from LogDataRange" "[ -n \"\$(mdof raid4)\" ] && echo \"\$OUT\" | grep -q 'its first stripes moved through the AMD log of the data, as the AMD driver does: md goes on from 1536'"
 qgdrop q54
 fi
 # --- end of stage 54 ---
@@ -5206,7 +5207,7 @@ G1=$(qgring $WQ/q53/d0.img | tail -1)
 P100=$(qgld $WQ/q53/d0.img $CID $((G1 - 1))); PF=$(qgld $WQ/q53/d0.img $CID $G1)
 check "53: \"100 %\" packet, then the final one: one LD RAID5 1 x 3 of 128 KiB, LastOperation NORMAL COMPLETED, generation as made, data at + 0x800; log cleared" "echo \"\$P100\" | head -1 | grep -q 'tt=5354 lo=5354 ts=a1a6 cap=80000 ps=80000 .* fs=1x3 .* psz=0 fl=84 lk=1 pct=186a0' && echo \"\$P100\" | tail -1 | grep -q 'tt=5354 lo=5354 ts=a1a1 cap=80000 ps=80000 .* fs=1x3 .* pct=186a0' && [ \$(echo \"\$PF\" | wc -l) = 1 ] && echo \"\$PF\" | grep -qE \"type=1bf5 st=200 tt=0 lo=5354 ts=a1a6 cap=80000 ps=0 gen=$(printf %x $((G0 + 1))) fs=1x3 tf=0 psz=0 fl=0 lk=0 pct=0 at=1( e[0-2]=[0-9a-f]+:100000\\\\+45000:100800\\\\+40000:0){3}$\" && [ \"\$(q53cts $WQ/q53/d0.img $CID)\" = 2 ] && [ \"\$(for d in 0 1 2; do qgtlog \$(qgl \$d) 0x100000; done | sort -u)\" = '0 0 0 0 0 0 0' ]"
 check "53: done: md raid5 of 128 KiB at 0x100800, not blocked; the data as written, md check 0" "[ \$(cat /sys/block/$C/md/chunk_size) = 131072 ] && [ \"\$(q53offs $C offset)\" = '$((0x100800)) ' ] && grep -q 'external:/' /sys/block/$C/md/metadata_version && q53same c53 && q53check $C"
-check "53: the data moved by a migration already: another chunk refused (AMD would move them back up, with a log of the data)" "$M --grow /dev/$C --chunk=256 2>&1 | grep -q 'an AMD migration moved its data already'"
+check "53: the data moved by a migration already: another chunk with a disk refused (AMD would go in place; the chunk alone - stage 66)" "$M --grow /dev/$C --chunk=256 --raid-devices=4 --force 2>&1 | grep -q 'in regions md cannot keep to' && [ \$(cat /sys/block/$C/md/chunk_size) = 131072 ]"
 # RAID10 of three columns 64 -> 256 KiB at full speed, written to meanwhile: the region of the source's chunk, 0x7f80
 R=$(qgmd r53); cp $WQ/q53/pat-r53 $WQ/q53/model; G0=$(qgring $WQ/q53/d0.img | tail -1)
 ( for i in $(seq 1 120); do o=$((RANDOM % 150)); head -c 1M /dev/urandom > $WQ/q53/blk
@@ -6238,6 +6239,379 @@ check "64c: RAID10 2 x 2 --chunk=128 stopped (-S) midway: mdmon does not run it 
 qgdrop q64
 fi
 # --- end of stage 64 ---
+
+# --- stage 65: a second migration of a volume whose data the first one moved to AllocatedSpace + 0x800 already:
+# in place, the first stripes through AMD's log of the data (AllocatedSpace + 0x600; rcblob RC_MoveDataNextRegion
+# @0018a770, LogDataRange - RC_InitTransformStruct @00192fd0), then dynamic regions
+# (RC_TransformUpdateNextDynamicRegionFromBeginning @0014e070). Fixture 2026-11-19-rcraid-second-migration (rcraid
+# 9.3.3-00302 in emulation): a RAID0 4 x 1 and a RAID5 1 x 4 at + 0x800 (after a first migration by rcadm -T), in
+# every sector the pair (tag, sector number of the volume).
+# 65a - rcraid's snapshot: RAID0 4 -> 5 midway through its log of the data (the stripe at 0x280, the phase before the
+# log of the data - flags 0x712141): the assembly takes the first stripes on to LogDataRange (0xa00) itself, md goes
+# on, mdmon ends the migration as AMD does (the LD = rcraid's final one, q20m-done), the data intact.
+# 65b - rcraid's snapshot: RAID5 4 -> 5, a region of 0x600 a stripe at a time, the stripe at 0x200 in the log of the
+# data (0x512141): the same, md check 0.
+# 65c - mdadm --grow of that RAID0 4 -> 5: the start packet as rcadm -T -r0 writes it (0x112141 in both LDs, protect
+# 0x7800, Flags 0x20010), the log a stripe at a time with its phase; stopped in the first stripes - the assembly
+# finishes them, the data intact.
+# 65d - the same for the RAID5 (a region of 0x600 a stripe at a time). 65e - --chunk of such a volume: the data go
+# back up, from the end (stage 66).
+# 1.5.1: volumes midway through the first stripes are not assembled, such a --grow is refused.
+if want 65; then
+cd "$MDADM_DIR"
+stopall
+Q65D=$FIXT/2026-11-19-rcraid-second-migration
+R0ID=83b23ee6ee43; R5ID=d13cd6296c75
+# q65over <snapshot>: the snapshot's metadata (LBA 0...0x6000) and parts of its extents [A, A + 0x4000) over the
+# loop devices of the set q65
+q65over() { local n f a
+	for n in 0 1 2 3 4; do xz -dc $Q65D/$1-sata$n-lba0-6000.img.xz | sudo dd of=$(qgl $n) bs=512 oflag=direct conv=notrunc status=none
+		for f in $Q65D/$1-sata$n-lba0x*-4000.img.xz; do [ -e "$f" ] || continue; a=${f##*-lba}; a=${a%-4000.img.xz}
+			xz -dc $f | sudo dd of=$(qgl $n) bs=512 seek=$((a)) oflag=direct conv=notrunc status=none; done; done; }
+# q65pat <dev> <MiB> <tag>: the pattern; q65chk <dev> <MiB> <tag>: "ok" or the first sector that differs
+q65pat() { python3 -c '
+import sys, struct
+o = sys.stdout.buffer
+for s in range(int(sys.argv[1]) * 2048): o.write(struct.pack("<QQ", int(sys.argv[2]), s) * 32)' $2 $3 |
+	sudo dd of=$1 bs=1M oflag=direct conv=notrunc status=none; }
+q65chk() { sudo dd if=$1 bs=1M count=$2 iflag=direct status=none | python3 -c '
+import sys, struct
+t = int(sys.argv[1]); b = sys.stdin.buffer.read()
+bad = [s for s in range(len(b) // 512) if b[s * 512:s * 512 + 512] != struct.pack("<QQ", t, s) * 32][:1]
+print("ok" if not bad and len(b) else "bad 0x%x" % (bad[0] if bad else 0))' $3; }
+q65mm() { echo check | sudo tee /sys/block/$1/md/sync_action >/dev/null; sleep 1
+	while ! grep -q idle /sys/block/$1/md/sync_action; do sleep 1; done; cat /sys/block/$1/md/mismatch_cnt; }
+q65wait() { for i in $(seq 1 300); do grep -qE 'reshape|resync|recover' /proc/mdstat || { sleep 3; grep -qE 'reshape|resync|recover' /proc/mdstat || return 0; }; sleep 1; done; return 1; }
+# q65base: the set as after rcraid's first migrations (q20m-first), the pattern in both volumes, all stopped
+q65base() { qgfix q65 $Q65D q20m-first; qgasm; q65pat /dev/$(qgmd r0) 256 7; q65pat /dev/$(qgmd r5) 256 9; stopall; }
+xz -dc $Q65D/q20m-done-sata0-lba0-6000.img.xz > $WQ/q65done.img
+# 65a
+q65base; q65over q20m-r0s01
+check "65a: rcraid's RAID0 4 -> 5 stopped in its log of the data (the stripe at 0x280, 0x712141): -E says the migration" "$M -E $(qgl 0) 2>/dev/null | grep -qE 'Migration : RAID10N 4 x 1, 384 MiB -> RAID10N 5 x 1, 385 MiB; [0-9]+% done'"
+OUT=$(for l in $QGL; do $M -I $l 2>&1; done); sleep 2; V=$(qgmd r0)
+check "65a: assembled: the first stripes moved as the AMD driver moves them, md (raid4) goes on from LogDataRange 0xa00" "echo \"\$OUT\" | grep -q 'subarray-0: its first stripes moved through the AMD log of the data, as the AMD driver does: md goes on from 2560' && [ -n '$V' ]"
+q65wait; sleep 3; V=$(qgmd r0)
+check "65a: done: md raid0 of 5, the data as written; the LD as rcraid ends it (q20m-done), the log cleared" "[ \$(cat /sys/block/$V/md/level) = raid0 ] && [ \$(cat /sys/block/$V/md/raid_disks) = 5 ] && [ \"\$(q65chk /dev/$V 256 7)\" = ok ] && [ \"\$(qgld $WQ/q65/d0.img $R0ID)\" = \"\$(qgld $WQ/q65done.img $R0ID)\" ] && [ \"\$(qgtlog $(qgl 0) 0x100000)\" = '0 0 0 0 0 0 0' ]"
+stopall
+# 65b
+q65base; q65over q20m-r5s02
+OUT=$(for l in $QGL; do $M -I $l 2>&1; done); sleep 2
+check "65b: rcraid's RAID5 4 -> 5 stopped in its log of the data (region 0x600 a stripe at a time, 0x200 logged, 0x512141): assembled, the stripe from the log of the data, the next through it, md goes on from 0x600" "echo \"\$OUT\" | grep -q 'subarray-1: its first stripes moved through the AMD log of the data, as the AMD driver does: md goes on from 1536'"
+q65wait; sleep 3; V=$(qgmd r5)
+check "65b: done: md raid5 of 5, the data as written, md check 0; the LD as rcraid ends it" "[ \$(cat /sys/block/$V/md/raid_disks) = 5 ] && [ \"\$(q65chk /dev/$V 256 9)\" = ok ] && [ \$(q65mm $V) = 0 ] && [ \"\$(qgld $WQ/q65/d0.img $R5ID)\" = \"\$(qgld $WQ/q65done.img $R5ID)\" ]"
+stopall
+# 65c, 65d: mdadm --grow, md slowed, stopped in the first stripes
+q65base; qgasm; C=$(cont1); $M /dev/$C --remove $(qgl 4) >/dev/null 2>&1; sleep 1; $M /dev/$C --add $(qgl 4) >/dev/null 2>&1; sleep 1
+for F in c:r0:0:7:100000:a00:280 d:r5:1:9:145000:600:200; do
+	K=${F%%:*}; F=${F#*:}; N=${F%%:*}; F=${F#*:}; SA=${F%%:*}; F=${F#*:}; TG=${F%%:*}; F=${F#*:}; AL=0x${F%%:*}; F=${F#*:}; LR=$((0x${F%%:*})); IO=${F#*:}
+	V=$(qgmd $N); [ $N = r5 ] && $M --readwrite /dev/$V >/dev/null 2>&1
+	G0=$(qgring $WQ/q65/d0.img | tail -1); ID=$([ $N = r0 ] && echo $R0ID || echo $R5ID)
+	echo 4 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null; echo 1 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null
+	$M --grow /dev/$V --raid-devices=5 > $WQ/q65/grow.out 2>&1; sleep 4
+	S1=$(qgld $WQ/q65/d0.img $ID $((G0 + 1)) | head -1); T=$(qgtlog $(qgl 0) $AL)
+	check "65$K: $N --raid-devices=5: in place (the data stay at + 0x800); start packet as rcadm -T (0x112141, Flags 0x20010, Link 1); the log a stripe at a time with its phase of the log of the data" "grep -q '4 -> 5 disks; mdmon records it as an AMD migration, md reshapes it, the data where they are' $WQ/q65/grow.out && echo \"\$S1\" | grep -q 'tt=5354 lo=5354 ts=0 .* tf=112141 psz=[0-9a-f]* fl=20010 lk=1' && echo \"\$T\" | grep -qE '^5354 [0-9a-f]+ 1 $IO [3-7]12141 [0-9a-f]+ '"
+	$M -S /dev/$V >/dev/null 2>&1; sleep 1; T=$(qgtlog $(qgl 0) $AL)
+	check "65$K: stopped in the first stripes (the log at 0x$(echo $T | cut -d' ' -f2), below 0x$(printf %x $LR))" "[ \"\$(echo \$T | cut -d' ' -f1)\" = 5354 ] && [ \$((0x\$(echo \$T | cut -d' ' -f2))) -lt $LR ]"
+	echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null; echo 1000 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null
+	stopall; OUT=$(for l in $QGL; do $M -I $l 2>&1; done); sleep 2; q65wait; sleep 3; V=$(qgmd $N)
+	check "65$K: assembled again: the first stripes moved through the log of the data, md goes on, done - $N of 5, the data as written" "echo \"\$OUT\" | grep -q 'subarray-$SA: its first stripes moved through the AMD log of the data' && [ \$(cat /sys/block/$V/md/raid_disks) = 5 ] && [ \"\$(q65chk /dev/$V 256 $TG)\" = ok ] && [ \$(qgld $WQ/q65/d0.img $ID | wc -l) = 1 ]"
+done
+V=$(qgmd r5)
+check "65e: --chunk of a volume a migration moved already: the data go back up, from the end (stage 66) - md reshapes it backwards to the end, the data as written" "$M --grow /dev/$V --chunk=128 > $WQ/q65e.out 2>&1; grep -q 'the data moving 9 MiB up on each disk, from the end' $WQ/q65e.out && q65wait && sleep 3 && [ \$(cat /sys/block/$V/md/chunk_size) = 131072 ] && [ \"\$(q65chk /dev/$V 256 9)\" = ok ]"
+qgdrop q65; rm -f $WQ/q65done.img
+fi
+# --- end of stage 65 ---
+
+# --- stage 66: the chunk change of a volume whose data a first migration moved to AllocatedSpace + 0x800 already:
+# AMD carries it out backwards - from the end, the data up to + 0x5000 (rcblob RC_SetupTransformParams @00190cd0:
+# 0x20222 | 0x2000; regions RC_TransformUpdateNextRegionFromEnd @0014d910), md as reshape_backwards. Fixture
+# 2026-11-20-rcraid-chunk-backwards (rcraid 9.3.3-00302 in emulation): a RAID0 4 x 1 and a RAID5 1 x 4 of 64K at
+# + 0x800 after a first migration by rcadm -T (q20m-first of stage 65), a RAID10 2 x 2 of 64K at + 0x800 after a
+# chunk change of ours; in every sector the pair (tag, sector number of the volume): 7 RAID0, 9 RAID5, 5 RAID10.
+# 66a - mdadm --grow <RAID5> --chunk=128: the start packet as the AMD driver lays such a migration out
+# (0x12222/0x22222, ProtectStart = capacity - ProtectSize, 0xd800), the log of a region from the end, md backwards,
+# held; stopped (-S), assembled - md from the log's mark; the end - "100 %" with ProtectStart 0, the final packet as
+# rcraid's (q21c-xs2). Refused: more disks and another chunk at once; members grown in place since.
+# 66b - rcraid's snapshot midway through such a migration of the RAID5 (the region [0x28800, 0x36000) in work): md
+# from 0x36000, the final packet = rcraid's.
+# 66c - the same for the RAID10 (our --chunk=128, regions of 0x8000); 66d - rcraid's snapshot midway through the
+# RAID10 (the region [0x18000, 0x20000)).
+# 1.5.1: such a --chunk is refused, volumes midway through it are not assembled as a backward migration.
+# shared with stage 69
+Q66D=$FIXT/2026-11-20-rcraid-chunk-backwards
+R5ID=d13cd6296c75; T10ID=d7b56f6f0525
+# q66fix <snapshot>: five disks of 8 GiB - the snapshot's metadata (LBA 0...0x6000) and the volumes' extents
+# [0x100000, + 0x9a000)
+q66fix() { local n f; qgdrop q66; mkdir -p $WQ/q66; QGL=""
+	for n in 0 1 2 3 4; do f=$WQ/q66/d$n.img; truncate -s 8G $f
+		xz -dc $Q66D/$1-sata$n-lba0-6000.img.xz | dd of=$f conv=notrunc status=none
+		f2=$Q66D/$1-sata$n-lba0x100000-9a000.img.xz
+		[ -e $f2 ] && xz -dc $f2 | dd of=$f bs=512 seek=$((0x100000)) conv=notrunc status=none
+		QGL="$QGL $(sudo losetup -f --show $f)"; done; }
+q66chk() { sudo dd if=$1 bs=1M count=$2 iflag=direct status=none | python3 -c '
+import sys, struct
+t = int(sys.argv[1]); b = sys.stdin.buffer.read()
+bad = [s for s in range(len(b) // 512) if b[s * 512:s * 512 + 512] != struct.pack("<QQ", t, s) * 32][:1]
+print("ok" if not bad and len(b) else "bad 0x%x" % (bad[0] if bad else 0))' $3; }
+q66mm() { echo check | sudo tee /sys/block/$1/md/sync_action >/dev/null; sleep 1
+	while ! grep -q idle /sys/block/$1/md/sync_action; do sleep 1; done; cat /sys/block/$1/md/mismatch_cnt; }
+q66wait() { for i in $(seq 1 300); do grep -qE 'reshape|resync|recover' /proc/mdstat || { sleep 3; grep -qE 'reshape|resync|recover' /proc/mdstat || return 0; }; sleep 1; done; return 1; }
+q66md() { cat /sys/block/$1/md/$2; }
+q66offs() { cat /sys/block/$1/md/dev-*/$2 | sort -u | tr '\n' ' '; }
+# q66final <snapshot of rcraid's end> <ID>: the LD of the live packet of that snapshot (via $WQ/q66fin.img)
+q66final() { xz -dc $Q66D/$1-sata0-lba0-6000.img.xz > $WQ/q66fin.img; qgld $WQ/q66fin.img $2; }
+q66slow() { echo 1 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null; echo $1 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null; }
+q66fast() { echo 1000 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null; echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null; }
+if want 66; then
+cd "$MDADM_DIR"
+stopall
+# 66a
+q66fix q21c-pat; qgasm; V=$(qgmd r5); $M --readwrite /dev/$V >/dev/null 2>&1
+check "66a: RAID5 64K at + 0x800: more disks and another chunk at once refused (AMD would go in place, regions md cannot keep to)" "$M --grow /dev/$V --chunk=128 --raid-devices=5 --force 2>&1 | grep -q 'in regions md cannot keep to' && [ \$(q66md $V chunk_size) = 65536 ] && [ \$(qgld $WQ/q66/d0.img $R5ID | wc -l) = 1 ]"
+G0=$(qgring $WQ/q66/d0.img | tail -1); q66slow 300
+$M --grow /dev/$V --chunk=128 > $WQ/q66/grow.out 2>&1; sleep 4
+S1=$(qgld $WQ/q66/d0.img $R5ID); T=$(qgtlog $(qgl 0) 0x145000)
+check "66a: --chunk=128: backwards (the data 0x4800 up: 0x145800 -> 0x14a000, 0x135800 -> 0x13a000 on sata3), md held, blocked" "grep -q 'chunk 64 -> 128 KiB; mdmon records it as an AMD migration, md reshapes it, the data moving 9 MiB up on each disk, from the end' $WQ/q66/grow.out && [ \$(q66md $V reshape_direction) = backwards ] && [ \"\$(q66offs $V new_offset)\" = '$((0x13a000)) $((0x14a000)) ' ] && [ \$(q66md $V sync_max) != max ] && grep -q 'external:-' /sys/block/$V/md/metadata_version"
+check "66a: start packet as the AMD driver lays such a migration out: 0x12222 at +0x800, ProtectStart = capacity - 0xd800 (0x73800), Flags 0x20010, Link 1; the LD made 0x22222, chunk 128 KiB, data at + 0x5000" "echo \"\$S1\" | head -1 | grep -q 'tt=5354 lo=5354 ts=0 cap=81000 ps=73800 .* fs=1x4 tf=12222 psz=d800 fl=20010 lk=1' && echo \"\$S1\" | tail -1 | grep -qE 'tt=0 lo=5354 ts=0 cap=81000 ps=0 .* tf=22222 psz=0 fl=0 lk=0 .*e0=[0-9a-f]+:145000[+]30000:14a000[+]2b000'"
+check "66a: the log of the region from the end: ProtectStart = IOStart at a region (ProtectSize 0xd800 from 0, the last 0x7800 up to 0x81000), I/O 0x600, the source's flags" "echo \"\$T\" | grep -qE '^5354 (79800 1 600 12222 7800 14|[0-9a-f]+ 1 600 12222 d800 24)$' && [ \$(( 0x\$(echo \$T | cut -d' ' -f2) % 0xd800 )) = 0 ]"
+sleep 15; $M -S /dev/$V >/dev/null 2>&1; sleep 1; T=$(qgtlog $(qgl 0) 0x145000); PS=$((0x$(echo $T | cut -d' ' -f2))); PZ=$((0x$(echo $T | cut -d' ' -f6)))
+check "66a: stopped midway: the log at a region below the end ($(printf %x $PS)); -E says the migration" "[ $PS -lt $((0x79800)) ] && [ \$(( $PS % 0xd800 )) = 0 ] && $M -E $(qgl 0) | grep -q 'Migration : RAID50 1 x 4, 258 MiB, 64 KiB chunk -> RAID50 1 x 4, 258 MiB, 128 KiB chunk; [0-9]*% done'"
+stopall; qgasm; V=$(qgmd r5); RS=$(q66md $V reshape_position)
+check "66a: assembled again: md goes on backwards from the log's region end ($(printf %x $((PS + PZ)))), the new offsets again, held" "[ \"\$RS\" -le $((PS + PZ)) ] && [ \"\$RS\" -ge $PS ] && [ \$(q66md $V reshape_direction) = backwards ] && [ \"\$(q66offs $V new_offset)\" = '$((0x13a000)) $((0x14a000)) ' ] && [ \$(q66md $V sync_max) != max ]"
+q66fast; q66wait; sleep 3; V=$(qgmd r5); G1=$(qgring $WQ/q66/d0.img | tail -1)
+P100=$(qgld $WQ/q66/d0.img $R5ID $((G1 - 1)))
+check "66a: \"100 %\" packet backwards: both LDs at ProtectStart 0 (rcraid's own, q21c-xs2 ring)" "echo \"\$P100\" | head -1 | grep -q 'tt=5354 lo=5354 ts=a1a6 cap=81000 ps=0 .* fl=84 lk=1 pct=186a0' && echo \"\$P100\" | tail -1 | grep -q 'tt=5354 lo=5354 ts=a1a1 cap=81000 ps=0 .* pct=186a0'"
+check "66a: done: md raid5 of 128 KiB at + 0x5000, the data as written, md check 0; the LD as rcraid ends it (q21c-xs2), the log cleared" "[ \$(q66md $V chunk_size) = 131072 ] && [ \"\$(q66offs $V offset)\" = '$((0x13a000)) $((0x14a000)) ' ] && [ \"\$(q66chk /dev/$V 256 9)\" = ok ] && [ \"\$(q66chk /dev/$(qgmd r0) 256 7)\" = ok ] && [ \$(q66mm $V) = 0 ] && [ \"\$(qgld $WQ/q66/d0.img $R5ID | sed 's/gen=[0-9a-f]* //')\" = \"\$(q66final q21c-xs2 $R5ID | sed 's/gen=[0-9a-f]* //')\" ] && [ \"\$(qgtlog $(qgl 0) 0x145000)\" = '0 0 0 0 0 0 0' ]"
+# the members grown in place since (--size): no room above for the data
+stopall; q66fix q21c-pat; qgasm; V=$(qgmd r5); $M --readwrite /dev/$V >/dev/null 2>&1; q66fast
+$M --grow /dev/$V --size=98304 >/dev/null 2>&1; sleep 2; q66wait; sleep 2
+check "66a: members grown in place since the data went down: another chunk refused (no room 9 MiB up)" "$M --grow /dev/$V --chunk=128 2>&1 | grep -q 'past the members. extents: they grew in place since' && [ \$(q66md $V chunk_size) = 65536 ]"
+# 66b
+stopall; q66fix q21c-xs1
+check "66b: rcraid's RAID5 chunk change stopped midway (the region [0x28800, 0x36000) in work, 0x12222): -E says the migration" "$M -E $(qgl 0) 2>/dev/null | grep -q 'Migration : RAID50 1 x 4, 258 MiB, 64 KiB chunk -> RAID50 1 x 4, 258 MiB, 128 KiB chunk; [0-9]*% done'"
+q66slow 300; qgasm; V=$(qgmd r5); RS=$(q66md $V reshape_position)
+check "66b: assembled: md goes on backwards from 0x36000, the data 0x4800 up, held" "[ \"\$RS\" -le $((0x36000)) ] && [ \"\$RS\" -ge $((0x28800)) ] && [ \$(q66md $V reshape_direction) = backwards ] && [ \$(q66md $V sync_max) != max ]"
+q66fast; q66wait; sleep 3; V=$(qgmd r5)
+check "66b: done: md raid5 128 KiB, the data as written, md check 0; the LD as rcraid ends it (q21c-xs2)" "[ \$(q66md $V chunk_size) = 131072 ] && [ \"\$(q66chk /dev/$V 256 9)\" = ok ] && [ \$(q66mm $V) = 0 ] && [ \"\$(qgld $WQ/q66/d0.img $R5ID)\" = \"\$(q66final q21c-xs2 $R5ID)\" ]"
+# 66c
+stopall; q66fix q21c-r10b; qgasm; V=$(qgmd t10); $M --readwrite /dev/$V >/dev/null 2>&1; q66slow 300
+$M --grow /dev/$V --chunk=128 > $WQ/q66/grow.out 2>&1; sleep 4; T=$(qgtlog $(qgl 0) 0x175000)
+check "66c: RAID10 2 x 2 64K at + 0x800 --chunk=128: backwards, held; the log of the last region (0x38000, 0x8000, I/O 0x400)" "grep -q 'the data moving 9 MiB up on each disk, from the end' $WQ/q66/grow.out && [ \$(q66md $V reshape_direction) = backwards ] && [ \$(q66md $V sync_max) != max ] && echo \"\$T\" | grep -qE '^5354 [0-9a-f]+ 1 400 12222 8000 20$'"
+sleep 10; $M -S /dev/$V >/dev/null 2>&1; sleep 1; stopall; qgasm; V=$(qgmd t10)
+check "66c: stopped, assembled again: backwards from the log, held" "[ \$(q66md $V reshape_direction) = backwards ] && [ \$(q66md $V sync_max) != max ]"
+q66fast; q66wait; sleep 3; V=$(qgmd t10)
+check "66c: done: md raid10 of 128 KiB, the data as written, md check 0; the LD as rcraid ends it (q21c-r10s2rc but for its generation)" "[ \$(q66md $V chunk_size) = 131072 ] && [ \"\$(q66chk /dev/$V 120 5)\" = ok ] && [ \$(q66mm $V) = 0 ] && [ \"\$(qgld $WQ/q66/d0.img $T10ID | sed 's/gen=[0-9a-f]* //')\" = \"\$(q66final q21c-r10s2rc $T10ID | sed 's/gen=[0-9a-f]* //')\" ]"
+# 66d
+stopall; q66fix q21c-r10xs1; q66slow 300; qgasm; V=$(qgmd t10); RS=$(q66md $V reshape_position)
+check "66d: rcraid's RAID10 256 -> 128 KiB stopped midway (region [0x18000, 0x20000)): assembled, md goes on backwards from 0x20000" "[ \"\$RS\" -le $((0x20000)) ] && [ \"\$RS\" -ge $((0x18000)) ] && [ \$(q66md $V reshape_direction) = backwards ]"
+q66fast; q66wait; sleep 3; V=$(qgmd t10)
+check "66d: done: the data as written, md check 0; the LD as rcraid ends it (q21c-r10s2rc)" "[ \$(q66md $V chunk_size) = 131072 ] && [ \"\$(q66chk /dev/$V 120 5)\" = ok ] && [ \$(q66mm $V) = 0 ] && [ \"\$(qgld $WQ/q66/d0.img $T10ID)\" = \"\$(q66final q21c-r10s2rc $T10ID)\" ]"
+q66fast; qgdrop q66; rm -f $WQ/q66fin.img
+fi
+# --- end of stage 66 ---
+
+# --- stage 67: md held (sync_max) midway through a stripe of the old layout holds a read of that stripe until it
+# gets there (raid5.c stripe_ahead_of_reshape), and the write of the suspend_lo/hi window (mddev_suspend) waits for
+# that read: mdadm waits for md, md for mdadm, for ever. It happens with a migration in place (the data at + 0x800
+# already): AMD's regions of a RAID0 are in stripes of the target (rcblob RC_TransformDynamicProtectSize @0018c310),
+# the marks midway through stripes of the source. Fixed: the window moves only where stripes of both layouts end (a
+# region that goes past the window ends on it), and the assembly takes the migration on to such a boundary itself,
+# before md runs (recover_backup_amd). Checked: a reader (4 KiB, O_DIRECT) again and again where md will stop
+# (sync_max), md slowed; a hang - mdadm 10 s in mddev_suspend, md not moving - is cleared (kill -9, sync_max max).
+# 67a - q8m-e1cmid (rcraid: RAID0 3 -> 4, a second growth, the mark at 0x29c00 - 0x80 into a stripe of the source of
+# 0x180 sectors).
+# 67b - q20m-r0s01 (rcraid: RAID0 4 -> 5 in its first stripes; past them AMD's regions end midway through stripes of
+# the source, 0x2580).
+# 67c, 67d - our --grow of the RAID0 / RAID5 4 -> 5 of that volume, mdadm killed (kill -9) with the log midway
+# through a stripe of the old layout.
+# 1.5.1: 67a hangs (cleared), 6 FAIL / 1 ok in all; 67b, 67c, 67d - not assembled, --grow refused.
+if want 67; then
+cd "$MDADM_DIR"
+stopall
+Q54D=$FIXT/2026-11-15-rcraid-migrations; Q65D=$FIXT/2026-11-19-rcraid-second-migration
+R0ID=83b23ee6ee43
+# q67pids: the mdadm processes of this tree that run a reshape (-I: assembly with Grow_continue; --grow)
+q67pids() { local p; for p in $(pgrep -f 'mdadm (-I|--grow)'); do [ "$(sudo readlink /proc/$p/exe)" = "$PWD/mdadm" ] && echo $p; done; }
+# q67slow <KiB/s> <level>: the md of the volume (that level, with disk d0) slow as soon as it has sync_speed_max
+# (in the background)
+q67slow() { ( local i m s; for i in $(seq 1 1500); do for m in $(ls /sys/block | grep ^md); do s=/sys/block/$m/md/sync_speed_max
+	[ -e $s ] && [ "$(cat /sys/block/$m/md/level 2>/dev/null)" = $2 ] && ls /sys/block/$m/slaves | grep -qx $(basename $(qgl 0)) || continue
+	echo $1 | sudo tee $s >/dev/null 2>&1 && echo 1 | sudo tee /sys/block/$m/md/sync_speed_min >/dev/null 2>&1 &&
+		grep -q "^$1 (local)" $s && exit 0; done; sleep 0.01; done ) & }
+# q67watch <md> <s>: a reader where md will stop; "ok", or "deadlock at ..." (cleared: mdadm kill -9, sync_max max)
+q67watch() { local md=$1 t=$(( $(date +%s) + $2 )) S=/sys/block/$1/md nd last="" same=0 p sus r=ok pid rp
+	[ -n "$md" ] && [ -e $S/sync_max ] || { echo "no md"; return; }
+	nd=$(( $(cut -d' ' -f1 $S/raid_disks) - 1 ))
+	sudo bash -c "end=\$(( \$(date +%s) + $2 )); while [ \$(date +%s) -lt \$end ]; do h=\$(cat $S/sync_max 2>/dev/null)
+		case \$h in [0-9]*) ;; *) break ;; esac
+		dd if=/dev/$md of=/dev/null bs=4k count=1 skip=\$(( h * $nd / 8 )) iflag=direct status=none 2>/dev/null; done" &
+	rp=$!
+	while [ $(date +%s) -lt $t ] && [ -e /proc/$rp ]; do sleep 2; p=$(cat $S/sync_completed 2>/dev/null)
+		sus=""; for pid in $(q67pids); do sudo grep -q mddev_suspend /proc/$pid/stack 2>/dev/null && sus=1; done
+		[ -n "$sus" ] && [ "$p" = "$last" ] && same=$((same + 1)) || same=0; last=$p
+		[ $same -ge 5 ] && { r="deadlock at ${p%% *} of $nd"; break; }; done
+	[ "$r" = ok ] || { for pid in $(q67pids); do sudo kill -9 $pid; done; echo max | sudo tee $S/sync_max >/dev/null; }
+	sudo kill $rp 2>/dev/null; wait $rp 2>/dev/null; echo "$r"; }
+q67wait() { for i in $(seq 1 600); do grep -qE 'reshape|resync|recover|check' /proc/mdstat || { sleep 3; grep -qE 'reshape|resync|recover|check' /proc/mdstat || return 0; }; sleep 1; done; return 1; }
+# the pattern (as in stage 65): in every sector 32 x (tag, sector number of the volume)
+q67pat() { python3 -c '
+import sys, struct
+o = sys.stdout.buffer
+for s in range(int(sys.argv[1]) * 2048): o.write(struct.pack("<QQ", int(sys.argv[2]), s) * 32)' $2 $3 |
+	sudo dd of=$1 bs=1M oflag=direct conv=notrunc status=none; }
+q67chk() { sudo dd if=$1 bs=1M count=$2 iflag=direct status=none | python3 -c '
+import sys, struct
+t = int(sys.argv[1]); b = sys.stdin.buffer.read()
+bad = [s for s in range(len(b) // 512) if b[s * 512:s * 512 + 512] != struct.pack("<QQ", t, s) * 32][:1]
+print("ok" if not bad and len(b) else "bad 0x%x" % (bad[0] if bad else 0))' $3; }
+q67over() { local n f a
+	for n in 0 1 2 3 4; do xz -dc $Q65D/$1-sata$n-lba0-6000.img.xz | sudo dd of=$(qgl $n) bs=512 oflag=direct conv=notrunc status=none
+		for f in $Q65D/$1-sata$n-lba0x*-4000.img.xz; do [ -e "$f" ] || continue; a=${f##*-lba}; a=${a%-4000.img.xz}
+			xz -dc $f | sudo dd of=$(qgl $n) bs=512 seek=$((a)) oflag=direct conv=notrunc status=none; done; done; }
+q67base() { qgfix q67 $Q65D q20m-first; qgasm; q67pat /dev/$(qgmd r0) 256 7; q67pat /dev/$(qgmd r5) 256 9; stopall; }
+# the mark of the log on <loop> at <LBA> (as amd_tlog_mark: IOStart of a dynamic region midway); "-": no log
+q67mark() { sudo dd if=$1 bs=512 skip=$(($2)) count=1 iflag=direct status=none | python3 -c '
+import sys, struct
+b = sys.stdin.buffer.read()
+if struct.unpack_from("<I", b, 0x18)[0] != 0x5354: print("-"); sys.exit()
+ps, io = struct.unpack_from("<QQ", b, 0x1c); fl, psz = struct.unpack_from("<II", b, 0x30)
+print(io if fl & 0x100 and ps < io < ps + psz else ps)'; }
+# 67a
+qgfix q67 $Q54D q8m-e1cmid
+q67slow 2000 raid4; OUT=$(for l in $QGL; do $M -I $l 2>&1; done); wait; V=$(mdof raid4 | head -1)
+check "67a: q8m-e1cmid (rcraid's RAID0 3 -> 4 in place, log at 0x29c00 - 0x80 into a stripe of the old layout): assembled, the stripes up to 0x2a000 moved first, md goes on from there" "echo \"\$OUT\" | grep -q 'subarray-0: stripes from 171008 moved as the AMD driver moves them: md goes on from 172032, where stripes of both layouts end' && [ \$(cat /sys/block/$V/md/reshape_position) -ge 172032 ]"
+R=$(q67watch "$V" 60)
+check "67a: a reader again and again where md stops (60 s, md slowed): md goes on, mdadm never waits in mddev_suspend for it ($R)" "[ '$R' = ok ]"
+qgdrop q67
+# 67b
+xz -dc $Q65D/q20m-done-sata0-lba0-6000.img.xz > $WQ/q67done.img
+q67base; q67over q20m-r0s01
+q67slow 2000 raid4; OUT=$(for l in $QGL; do $M -I $l 2>&1; done); wait; V=$(qgmd r0)
+R=$(q67watch "$V" 60)
+check "67b: q20m-r0s01 (rcraid's RAID0 4 -> 5 in its first stripes): md from 0xa00, past regions that end across old stripes (0x2580), a reader where md stops (60 s): no wait for ever ($R)" "echo \"\$OUT\" | grep -q 'md goes on from 2560' && [ '$R' = ok ]"
+[ -e /sys/block/$V/md/sync_speed_max ] && echo system | sudo tee /sys/block/$V/md/sync_speed_max /sys/block/$V/md/sync_speed_min >/dev/null
+q67wait; sleep 3; V=$(qgmd r0)
+check "67b: done: md raid0 of 5, the data as written; the LD as rcraid ends it (q20m-done)" "[ \$(cat /sys/block/$V/md/level) = raid0 ] && [ \$(cat /sys/block/$V/md/raid_disks) = 5 ] && [ \"\$(q67chk /dev/$V 256 7)\" = ok ] && [ \"\$(qgld $WQ/q67/d0.img $R0ID)\" = \"\$(qgld $WQ/q67done.img $R0ID)\" ]"
+stopall; rm -f $WQ/q67done.img
+# 67c, 67d: our --grow, md very slow; killed as soon as the log is past LogDataRange midway through a stripe of
+# the old layout
+for F in c:r0:raid4:7:100000:200:a00 d:r5:raid5:9:145000:180:600; do
+	K=${F%%:*}; F=${F#*:}; N=${F%%:*}; F=${F#*:}; LV=${F%%:*}; F=${F#*:}; TG=${F%%:*}; F=${F#*:}
+	AL=0x${F%%:*}; F=${F#*:}; SS=$((0x${F%%:*})); LDR=$((0x${F#*:}))
+	q67base; qgasm; C=$(cont1); $M /dev/$C --remove $(qgl 4) >/dev/null 2>&1; sleep 1; $M /dev/$C --add $(qgl 4) >/dev/null 2>&1; sleep 1
+	V=$(qgmd $N); [ $N = r5 ] && $M --readwrite /dev/$V >/dev/null 2>&1
+	q67slow 100 $LV; $M --grow /dev/$V --raid-devices=5 > $WQ/q67/grow.out 2>&1 &
+	G=""; TE=$(( $(date +%s) + 600 )); TS=$(( $(date +%s) + 15 ))
+	# at such a mark mdadm is stopped (SIGSTOP) and the mark read again: the log may have moved on
+	while [ $(date +%s) -lt $TE ]; do m=$(q67mark $(qgl 0) $AL)
+		if [ "$m" != - ] && [ $m -ge $LDR ] && [ $((m % SS)) != 0 ]; then
+			P=$(q67pids); [ -n "$P" ] && sudo kill -STOP $P; m=$(q67mark $(qgl 0) $AL)
+			[ $m -ge $LDR ] && [ $((m % SS)) != 0 ] && { G=$m; break; }
+			[ -n "$P" ] && sudo kill -CONT $P
+		fi
+		[ $(date +%s) -gt $TS ] && ! grep -q reshape /sys/block/$V/md/sync_action 2>/dev/null && break
+		sleep 0.01; done
+	P=$(q67pids); [ -n "$P" ] && sudo kill -9 $P
+	wait; sleep 2; stopall; OUT=$(for l in $QGL; do $M -I $l 2>&1; done); sleep 2; q67wait; sleep 3; V=$(qgmd $N)
+	check "67$K: $N --raid-devices=5, mdadm killed with the log at $G (across a stripe of the old layout, past LogDataRange): assembled, the stripes from there moved up to where stripes of both layouts end, md goes on, done - $N of 5, the data as written" "[ -n '$G' ] && echo \"\$OUT\" | grep -q 'stripes from $G moved as the AMD driver moves them' && [ \$(cat /sys/block/$V/md/raid_disks) = 5 ] && [ \"\$(q67chk /dev/$V 256 $TG)\" = ok ]"
+	if [ $N = r5 ]; then echo check | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; q67wait
+		check "67$K: md check of the RAID5 (the stripes moved at assembly with their parity): 0" "[ \$(cat /sys/block/$V/md/mismatch_cnt) = 0 ]"; fi
+done
+qgdrop q67
+fi
+# --- end of stage 67 ---
+
+# --- stage 68: chunk changes of one volume one after another, without a pause: down (the data to + 0x800,
+# forwards), at once up (backwards, to + 0x5000), at once down... - each held (md waits for the manager: sync_max not
+# max midway), in its direction and with AMD's log of a region (forwards 0x22211, backwards 0x12222); the data
+# intact, md check 0. 68c: through a pipe, mdadm --grow comes back as the migration ends, not as it starts - the
+# reshape manager (a child mdadm, Grow.c handle_forking without manage_fork_fds) keeps the output open. What is read
+# after such a pipe (md forwards, sync_max max, the log cleared) is the state after the end, not a chunk change left
+# unheld.
+if want 68; then
+cd "$MDADM_DIR"
+stopall
+Q68=$WQ/q68
+q68md() { cat /sys/block/$V/md/$1; }
+# q68mk <level>: a container of 4 disks of 1 GiB, a volume 4 x 32 MiB of 64 KiB, the data at + 0x5000; the
+# pattern (tag 6)
+q68mk() { local n l; stopall; for l in $(sudo losetup -a | grep "$Q68/" | cut -d: -f1); do sudo losetup -d $l; done
+	rm -rf $Q68; mkdir -p $Q68; L68=""
+	for n in 0 1 2 3; do truncate -s 1G $Q68/d$n.img; L68="$L68 $(sudo losetup -f --show $Q68/d$n.img)"; done
+	$M -C /dev/md/c68 -e amd -n 4 $L68 --run >/dev/null 2>&1
+	$M -C /dev/md/v68 -e amd -l$1 -n4 -c64 -z 32M $L68 --run >/dev/null 2>&1; sleep 1
+	V=$(basename $(readlink -f /dev/md/v68)); q68idle
+	python3 -c '
+import sys, struct
+o = sys.stdout.buffer
+for s in range(int(sys.argv[1]) * 2048): o.write(struct.pack("<QQ", 6, s) * 32)' $(( $(sudo blockdev --getsize64 /dev/$V) >> 20 )) |
+		sudo dd of=/dev/$V bs=1M oflag=direct status=none; }
+q68idle() { local i; for i in $(seq 1 900); do [ "$(q68md sync_action)" = idle ] && [ "$(q68md reshape_position)" = none ] && return 0; sleep 0.1; done; return 1; }
+q68chk() { sudo dd if=/dev/$V bs=1M iflag=direct status=none | python3 -c '
+import sys, struct
+b = sys.stdin.buffer.read()
+bad = [s for s in range(len(b) // 512) if b[s * 512:s * 512 + 512] != struct.pack("<QQ", 6, s) * 32][:1]
+print("ok" if not bad and len(b) else "bad 0x%x" % (bad[0] if bad else 0))'; }
+# the AMD log of member 0 (the first sector of its extent, 0x100000): "type flags"; "0 0": none
+q68log() { sudo dd if=$(echo $L68 | cut -d' ' -f1) bs=512 skip=$((0x100000)) count=1 iflag=direct status=none | python3 -c '
+import sys, struct
+b = sys.stdin.buffer.read(); print("%x %x" % (struct.unpack_from("<I", b, 0x18)[0], struct.unpack_from("<I", b, 0x30)[0]))'; }
+# q68run <level> <letter>: 64 -> 128 -> 256 -> 128 -> 64 KiB, each as soon as md ended the one before; md at
+# 4 MB/s for the first 1.5 s
+q68run() { local c i d r ok=0 n=0 want; q68mk $1; i=0	# after q68mk: stopall changes i
+	for c in 128 256 128 64; do i=$((i + 1)); [ $((i % 2)) = 1 ] && want="forwards 5354 22211" || want="backwards 5354 12222"
+		echo 4000 | sudo tee /sys/block/$V/md/sync_speed_max >/dev/null
+		$M --grow /dev/$V --chunk=$c > $Q68/g$i.out 2>&1; sleep 1.5
+		r="$(q68md sync_action) $(q68md reshape_direction) $(q68log) $(q68md sync_max)"
+		n=$((n + 1)); [ "${r% *}" = "reshape $want" ] && [ "${r##* }" != max ] && ok=$((ok + 1)) || echo "  68$2 #$i -> ${c}K: $r"
+		echo 400000 | sudo tee /sys/block/$V/md/sync_speed_max >/dev/null; q68idle; done
+	check "68$2: raid$1 64 -> 128 -> 256 -> 128 -> 64 KiB, each as md ended the one before: down forwards, up backwards, held, the AMD log of a region ($ok of $n)" "[ $ok = $n ]"
+	sleep 2; echo check | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; q68idle
+	check "68$2: done: 64 KiB at + 0x5000, the data as written, md check 0" "[ \$(q68md chunk_size) = 65536 ] && [ \"\$(cat /sys/block/$V/md/dev-*/offset | sort -u)\" = $((0x105000)) ] && [ \"\$(q68chk)\" = ok ] && [ \$(q68md mismatch_cnt) = 0 ]"; }
+q68run 10 a
+q68run 5 b
+# 68c: the output through a pipe - mdadm comes back as the migration ends (the manager keeps the output), not
+# as it starts
+q68mk 10; echo 4000 | sudo tee /sys/block/$V/md/sync_speed_max >/dev/null
+Q68T0=$(date +%s); $M --grow /dev/$V --chunk=128 2>&1 | cat > $Q68/pipe.out; Q68T1=$(date +%s)
+R="$(q68md sync_action) $(q68md reshape_direction) $(q68md sync_max) $(q68log)"
+check "68c: mdadm --grow | cat comes back as the migration ends ($((Q68T1 - Q68T0)) s: md forwards, sync_max max, the log cleared - not a reshape left unheld)" "[ $((Q68T1 - Q68T0)) -ge 8 ] && [ \"$R\" = 'idle forwards max 0 0' ] && grep -q 'the data moving 9 MiB down' $Q68/pipe.out && [ \$(q68md chunk_size) = 131072 ]"
+stopall; for l in $(sudo losetup -a | grep "$Q68/" | cut -d: -f1); do sudo losetup -d $l; done; rm -rf $Q68
+fi
+# --- end of stage 68 ---
+# --- stage 69: the chunk change backwards of stage 66 carried on by mdadm --grow --continue - as
+# mdadm-grow-continue@, the systemd unit mdadm --grow hands its reshape manager to. Real hardware (1.6 before the
+# fix): the unit failed at once - Grow.c verify_reshape_position read sync_max as counted from the start ("not
+# properly frozen"), md counts a reshape it runs backwards from the end - and md stood at 0. The suite runs
+# without the unit (MDADM_NO_SYSTEMCTL): the manager, the child of mdadm --grow, is killed here (SIGKILL) and
+# --grow --continue of the container goes on as the unit would: a) at the start (sync_max 0), b) midway (md past a
+# third), c) after -S and assembly; d) the end - 128K, the data as written, md check 0, the LD as rcraid's. The
+# fixture of 66c (q21c-r10b: a RAID10 2 x 2 of 64K at + 0x800).
+if want 69; then
+cd "$MDADM_DIR"
+stopall
+# q69cont <tag>: the manager killed, --grow --continue of the container; waits until the new manager lets md on
+# past the sync_max the killed one held it at (90 s at most: a region of 0x8000 at 1000 KB/s takes ~16 s)
+q69cont() { local c=$(grep -l '^external:amd' /sys/block/md*/md/metadata_version | head -1 | cut -d/ -f4) s0 s i
+	sudo pkill -KILL -x mdadm; sleep 0.5; s0=$(cat /sys/block/$V/md/sync_max)
+	( $M --grow --continue /dev/$c > $WQ/q66/cont$1.out 2>&1 & ); sleep 1
+	for i in $(seq 1 90); do s=$(cat /sys/block/$V/md/sync_max); [ "$s" != "$s0" ] && break; sleep 1; done
+	Q69="$s0 -> $s"; Q69UP=0; [ "$s" = max ] || [ "$s" -gt "$s0" ] 2>/dev/null && Q69UP=1; }
+q66fix q21c-r10b; qgasm; V=$(qgmd t10); $M --readwrite /dev/$V >/dev/null 2>&1; q66slow 1000
+$M --grow /dev/$V --chunk=128 > $WQ/q66/grow.out 2>&1; sleep 2
+q69cont a
+check "69a: RAID10 at + 0x800 --chunk=128 (backwards), its manager killed at the start: --grow --continue goes on (sync_max $Q69)" "grep -q 'from the end' $WQ/q66/grow.out && ! grep -qE 'not properly frozen|Cannot continue' $WQ/q66/conta.out && [ \$(q66md $V reshape_direction) = backwards ] && [ $Q69UP = 1 ] && pgrep -x mdadm >/dev/null"
+for i in $(seq 1 120); do read -r a _ b < /sys/block/$V/md/sync_completed; [ "${a:-0}" -ge $(( ${b:-1} / 3 )) ] 2>/dev/null && break; sleep 1; done
+q69cont b
+check "69b: its manager killed midway (md past a third): --grow --continue goes on (sync_max $Q69)" "! grep -qE 'not properly frozen|Cannot continue' $WQ/q66/contb.out && [ $Q69UP = 1 ] && pgrep -x mdadm >/dev/null"
+sleep 3; $M -S /dev/$V >/dev/null 2>&1; sleep 1; stopall; qgasm; V=$(qgmd t10); sleep 2
+q69cont c
+check "69c: stopped (-S), assembled, its manager killed: --grow --continue goes on backwards (sync_max $Q69)" "! grep -qE 'not properly frozen|Cannot continue' $WQ/q66/contc.out && [ \$(q66md $V reshape_direction) = backwards ] && [ $Q69UP = 1 ] && pgrep -x mdadm >/dev/null"
+q66fast; q66wait; sleep 3; V=$(qgmd t10)
+check "69d: done: md raid10 of 128 KiB, the data as written, md check 0; the LD as rcraid ends it (q21c-r10s2rc but for its generation)" "[ \$(q66md $V chunk_size) = 131072 ] && [ \"\$(q66chk /dev/$V 120 5)\" = ok ] && [ \$(q66mm $V) = 0 ] && [ \"\$(qgld $WQ/q66/d0.img $T10ID | sed 's/gen=[0-9a-f]* //')\" = \"\$(q66final q21c-r10s2rc $T10ID | sed 's/gen=[0-9a-f]* //')\" ]"
+q66fast; qgdrop q66; rm -f $WQ/q66fin.img
+fi
+# --- end of stage 69 ---
 
 # the ASRock and X399 snapshots are untouched: attached before stage 7, assembled only in stage 1
 if want 1; then

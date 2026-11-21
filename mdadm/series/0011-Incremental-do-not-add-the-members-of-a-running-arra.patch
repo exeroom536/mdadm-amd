@@ -1,7 +1,7 @@
-From 698954635ed7bd41528fd0408c8a84df99e86fe4 Mon Sep 17 00:00:00 2001
+From fb715ee5d8d76b334b181df20b5df6417fbd2054 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:52:12 +0500
-Subject: [PATCH 11/49] Incremental: do not add the members of a running array
+Subject: [PATCH 11/53] Incremental: do not add the members of a running array
  again
 
 Incremental_container() is run again for each disk that joins a container.
@@ -26,10 +26,10 @@ Written by Claude Opus 5.5, an AI model by Anthropic.
  2 files changed, 25 insertions(+)
 
 diff --git a/Assemble.c b/Assemble.c
-index 3eee3ae6..5a039f2b 100644
+index 9ee95f17..a4ae2707 100644
 --- a/Assemble.c
 +++ b/Assemble.c
-@@ -2070,6 +2070,18 @@ int assemble_container_content(struct supertype *st, int mdfd,
+@@ -2071,6 +2071,18 @@ int assemble_container_content(struct supertype *st, int mdfd,
  	for (dev = content->devs; dev; dev = dev->next) {
  		if (dev->disk.raid_disk >= 0)
  			avail[dev->disk.raid_disk] = 1;
@@ -49,10 +49,10 @@ index 3eee3ae6..5a039f2b 100644
  			if (dev->disk.raid_disk >= old_raid_disks &&
  			    content->reshape_active)
 diff --git a/Incremental.c b/Incremental.c
-index 44eed2f1..03adfa32 100644
+index e89760f6..e07df34a 100644
 --- a/Incremental.c
 +++ b/Incremental.c
-@@ -1642,6 +1642,19 @@ static int Incremental_container(struct supertype *st, char *devname,
+@@ -1643,6 +1643,19 @@ static int Incremental_container(struct supertype *st, char *devname,
  			close_fd(&mdfd);
  			continue;
  		}
