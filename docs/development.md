@@ -21,31 +21,32 @@
 
 ## The patch series
 
-`mdadm/series/` has 48 patches; each builds on its own with gcc and clang without new warnings, and together they
+`mdadm/series/` has 49 patches; each builds on its own with gcc and clang without new warnings, and together they
 give the tree of `mdadm-amd.patch`.
 
-- **1–34 change common mdadm code**, one change each.
-  - 1–5 fix bugs of upstream and apply to it as they are: `Manage_remove()` arguments swapped since 2017; an fd of
+- **1–35 change common mdadm code**, one change each.
+  - 1–6 fix bugs of upstream and apply to it as they are: `Manage_remove()` arguments swapped since 2017; an fd of
     mdmon leaked on every removal md refuses; a faulty device removed by hand that keeps a spare out for good;
     mdmon reading an array it has just freed when a member fails with a spare in the container (found with
-    AddressSanitizer); `--create` of a container failing when the bitmap question is answered yes. 2–5 were
-    reproduced with Intel IMSM.
-  - 6–10, 12, 13, 19, 20 and 21 fix other things that are not AMD-specific (6, 8, 9, 19 and 21 reproduced with
-    IMSM): among them an mdmon that is a zombie in the shutdown ramfs no longer taken for running (8), and no
-    "has wrong uuid" about the other arrays of a container when one of them is assembled (19); 17 makes
+    AddressSanitizer); `--create` of a container failing when the bitmap question is answered yes; mdmon running an
+    array again that `mdadm --stop` stopped while mdmon wrote its metadata (seen with AMD; Intel IMSM takes the same
+    path, not tried). 2–5 were reproduced with Intel IMSM.
+  - 7–11, 13, 14, 20, 21 and 22 fix other things that are not AMD-specific (7, 9, 10, 20 and 22 reproduced with
+    IMSM): among them an mdmon that is a zombie in the shutdown ramfs no longer taken for running (9), and no
+    "has wrong uuid" about the other arrays of a container when one of them is assembled (20); 18 makes
     `--create` recognise XFS, btrfs, LUKS and LVM on a device, as it does ext2/3/4 and ReiserFS.
-  - 11, 14–16, 18, 22–24, 31 and 32–34 give metadata handlers what AMD needs and export two helpers; 23 and 24
+  - 12, 15–17, 19, 23–25, 32 and 33–35 give metadata handlers what AMD needs and export two helpers; 24 and 25
     let `--grow` change the number of disks and the size of a member array that md still keeps read-only
-    (read-auto); 31 lets a format keep a member failure to the member array md failed it in, as AMD does.
-  - 25–30 let external metadata run a reshape that moves the data, as AMD's migrations do: md gets the new data
+    (read-auto); 32 lets a format keep a member failure to the member array md failed it in, as AMD does.
+  - 26–31 let external metadata run a reshape that moves the data, as AMD's migrations do: md gets the new data
     offsets the metadata records (also when the reshape goes on after a restart), the metadata handler keeps md
     behind its own log (RAID5 and RAID10), a reshape stopped before it moved anything goes on from its start, and
     the arrays of a container left midway go on one after another.
-- **35–47 add the handler step by step**: reading and assembly, mdmon, rebuilds, creation, `--add` and volume
+- **36–48 add the handler step by step**: reading and assembly, mdmon, rebuilds, creation, `--add` and volume
   updates, dedicated spares, the firmware's checks, RAIDABLE → RAID1, growing in place and RAID0 → RAID10, the md
   write-intent bitmap, more disks for a RAID5 and RAID1 → RAID5, more disks for a RAID0, the stripe size. Each stage builds
   on its own and refuses what it does not support yet before writing anything.
-- **48** documents the format in `mdadm(8)` and `mdadm.conf(5)`.
+- **49** documents the format in `mdadm(8)` and `mdadm.conf(5)`.
 
 `mdadm/upstream/` has the upstream fixes as stand-alone patches: `sha1.c` computing a wrong hash on big-endian
 hosts and the 0.90 homehost match that depends on it, the mdmon use-after-free (patch 4 of the series), and the
@@ -56,8 +57,8 @@ bitmap question for containers (patch 5).
 Build as in [install.md](install.md#building-mdadm-from-source). With the patch applied, upstream's own test suite
 runs as usual (`./test`); it needs devices of 1 GiB or more.
 
-The test suite of this project is in [tests/](../tests/README.md): 791 checks on loop devices, with the metadata of
-real disks and of the emulated board as fixtures; `sudo tests/run.sh /path/to/upstream-mdadm` runs it in about 80
+The test suite of this project is in [tests/](../tests/README.md): 797 checks on loop devices, with the metadata of
+real disks and of the emulated board as fixtures; `sudo tests/run.sh /path/to/upstream-mdadm` runs it in about 100
 minutes. Metadata dumps from other boards help most —
 `tools/amdraid_dump.py <disk> --brief --ring`, or the first 12 MiB of a member
 (`dd if=/dev/sdX of=member.img bs=512 count=$((0x6000))`).

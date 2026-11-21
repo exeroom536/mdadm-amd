@@ -5861,6 +5861,14 @@ static struct mdinfo *container_content_amd(struct supertype *st,
 	struct mdinfo *rest = NULL, **tail = &rest;
 	int vol;
 
+	/*
+	 * None loaded: Grow.c reshape_array() loads the metadata again after
+	 * the reshape, and the container may be gone by then -
+	 * reshape_container() asks for the arrays next (hardware:
+	 * mdadm-grow-continue@ SIGSEGV as the container stopped).
+	 */
+	if (!super)
+		return NULL;
 	for (vol = 0; vol < super->nvol; vol++) {
 		struct amd_vol *v = &super->vol[vol];
 		struct mdinfo *this;
@@ -11348,7 +11356,14 @@ static int amd_copy_recorded(struct amd_super *super, const void *id)
  * status_resync).  For a RAID10: raid10 records the position in
  * sync_completed only at its checkpoints (raid10.c reshape_request: every
  * 10 s, or before it would write over data not recorded as moved), never
- * while sync_max holds it.  -1 if md shows no reshape of it.
+ * while sync_max holds it.  -1 if md shows no reshape of it - or the whole
+ * array: so it shows the reshape as it cleans up after its sync thread
+ * (status_resync: MD_RECOVERY_DONE), stopped or ended.  sync_action reads
+ * reshape then, unless md was frozen first: "idle" (Grow.c abort_reshape),
+ * or md stopped again as it ran after mdadm -S, a manager waiting meanwhile
+ * (hardware: md held at 0xb0000 of 0x400000 showed 0x400000 so).  A
+ * position md really has is short of the end: md ends there with no reshape
+ * position (amd_reshape_wait).
  */
 static long long amd_mdstat_reshaped(const char *devnm)
 {
@@ -11368,13 +11383,25 @@ static long long amd_mdstat_reshaped(const char *devnm)
 		if (p)
 			p = strchr(p, '(');
 		if (p && sscanf(p, "(%llu/%llu)", &done, &max) == 2) {
-			rv = done * 2;
+			if (done < max)
+				rv = done * 2;
 			break;
 		}
 	}
 	if (f)
 		fclose(f);
 	return rv;
+}
+
+/* md runs @sra: it has a personality (md.c array_state_show) */
+static int amd_md_running(struct mdinfo *sra)
+{
+	char state[SYSFS_MAX_BUF_SIZE];
+
+	return sysfs_get_str(sra, NULL, "array_state", state,
+			     sizeof(state)) > 0 &&
+	       strncmp(state, "clear", 5) != 0 &&
+	       strncmp(state, "inactive", 8) != 0;
 }
 
 /*
@@ -11387,6 +11414,11 @@ static long long amd_mdstat_reshaped(const char *devnm)
  * where md has moved part of the region, which is copied again from the
  * log at its start, over them (q16mon).  A stopped array has no
  * sync_action (mdadm -S: md frozen, then inactive) and ends the wait.
+ * Before its sysfs goes, md clears it (md.c md_clean): no reshape
+ * position, nothing synced, as at the end of the reshape - but no
+ * personality (array_state "clear" or "inactive").  Taken for the end,
+ * the next region would be logged as reached, the one md stopped in
+ * never moved after.
  */
 static int amd_reshape_wait(struct mdinfo *sra, int fd, unsigned long long to,
 			    int raid10)
@@ -11403,17 +11435,25 @@ static int amd_reshape_wait(struct mdinfo *sra, int fd, unsigned long long to,
 			return -1;
 		if (!raid10 && !str_is_none(buf))
 			done = strtoull(buf, NULL, 10);
-		if (done >= 0 && (unsigned long long)done >= to)
-			return 0;
 		/* no sync_action: the array is stopped (it may be assembled again) */
 		if (sysfs_get_str(sra, NULL, "sync_action", action,
 				  sizeof(action)) <= 0 ||
 		    sysfs_get_str(sra, NULL, "reshape_position", pos,
 				  sizeof(pos)) <= 0)
 			return -1;
+		/*
+		 * raid10's progress in /proc/mdstat holds only while md
+		 * reshapes: stopped (mdadm -S) as it waited at a region's
+		 * end, it showed the next region done, which it never wrote
+		 * (q21chunk: RAID10 moving its data up).  Read before the
+		 * state: frozen first, md interrupts the reshape after.
+		 */
+		if (done >= 0 && (unsigned long long)done >= to &&
+		    (!raid10 || strncmp(action, "reshape", 7) == 0))
+			return 0;
 		if (strncmp(action, "reshape", 7) != 0) {
 			if (str_is_none(buf) && str_is_none(pos))
-				return 0;
+				return amd_md_running(sra) ? 0 : -1;
 			/*
 			 * mdadm -S freezes md first, and the array goes with
 			 * no event on sync_completed: seen at once, before
@@ -11613,7 +11653,7 @@ static int manage_reshape_amd(int afd, struct mdinfo *sra,
 	struct amd_super *super = st->sb;
 	int vol = super ? amd_devnm_volume(super, sra->sys_name) : -1;
 	unsigned long long data = reshape->after.data_disks, unit = data;
-	unsigned long long region, end, mark, next, logged;
+	unsigned long long region, end, mark, next;
 	struct amd_vol *v;
 	int fd, i, ok = 1;
 	__u64 id;
@@ -11635,14 +11675,17 @@ static int manage_reshape_amd(int afd, struct mdinfo *sra,
 	}
 	end = sra->component_size * data;
 	/*
-	 * The mark of the log md goes on from (amd_reshape_content), or 0 -
-	 * never behind the log on the disks: the source of the data below
-	 * that mark is overwritten already, should Grow.c give a lower one.
+	 * From the log on the disks, as md after assembly
+	 * (amd_reshape_content), or 0: below it the source of the data is
+	 * overwritten already, and above it the region md is in is not moved
+	 * all yet.  Not from Grow.c's mark: going on with a reshape md runs
+	 * already (mdadm-grow-continue@, started by udev as md came back
+	 * after mdadm -S, its manager gone), it takes the sync_max that
+	 * manager held md at for where md is (verify_reshape_position) - the
+	 * end of a region md may not have reached.  Logged there, the rest of
+	 * that region would never be moved.
 	 */
-	mark = sra->reshape_progress;
-	logged = amd_tlog_scan(super, v, v->link, AMD_TRANSFORM_NORMAL, 1);
-	if (logged > mark)
-		mark = logged;
+	mark = amd_tlog_scan(super, v, v->link, AMD_TRANSFORM_NORMAL, 1);
 	fd = sysfs_get_fd(sra, NULL, "sync_completed");
 	if (!is_fd_valid(fd))
 		return 0;

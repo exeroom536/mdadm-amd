@@ -26,7 +26,7 @@ refused() { "$@"; local r=$?; [ $r != 0 ] && [ $r -lt 128 ]; }
 # for two machines at once: the second runs the stages in PART2, the first all others (a new stage not listed
 # in PART2 goes to the first). A stage prepares its own images; helpers needed by other stages too are defined outside "if want ...",
 # so any set of stages gets them.
-PART2="7c 7d 10c 15 9b 17 20 21 32 34 36 38 53 55 56 57 58 59 60 61"
+PART2="7c 7d 10c 15 9b 17 20 21 32 34 36 38 53 55 56 57 58 59 60 61 62 63 64"
 SEEN=" "
 want() {	# want <stage>: the stage is selected (SEEN: all stages asked about, to check the ids at the end)
 	SEEN="$SEEN$1 "
@@ -1426,7 +1426,7 @@ stopall; for n in g0 g1; do sudo losetup -d $(gnl $n); done; rm -f $WQ/gn/*.img
 fi
 # --- end of stage 13c ---
 
-# --- stage 14: -As with the stale disk first in the scan (patch 9 "Assemble: look at every slotless device…"):
+# --- stage 14: -As with the stale disk first in the scan (patch 21 "Assemble: look at every slotless device…"):
 # members of an AMD container have no slot, Assemble.c looked for the newest disk only at even places of best[]:
 # "No suitable drives found". So Debian 13 failed to boot from the volume after a boot without a disk (initramfs: mdadm -As by
 # mdadm.conf, on the emulated board). Here the same on loop: the stale one first in DEVICE, ARRAY from -Es, as Debian mkconf writes.
@@ -5980,6 +5980,264 @@ check "61e: a configuration write fails on d2: it stays stale ($G2 -> $(q61gen 2
 q61drop
 fi
 # --- end of stage 61 ---
+
+# --- stage 62: a RAID10 stopped (mdadm -S) midway through a chunk change. The reshape manager takes raid10's
+# progress from /proc/mdstat (amd_mdstat_reshaped), and while md cleans up a reshape it has interrupted (md.c
+# status_resync: MD_RECOVERY_DONE, "Still cleaning up") /proc/mdstat shows the whole array done for some 15 ms,
+# sync_action frozen already. 1.5 took that for the end of the region: the log went a region ahead, md never moved
+# that region, and after assembly it stayed in the old layout - the data wrong, md check 0. The manager looks every
+# 100 ms and does not always hit the window: 9 of 50 random stops of a RAID10 2 x 2 (64 -> 128 and 256 -> 128 KiB,
+# 32 MiB a member) went wrong with 1.5, 2 and 1 of 18 tries in this stage. Fixed: the progress from mdstat only
+# while sync_action is "reshape", the end only of an array md runs (array_state not "clear" or "inactive").
+# Here: a RAID10 2 x 2 of 64 KiB, 32 MiB a member, the sector number in every sector, md at 2000 KB/s, -S 3 to
+# 14 s after --grow --chunk=128, assembled, run to the end, the whole volume read, md check; Q62N tries (default 24,
+# about 10 minutes) - with 1.5 at least one goes wrong with a probability of 86 to 97 % (8 to 14 % a try).
+if want 62; then
+cd "$MDADM_DIR"
+stopall
+Q62N=${Q62N:-24}
+# q62pat fill|check <md> [<sectors>]: in each sector s the pair (5, s) of 8-byte numbers; fill prints the number
+# of sectors, check the number of sectors that differ (and the first and last of them)
+q62pat() { sudo python3 - "$@" <<'PY'
+import os, struct, sys
+op, dev = sys.argv[1], "/dev/" + sys.argv[2]
+fd = os.open(dev, os.O_RDWR if op == "fill" else os.O_RDONLY)
+n = int(sys.argv[3]) if op == "check" else os.lseek(fd, 0, 2) // 512
+os.lseek(fd, 0, 0); s = 0; bad = []
+while s < n:
+    k = min(2048, n - s); want = b"".join(struct.pack("<QQ", 5, x) * 32 for x in range(s, s + k))
+    if op == "fill": os.write(fd, want)
+    else:
+        b = os.read(fd, k * 512)
+        if b != want: bad += [x for x in range(s, s + k) if b[(x - s) * 512:(x - s + 1) * 512] != want[(x - s) * 512:(x - s + 1) * 512]]
+    s += k
+if op == "fill": os.fsync(fd); print(n)
+else: print("%d%s" % (len(bad), "_0x%x-0x%x" % (bad[0], bad[-1]) if bad else ""))
+PY
+}
+q62wait() { for i in $(seq 1 300); do grep -qE 'resync|recover|check|reshape' /proc/mdstat || { sleep 2; grep -qE 'resync|recover|check|reshape' /proc/mdstat || return 0; }; sleep 1; done; return 1; }
+Q62R=""; Q62OK=0
+for q62i in $(seq 1 $Q62N); do
+	qgmk q62 4 1
+	echo 1000 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null; echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+	$M -C /dev/md/amd62 -e amd -n 4 $(qgl 0) $(qgl 1) $(qgl 2) $(qgl 3) --run >/dev/null 2>&1
+	$M -C /dev/md/r62 -e amd -l10 -n4 -c64 -z 32M $(qgl 0) $(qgl 1) $(qgl 2) $(qgl 3) --run >/dev/null 2>&1
+	sleep 1; waitrec; V=$(qgmd r62); [ -n "$V" ] || { Q62R="$Q62R $q62i:no-volume"; continue; }
+	NS=$(q62pat fill $V)
+	echo 1 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null; echo 2000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+	$M --grow /dev/$V --chunk=128 >/dev/null 2>&1
+	sleep $((3 + RANDOM % 12)); $M -S /dev/$V >/dev/null 2>&1; sleep 1
+	Q62L=$(qgtlog $(qgl 0) 0x100000 | cut -d" " -f2)
+	stopall; qgasm; V=$(qgmd r62)
+	echo 1000 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null; echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+	q62wait; sleep 2
+	B=$(q62pat check $V $NS); echo check | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; q62wait
+	C=$(cat /sys/block/$V/md/chunk_size); MM=$(cat /sys/block/$V/md/mismatch_cnt)
+	[ "$C" = 131072 ] && [ "$B" = 0 ] && [ "$MM" = 0 ] && Q62OK=$((Q62OK + 1)) || Q62R="$Q62R $q62i:log=0x$Q62L,chunk=$C,bad=$B,mm=$MM"
+done
+check "62: RAID10 2 x 2 --chunk=128 stopped (-S) midway, $Q62N times: assembled, done - 128 KiB, the data as written, md check 0 every time ($Q62OK of $Q62N;$Q62R)" "[ $Q62OK = $Q62N ]"
+qgdrop q62
+fi
+# --- end of stage 62 ---
+
+# --- stage 63: a RAID10 stopped (mdadm -S) midway through a chunk change goes on after assembly. Grow.c
+# start_reshape() holds md where the reshape goes on from: sync_max = reshape_progress / data_disks, as for a RAID5,
+# whose reshape md counts in sectors of a member; md counts that of a RAID10 in sectors of the array (raid10.c
+# reshape_request), and the data_disks of a RAID10 are all its disks (analyse_change). On a RAID10 of 3 x 2 the AMD
+# region is 0x7f80 (64 KiB) or 0x7e00 (256 KiB) sectors, and at an odd region mark the quotient is no multiple of
+# the chunk: md.c max_sync_store - EINVAL, "Cannot continue reshape", the volume stays read-only and md reads the
+# part it moved wrong (raid10.c choose_data_offset: the old data offset with the new geometry while no reshape
+# runs). A 2 x 2 (region 0x8000, the quotient a multiple of the chunk) went on by chance. Here: RAID10 3 x 2
+# 64 -> 128 and 256 -> 64 KiB, 2 x 2 64 -> 128 (control), 32 MiB a member, the sector number in every sector, md at
+# 2000 KB/s, -S at different places (midway through regions 0 to 4 - from 0 the reshape goes on another way,
+# Assemble.c; "edge": md at the end of a region, waiting for the log), assembled; checked: the volume went on (not
+# read-only, md reshaping), reached the new chunk, the data as written, md check 0. How many marks were odd is in
+# the output; about 9 minutes.
+if want 63; then
+cd "$MDADM_DIR"
+stopall
+# q63pat fill|check <md> [<sectors>]: in each sector s the pair (5, s) of 8-byte numbers; fill prints the number
+# of sectors, check the number of sectors that differ (and the first and last of them)
+q63pat() { sudo python3 - "$@" <<'PY'
+import os, struct, sys
+op, dev = sys.argv[1], "/dev/" + sys.argv[2]
+fd = os.open(dev, os.O_RDWR if op == "fill" else os.O_RDONLY)
+n = int(sys.argv[3]) if op == "check" else os.lseek(fd, 0, 2) // 512
+os.lseek(fd, 0, 0); s = 0; bad = []
+while s < n:
+    k = min(2048, n - s); want = b"".join(struct.pack("<QQ", 5, x) * 32 for x in range(s, s + k))
+    if op == "fill": os.write(fd, want)
+    else:
+        b = os.read(fd, k * 512)
+        if b != want: bad += [x for x in range(s, s + k) if b[(x - s) * 512:(x - s + 1) * 512] != want[(x - s) * 512:(x - s + 1) * 512]]
+    s += k
+if op == "fill": os.fsync(fd); print(n)
+else: print("%d%s" % (len(bad), "_0x%x-0x%x" % (bad[0], bad[-1]) if bad else ""))
+PY
+}
+q63busy() { grep -qE 'resync|recover|check|reshape' /proc/mdstat; }
+q63wait() { for i in $(seq 1 300); do q63busy || { sleep 2; q63busy || return 0; }; sleep 1; done; return 1; }
+# q63stop <md> mid|edge <K>: mdadm -S once md is midway through region K (0 the first; a region lies between the
+# values of sync_max the manager sets) or (edge) has reached the end of region K - 1 and waits at sync_max; prints where
+q63stop() { sudo python3 - "$@" <<'PY'
+import re, subprocess, sys, time
+md, how, k = sys.argv[1], sys.argv[2], int(sys.argv[3]); ends = [0]; t0 = time.time()
+def rd(a):
+    try: return open("/sys/block/%s/md/%s" % (md, a)).read().strip()
+    except OSError: return ""
+while time.time() - t0 < 300:
+    mx = rd("sync_max")
+    if mx.isdigit() and int(mx) > ends[-1]: ends.append(int(mx))
+    m = re.search(r"reshape =\s*[0-9.]+% \((\d+)/", open("/proc/mdstat").read().split(md + " :", 1)[-1].split("\n\n")[0])
+    d = int(m.group(1)) * 2 if m else -1
+    n = len(ends) - 1	# the region md is let on to the end of
+    if (how == "mid" and n == k + 1 and d >= (ends[-2] + ends[-1]) // 2) or (how == "edge" and n == k and d >= ends[-1]):
+        subprocess.run(["sudo", "-E", "./mdadm", "-S", "/dev/" + md], capture_output=True)
+        print("%s%d@0x%x" % (how, k, d)); sys.exit(0)
+    time.sleep(0.02)
+subprocess.run(["sudo", "-E", "./mdadm", "-S", "/dev/" + md], capture_output=True); print("%s%d@timeout" % (how, k))
+PY
+}
+# q63one <disks> <chunk> <new chunk> mid|edge <K>: one try; Q63R the failures, Q63OK, Q63ODD, Q63AT where stopped
+q63one() { local nd=$1 c1=$2 c2=$3 how=$4$5 V NS L RO B C MM i ls=""
+	qgmk q63 $nd 1
+	for i in $(seq 0 $((nd - 1))); do ls="$ls $(qgl $i)"; done
+	echo 1000 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null; echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+	$M -C /dev/md/amd63 -e amd -n $nd $ls --run >/dev/null 2>&1
+	$M -C /dev/md/r63 -e amd -l10 -n$nd -c$c1 -z 32M $ls --run >/dev/null 2>&1
+	sleep 1; waitrec; V=$(qgmd r63); [ -n "$V" ] || { Q63R="$Q63R ${nd}d$c1-$how:no-volume"; return; }
+	NS=$(q63pat fill $V)
+	echo 1 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null; echo 2000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+	$M --grow /dev/$V --chunk=$c2 >/dev/null 2>&1
+	Q63AT="$Q63AT $(q63stop $V $4 $5)"
+	sleep 1; L=$(qgtlog $(qgl 0) 0x100000 | cut -d" " -f2)
+	stopall; qgasm; V=$(qgmd r63); sleep 3
+	# went on: not read-only, md reshaping (or done already)
+	RO=$(cat /sys/block/$V/md/array_state 2>/dev/null)/$(cat /sys/block/$V/md/sync_action 2>/dev/null)
+	echo 1000 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null; echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+	q63wait; sleep 2
+	B=$(q63pat check $V $NS); echo check | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; q63wait
+	C=$(cat /sys/block/$V/md/chunk_size); MM=$(cat /sys/block/$V/md/mismatch_cnt)
+	# an odd region mark of a 3 x 2 is where 1.5 did not go on (divided by 6, no multiple of the chunk)
+	[ $nd = 6 ] && [ -n "$L" ] && [ $(((0x$L / (c1 == 64 ? 0x7f80 : 0x7e00)) % 2)) = 1 ] && Q63ODD=$((Q63ODD + 1))
+	case $RO in readonly/*|*/idle|*/frozen) [ "$C" = $((c2 * 1024)) ] || RO="stuck:$RO";; esac
+	[ "$C" = $((c2 * 1024)) ] && [ "$B" = 0 ] && [ "$MM" = 0 ] && case $RO in stuck:*) false;; *) true;; esac &&
+		Q63OK=$((Q63OK + 1)) || Q63R="$Q63R ${nd}d$c1-$how:log=0x$L,after=$RO,chunk=${C%% *},bad=$B,mm=$MM"
+}
+Q63R=""; Q63OK=0; Q63ODD=0; Q63N=0; Q63AT=""
+for q63s in "mid 0" "mid 1" "mid 2" "mid 3" "mid 4" "edge 2" "edge 3"; do q63one 6 64 128 $q63s; Q63N=$((Q63N + 1)); done
+for q63s in "mid 1" "mid 2" "edge 3"; do q63one 6 256 64 $q63s; Q63N=$((Q63N + 1)); done
+echo "63: RAID10 3 x 2 stopped at$Q63AT"
+check "63: RAID10 3 x 2 --chunk 64 -> 128 and 256 -> 64 stopped (-S) midway, $Q63N times ($Q63ODD at an odd region mark): goes on after assembly, done - the new chunk, the data as written, md check 0 every time ($Q63OK of $Q63N;$Q63R)" "[ $Q63OK = $Q63N ] && [ $Q63ODD -gt 0 ]"
+Q63R=""; Q63OK=0; Q63N=0; Q63AT=""
+for q63s in "mid 1" "mid 2" "edge 2"; do q63one 4 64 128 $q63s; Q63N=$((Q63N + 1)); done
+echo "63: RAID10 2 x 2 stopped at$Q63AT"
+check "63: RAID10 2 x 2 --chunk 64 -> 128 stopped midway, $Q63N times: the same ($Q63OK of $Q63N;$Q63R)" "[ $Q63OK = $Q63N ]"
+qgdrop q63
+fi
+# --- end of stage 63 ---
+
+# --- stage 64: a RAID10 2 x 2, the chunk changed 64 -> 128: the AMD log does not get ahead of md (real hardware: md
+# stood at 0x140100, and after assembly it went on from 0x290000 - a third of the volume left in the old layout).
+# a) A second manager on the running volume. After mdadm -S, mdmon ran the volume again (its "active" for the
+#    write-pending state came after "inactive"), the manager before left (its sync_completed was of the stopped
+#    volume), and udev started mdadm-grow-continue@ by MD_RESHAPE_ACTIVE. That one took the sync_max the manager
+#    before held md at (the end of a region) for where md was, twice it (Grow.c verify_reshape_position: a RAID10's
+#    sync_max is in sectors of the array), and wrote the log there. Here the same without the restart: the manager
+#    killed (SIGKILL), mdadm --grow --continue of the container, -S 1 s later. Before the fix: the log at
+#    2 x sync_max, after assembly the part [where md was, that mark) wrong - every time.
+# b) md interrupted unfrozen ("idle" in sync_action, as Grow.c abort_reshape interrupts it): for some 15 ms
+#    /proc/mdstat shows the whole array with sync_action "reshape", which the manager took for the end of a region.
+#    It hardly ever hit that window (the sync_completed event wakes it before, the next look is 100 ms later; 0 of
+#    about 20 in a VM): here, that the manager goes through such interruptions with the data intact.
+# c) mdmon does not run a volume mdadm -S stopped again: no "active with" of the volume in the kernel log after -S.
+# Each try: a fresh volume, 64 MiB a member (with 32 MiB the doubled mark of a) is the end of the volume already and
+# no log is written), the sector number in every sector, assembled, run to the end, the whole volume read, chunk
+# 128K, md check 0. Q64A, Q64B, Q64C tries (3, 2, 5); about 8 minutes.
+if want 64; then
+cd "$MDADM_DIR"
+stopall
+Q64A=${Q64A:-3}; Q64B=${Q64B:-2}; Q64C=${Q64C:-5}
+# q64pat fill|check <md> [<sectors>]: in each sector s the pair (5, s) of 8-byte numbers; fill prints the number
+# of sectors, check the number of sectors that differ (and the first and last of them)
+q64pat() { sudo python3 - "$@" <<'PY'
+import os, struct, sys
+op, dev = sys.argv[1], "/dev/" + sys.argv[2]
+fd = os.open(dev, os.O_RDWR if op == "fill" else os.O_RDONLY)
+n = int(sys.argv[3]) if op == "check" else os.lseek(fd, 0, 2) // 512
+os.lseek(fd, 0, 0); s = 0; bad = []
+while s < n:
+    k = min(2048, n - s); want = b"".join(struct.pack("<QQ", 5, x) * 32 for x in range(s, s + k))
+    if op == "fill": os.write(fd, want)
+    else:
+        b = os.read(fd, k * 512)
+        if b != want: bad += [x for x in range(s, s + k) if b[(x - s) * 512:(x - s + 1) * 512] != want[(x - s) * 512:(x - s + 1) * 512]]
+    s += k
+if op == "fill": os.fsync(fd); print(n)
+else: print("%d%s" % (len(bad), "_0x%x-0x%x" % (bad[0], bad[-1]) if bad else ""))
+PY
+}
+q64wait() { for i in $(seq 1 300); do grep -qE 'resync|recover|check|reshape' /proc/mdstat || { sleep 2; grep -qE 'resync|recover|check|reshape' /proc/mdstat || return 0; }; sleep 1; done; return 1; }
+q64spd() { echo $1 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null; echo $2 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null; }
+q64pos() { grep -A3 "^$1 :" /proc/mdstat | grep -o 'reshape = [^(]*([0-9]*' | grep -o '[0-9]*$'; }	# where md is, KiB
+# q64mk: a fresh RAID10 2 x 2 of 64K "r64", 64 MiB a member, the pattern written, the chunk change to 128K started
+# slowly (md at 1000 KB/s)
+q64mk() { qgmk q64 4 1; q64spd 1000 400000
+	$M -C /dev/md/amd64 -e amd -n 4 $(qgl 0) $(qgl 1) $(qgl 2) $(qgl 3) --run >/dev/null 2>&1
+	$M -C /dev/md/r64 -e amd -l10 -n4 -c64 -z 64M $(qgl 0) $(qgl 1) $(qgl 2) $(qgl 3) --run >/dev/null 2>&1
+	sleep 1; waitrec; V=$(qgmd r64); [ -n "$V" ] || return 1
+	NS=$(q64pat fill $V); q64spd 1 1000
+	$M --grow /dev/$V --chunk=128 >/dev/null 2>&1; }
+# q64end: assembled, run to the end, the pattern and md check; Q64E what is wrong (empty: all ok)
+q64end() { local b c mm
+	stopall; q64spd 1 1000; qgasm; V=$(qgmd r64); q64spd 1000 400000; q64wait; sleep 2
+	b=$(q64pat check $V $NS); echo check | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; q64wait
+	c=$(cat /sys/block/$V/md/chunk_size); mm=$(cat /sys/block/$V/md/mismatch_cnt)
+	Q64E=""; [ "$c" = 131072 ] && [ "$b" = 0 ] && [ "$mm" = 0 ] || Q64E="chunk=$c,bad=$b,mm=$mm"; }
+# a) a second manager: md in the second region or further (at 0x8100 or past it), the manager killed,
+# --grow --continue, -S
+Q64R=""; Q64OK=0
+for q64i in $(seq 1 $Q64A); do
+	q64mk || { Q64R="$Q64R $q64i:no-volume"; continue; }
+	for i in $(seq 1 60); do P=$(q64pos $V); [ "${P:-0}" -ge $((0x8100 / 2)) ] && break; sleep 0.5; done
+	P=$(( ${P:-0} * 2 )); S=$(cat /sys/block/$V/md/sync_max)
+	sudo pkill -KILL -x mdadm; sleep 0.5
+	( $M --grow --continue /dev/$(qgmd amd64) >/dev/null 2>&1 & ); sleep 1
+	$M -S /dev/$V >/dev/null 2>&1; sleep 1
+	L=$((0x$(qgtlog $(qgl 0) 0x100000 | cut -d" " -f2)))
+	q64end
+	[ $L -le $P ] && [ -z "$Q64E" ] && Q64OK=$((Q64OK + 1)) ||
+		Q64R="$Q64R $q64i:md=$(printf 0x%x $P),sync_max=$(printf 0x%x $S),log=$(printf 0x%x $L),$Q64E"
+done
+check "64a: RAID10 2 x 2 --chunk=128, its manager killed, --grow --continue on the running volume, -S: the AMD log not ahead of md, assembled, done - 128 KiB, the data as written, md check 0 ($Q64OK of $Q64A;$Q64R)" "[ $Q64OK = $Q64A ]"
+# b) md interrupted unfrozen while the manager waits: "idle" 4 times, 10 to 90 ms apart, then -S
+Q64R=""; Q64OK=0
+for q64i in $(seq 1 $Q64B); do
+	q64mk || { Q64R="$Q64R $q64i:no-volume"; continue; }
+	sleep $((3 + RANDOM % 5))
+	for i in 1 2 3 4; do echo idle | sudo tee /sys/block/$V/md/sync_action >/dev/null 2>&1; sleep 0.0$((RANDOM % 9 + 1)); done
+	sleep 0.5; $M -S /dev/$V >/dev/null 2>&1; sleep 1
+	L=$(qgtlog $(qgl 0) 0x100000 | cut -d" " -f2)
+	q64end
+	[ -z "$Q64E" ] && Q64OK=$((Q64OK + 1)) || Q64R="$Q64R $q64i:log=0x$L,$Q64E"
+done
+check "64b: RAID10 2 x 2 --chunk=128, md interrupted unfrozen (sync_action idle) 4 times, then -S: assembled, done - 128 KiB, the data as written, md check 0 ($Q64OK of $Q64B;$Q64R)" "[ $Q64OK = $Q64B ]"
+# c) -S midway: mdmon does not run the volume again (no "active with" after -S), the data intact
+Q64R=""; Q64OK=0; Q64RS=0
+for q64i in $(seq 1 $Q64C); do
+	q64mk || { Q64R="$Q64R $q64i:no-volume"; continue; }
+	# a mark in the kernel log: its ring is full by now, counting lines would not do
+	sleep $((3 + RANDOM % 8)); K="q64c $q64i $RANDOM"; echo "$K" | sudo tee /dev/kmsg >/dev/null
+	$M -S /dev/$V >/dev/null 2>&1; sleep 1
+	RS=$(sudo dmesg | sed -n "/$K\$/,\$p" | grep -c "raid10:$V: active with")
+	q64end
+	[ $RS = 0 ] || Q64RS=$((Q64RS + 1))
+	[ $RS = 0 ] && [ -z "$Q64E" ] && Q64OK=$((Q64OK + 1)) || Q64R="$Q64R $q64i:restarted=$RS,$Q64E"
+done
+check "64c: RAID10 2 x 2 --chunk=128 stopped (-S) midway: mdmon does not run it again ($Q64RS of $Q64C run again), assembled, done, the data as written ($Q64OK of $Q64C;$Q64R)" "[ $Q64OK = $Q64C ]"
+qgdrop q64
+fi
+# --- end of stage 64 ---
 
 # the ASRock and X399 snapshots are untouched: attached before stage 7, assembled only in stage 1
 if want 1; then

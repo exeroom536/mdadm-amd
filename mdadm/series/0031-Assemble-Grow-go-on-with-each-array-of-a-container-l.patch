@@ -1,0 +1,126 @@
+From 5ebb2740a532c028fd6247d98c348e66e2db2552 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:53:16 +0500
+Subject: [PATCH 31/49] Assemble, Grow: go on with each array of a container
+ left midway
+
+reshape_container() reshapes the arrays of a container that have a
+reshape in the metadata one after another: once one is done, it takes
+the next as a new reshape (restart 0).  With IMSM one array migrates at
+a time, and the next one only once mdmon has switched the migration
+over to it: md has no reshape of it yet.
+
+The AMD driver (AMD RAIDXpert2, later in this series) migrates several
+volumes of a container at once and may leave them all midway.  Each of
+them that assemble_container_content() starts, Grow_continue() takes
+up: two mdadm then reshape the same array (reshape_container() picks the
+first active one in the container), and the other is taken as a new
+reshape later, over the reshape md has of it - md started on it unheld,
+from where it was.
+
+Leave an array to the mdadm that reshapes another one of its container
+already, holding md where it is meanwhile (sync_max, as start_reshape()
+sets it to go on with the reshape - a RAID10 at the position itself, as
+md counts its reshape in sectors of the array; the array stays read-only
+and blocked for mdmon).  reshape_container() goes on with an array md
+has the reshape of in hand - it was started with the reshape position of
+the metadata - as with a restart, the way Grow_continue() would have.
+For IMSM neither holds (md has no reshape of the next array), and it
+goes on as before.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Assemble.c | 49 ++++++++++++++++++++++++++++++++++++++++++++++++-
+ Grow.c     |  9 +++++++++
+ 2 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/Assemble.c b/Assemble.c
+index 71b45e73..22dc4924 100644
+--- a/Assemble.c
++++ b/Assemble.c
+@@ -2042,6 +2042,28 @@ static bool reshape_moves_data(struct mdinfo *content)
+ 	return false;
+ }
+ 
++/*
++ * md has the reshape of another array of @container than @devnm in hand:
++ * the mdadm that goes on with it goes on with the other arrays of the
++ * container next (reshape_container()).
++ */
++static bool container_reshape_pending(char *container, char *devnm)
++{
++	struct mdstat_ent *mdstat = mdstat_read(0, 0), *ent;
++	unsigned long long position;
++	bool pending = false;
++	struct mdinfo sra;
++
++	for (ent = mdstat; ent && !pending; ent = ent->next)
++		if (is_container_member(ent, container) &&
++		    strcmp(ent->devnm, devnm) != 0 &&
++		    sysfs_init(&sra, -1, ent->devnm) == 0)
++			pending = sysfs_get_ll(&sra, NULL, "reshape_position",
++					       &position) == 0;
++	free_mdstat(mdstat);
++	return pending;
++}
++
+ int assemble_container_content(struct supertype *st, int mdfd,
+ 			       struct mdinfo *content, struct context *c,
+ 			       char *chosen_name, int *result)
+@@ -2293,7 +2315,32 @@ int assemble_container_content(struct supertype *st, int mdfd,
+ 				st->update_tail = &st->updates;
+ 		}
+ 
+-		err = Grow_continue(mdfd, st, content, 0, c);
++		/*
++		 * One mdadm reshapes the arrays of a container, one after
++		 * another.  If md has the reshape of another in hand, its
++		 * mdadm goes on with this one next.  Until then md holds it
++		 * where it is, should it be made writable: sync_max as
++		 * start_reshape() sets it to go on.
++		 */
++		if (st->ss->external &&
++		    container_reshape_pending(st->container_devnm,
++					      content->sys_name)) {
++			/* md counts a RAID10 reshape in sectors of the array */
++			int data = content->array.level == 10 ? 1 :
++				   get_data_disks(content->array.level,
++						  content->new_layout,
++						  content->array.raid_disks);
++			unsigned long long held = 0;
++
++			if (data > 0)
++				held = content->reshape_progress / data;
++			err = sysfs_set_num(content, NULL, "sync_max", held);
++			if (!err && c->verbose >= 0)
++				pr_err("%s: its reshape goes on after that of another array of the container\n",
++				       chosen_name);
++		} else {
++			err = Grow_continue(mdfd, st, content, 0, c);
++		}
+ 	} else switch(content->array.level) {
+ 		case LEVEL_LINEAR:
+ 		case LEVEL_MULTIPATH:
+diff --git a/Grow.c b/Grow.c
+index a98af024..d09416c7 100644
+--- a/Grow.c
++++ b/Grow.c
+@@ -4038,6 +4038,15 @@ int reshape_container(char *container, char *devname,
+ 		if (mdmon_running(container))
+ 			flush_mdmon(container);
+ 
++		/*
++		 * Assembled while another array of the container was being
++		 * reshaped, this one waits midway, held where it is
++		 * (assemble_container_content()): go on with it from there,
++		 * as Grow_continue() would have.
++		 */
++		if (!restart && md_reshape_pending(content))
++			restart = 1 | content->reshape_active;
++
+ 		rv = reshape_array(container, fd, adev, st,
+ 				   content, c->force, NULL, INVALID_SECTORS,
+ 				   c->backup_file, c->verbose, 1, restart);
+-- 
+2.47.3
+

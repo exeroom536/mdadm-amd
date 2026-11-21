@@ -109,6 +109,13 @@ started. No SELinux denials. The tree the script lays out is the same, file for 
   Normal, `md` check clean, the data the same. Linux booted twice from its RAID1 volume with this release (kernel
   7.3.1): `mdmon` took over from the initramfs, no resync, shutdown without waiting for `mdmon`, `md` check of the
   Linux and the Windows volume clean.
+- 1.5.1, kernel 7.3.5, a RAID10 of two HDDs and two SATA SSDs (1 GiB per disk) with each sector holding its own
+  number, stripe size 64 → 128 KiB: before the fix such a volume stopped with `mdadm -S` at 31 % came back at 64 %, a
+  third of it in the old layout. With 1.5.1: a second migration manager forced on the running volume (the first
+  one killed, udev started another) went on from the AMD log, the data right; five `mdadm -S` at 9 to 13 % - the
+  volume never ran again, after assembly md went on from where it was, every sector right, `md` check clean. Stopped
+  at 31 %, assembled (md went on at 32 %), stopped again at 60 %: Windows (driver 9.3.3.218) read the volume right
+  and finished the change; Linux then found it at 128 KiB, every sector right, `md` check clean.
 
 ## Emulation
 
@@ -175,13 +182,13 @@ An ASRock X670E RAID0 of two NVMe drives (our dump) and an ASUS X399 RAID10 (pub
 ## Test suites
 
 - The test suite in [tests/](../tests/README.md), on loop devices with metadata of real disks and of the emulated
-  board: 791 checks, all pass on a VM with the emulated AMD controllers (1.5; 639 for 1.4, 586 for 1.3, 573 for 1.2, 545 for
+  board: 797 checks, all pass on a VM with the emulated AMD controllers (1.5.1; 791 for 1.5, 639 for 1.4, 586 for 1.3, 573 for 1.2, 545 for
   1.1; for 1.0: 530 checks, 504 of them also on a plain VM without the controllers).
 - The same suite with mdadm and mdmon built with AddressSanitizer and UBSan: no reports. A fuzzer on the metadata
   parser: no crashes. (Both for 1.0.)
 - The upstream mdadm test suite: no regressions (1.5 and 1.1: 67 pass, 0 fail, 1 skipped, the same as upstream
   `5542bf40` alone). The upstream CI build matrix; no new compiler warnings on the distributions above and on i686, s390x,
-  powerpc and musl (for 1.0; for 1.1 to 1.5 each patch of the series builds with gcc and clang without new
+  powerpc and musl (for 1.0; for 1.1 to 1.5.1 each patch of the series builds with gcc and clang without new
   warnings).
 
 ## Not tested

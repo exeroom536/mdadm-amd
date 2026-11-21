@@ -1,0 +1,172 @@
+From 09b4a79d3dc451972c389ac55f4f408db413a8be Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:53:12 +0500
+Subject: [PATCH 29/49] Grow: let external metadata manage a RAID10 reshape
+ that moves the data
+
+reshape_array() hands a RAID10 reshape to raid10_reshape(), which moves
+data_offset by the same distance on every device and lets md run free.
+External metadata that records where the data of each member go, and
+how far the reshape is - AMD RAIDXpert2 (later in this series): another
+chunk, the AMD driver going on from its transform log after a crash -
+needs both as for a RAID5 that moves its data: the new offsets it gives
+(set_metadata_data_offset()) and md held for ->manage_reshape(), at the
+start and when the reshape goes on after assembly.
+
+Take such a RAID10 reshape the way of that RAID5 one; one the metadata
+gives no new offsets for - IMSM's, native arrays - still goes to
+raid10_reshape().  RAID10 has no backup (backup_blocks is
+INVALID_SECTORS): its reshape unit is the offset change, and it has no
+stripe cache to size.
+
+When it goes on, start_reshape() holds such a RAID10 at reshape_progress
+itself (sysfs_read() reads the level for it), not at reshape_progress /
+data_disks as a RAID5: md counts the reshape of a RAID10 in sectors of
+the array (raid10.c reshape_request), not of a member of the new layout,
+and analyse_change() gives a RAID10 all its disks as data_disks.
+Divided by them, the position need not be a multiple of the chunk, as md
+requires (md.c max_sync_store): on a RAID10 of 3 x 2 md refused every
+other AMD region's mark (0x7f80 with 64 KiB), "Cannot continue reshape",
+and the array was left read-only.
+
+verify_reshape_position() reads md's sync_max the same way: mdadm
+--grow --continue on such a RAID10 that md runs already
+(mdadm-grow-continue@, which udev starts on an event of a reshaping
+array whose manager is gone) took it times the data disks for where md
+is - twice the position md was held at for a RAID10 of 2 x 2.  The
+manager recorded the reshape there, md went on from there after
+assembly, and all between where md was and that mark stayed in the old
+layout (hardware, AMD: a RAID10 2 x 2 held at 0x148000 recorded at
+0x290000, a third of a 2 GiB volume lost).  Native RAID10 never comes
+there (RESHAPE_NO_BACKUP), nor does IMSM (no reshape of a RAID10).
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Grow.c | 55 +++++++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 45 insertions(+), 10 deletions(-)
+
+diff --git a/Grow.c b/Grow.c
+index b0369c30..6fa9f8da 100644
+--- a/Grow.c
++++ b/Grow.c
+@@ -923,7 +923,16 @@ int start_reshape(struct mdinfo *sra, int already_running,
+ 		err = err ?: sysfs_set_num(sra, NULL, "suspend_lo",
+ 					   sra->reshape_progress);
+ 	}
+-	if (before_data_disks <= data_disks)
++	if (sra->array.level == 10)
++		/*
++		 * md counts the reshape of a RAID10 in sectors of the array
++		 * (raid10.c reshape_request), not of a member of the new
++		 * layout as that of a RAID5: held where it goes on from.
++		 * Divided by the data disks, that need not be a multiple of
++		 * the chunk, as md requires (md.c max_sync_store).
++		 */
++		sync_max_to_set = sra->reshape_progress;
++	else if (before_data_disks <= data_disks)
+ 		sync_max_to_set = sra->reshape_progress / data_disks;
+ 	else
+ 		sync_max_to_set = (sra->component_size * data_disks
+@@ -2441,9 +2450,14 @@ static int verify_reshape_position(struct mdinfo *info, int level)
+ 
+ 		dprintf("Read sync_max sysfs entry is: %s\n", buf);
+ 		if (!(ep == buf || (*ep != 0 && *ep != '\n' && *ep != ' '))) {
+-			position *= get_data_disks(level,
+-						   info->new_layout,
+-						   info->array.raid_disks);
++			/*
++			 * md counts a RAID10 reshape in sectors of the array
++			 * (raid10.c reshape_request), and so is it held.
++			 */
++			if (level != 10)
++				position *= get_data_disks(level,
++							   info->new_layout,
++							   info->array.raid_disks);
+ 			if (info->reshape_progress < position) {
+ 				dprintf("Corrected reshape progress (%llu) to md position (%llu)\n",
+ 					info->reshape_progress, position);
+@@ -3186,6 +3200,7 @@ static int reshape_array(char *container, int fd, char *devname,
+ 	int done;
+ 	int moved;
+ 	bool no_backup = false;
++	bool managed10 = false;
+ 	int *backup_fdp = NULL;
+ 	struct mdinfo *sra = NULL;
+ 	char buf[SYSFS_MAX_BUF_SIZE];
+@@ -3267,7 +3282,7 @@ static int reshape_array(char *container, int fd, char *devname,
+ 		/* Need 'sra' down at 'started:' */
+ 		sra = sysfs_read(fd, NULL,
+ 				 GET_COMPONENT|GET_DEVS|GET_OFFSET|GET_STATE|
+-				 GET_CHUNK|GET_CACHE);
++				 GET_CHUNK|GET_CACHE|GET_LEVEL);
+ 		if (!sra) {
+ 			pr_err("%s: Cannot get array details from sysfs\n",
+ 			       devname);
+@@ -3494,7 +3509,16 @@ static int reshape_array(char *container, int fd, char *devname,
+ 		goto release;
+ 	}
+ 
+-	if (array.level == 10) {
++	/*
++	 * External metadata that manages a reshape may record where the data
++	 * of a RAID10 go, and how far it is - AMD: another chunk, the AMD
++	 * driver going on from its record after a crash.  Such a RAID10
++	 * reshape is started below as one that moves the data of a RAID5,
++	 * held for ->manage_reshape().
++	 */
++	managed10 = array.level == 10 && st->ss->external &&
++		    st->ss->manage_reshape && !backup_file;
++	if (array.level == 10 && !managed10) {
+ 		/* Reshaping RAID10 does not require any data backup by
+ 		 * user-space.  Instead it requires that the data_offset
+ 		 * is changed to avoid the need for backup.
+@@ -3508,7 +3532,7 @@ static int reshape_array(char *container, int fd, char *devname,
+ 	}
+ 	sra = sysfs_read(fd, NULL,
+ 			 GET_COMPONENT|GET_DEVS|GET_OFFSET|GET_STATE|GET_CHUNK|
+-			 GET_CACHE);
++			 GET_CACHE|GET_LEVEL);
+ 	if (!sra) {
+ 		pr_err("%s: Cannot get array details from sysfs\n",
+ 			devname);
+@@ -3521,6 +3545,13 @@ static int reshape_array(char *container, int fd, char *devname,
+ 		int delta = reshape.after.data_disks - reshape.before.data_disks;
+ 
+ 		moved = set_metadata_data_offset(st, info, sra);
++		if (moved == 1 && managed10) {
++			/* the metadata records no new offsets: the RAID10 way */
++			sysfs_free(sra);
++			return raid10_reshape(container, fd, devname, st, info,
++					      &reshape, data_offset, force,
++					      verbose);
++		}
+ 		if (moved == 1)
+ 			moved = set_new_data_offset(sra, st, devname, delta,
+ 						    data_offset,
+@@ -3602,6 +3633,9 @@ started:
+ 	 * unit.  The number we have so far is just a minimum
+ 	 */
+ 	blocks = reshape.backup_blocks;
++	/* RAID10 has no backup (analyse_change): the offset change will do */
++	if (array.level == 10)
++		blocks = reshape.min_offset_change;
+ 	if (reshape.before.data_disks ==
+ 	    reshape.after.data_disks) {
+ 		/* Make 'blocks' bigger for better throughput, but
+@@ -3658,9 +3692,10 @@ started:
+ 		}
+ 	}
+ 
+-	update_cache_size(container, sra, info,
+-			  min(reshape.before.data_disks,
+-			      reshape.after.data_disks), blocks);
++	if (array.level != 10)	/* no stripe cache */
++		update_cache_size(container, sra, info,
++				  min(reshape.before.data_disks,
++				      reshape.after.data_disks), blocks);
+ 
+ 	/* Right, everything seems fine. Let's kick things off.
+ 	 * If only changing raid_disks, use ioctl, else use
+-- 
+2.47.3
+

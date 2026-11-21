@@ -1,0 +1,83 @@
+From 22b34a122b485de48531a7dc511dfd171c4e1b5c Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 08:51:09 +0500
+Subject: [PATCH 06/49] monitor: do not run again an array stopped as the
+ metadata was written
+
+mdadm -S of a member array of a container writes "inactive" to its
+array_state (Manage_stop()).  md ends the sync or reshape it runs
+first (md.c do_md_stop()), and that end leaves the array write-pending
+(md_do_sync(): MD_SB_CHANGE_PENDING).  The monitor reads write-pending,
+writes the metadata, then "active" - by then the array may be stopped,
+and "active" written to a stopped array runs it again (md.c
+array_state_store(): do_md_run()).  md goes on with the sync or reshape
+it was stopped in, with nothing that manages it, for as long as
+STOP_ARRAY takes to get the array (md: still in use, retried for up to
+5 s), and the array that came back sends its uevents again: udev starts
+mdadm-grow-continue@ (MD_RESHAPE_ACTIVE) for a reshape whose manager
+has just left.
+
+Read the state again just before "active" or "read-auto", not from the
+file the monitor polls: an array stopped meanwhile is left for the next
+pass, which sees it stopped.  The window is the gap between the two
+reads now, not the metadata write.
+
+Seen with AMD RAIDXpert2 metadata (later in this series) on mdadm -S of
+a RAID10 midway through a reshape: in a VM, "active" some 40 ms after
+"inactive", the array run again on 21 of 24 such stops (0 of 9 with the
+change); on hardware with HDDs, several restarts within 1.5 s, and the
+mdadm-grow-continue@ that udev started went on from where the manager
+before had held md, not from where md was.  IMSM takes the same path in
+read_and_act() (not tried).
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ monitor.c | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/monitor.c b/monitor.c
+index b771707a..7c4e4916 100644
+--- a/monitor.c
++++ b/monitor.c
+@@ -118,6 +118,21 @@ static enum array_state read_state(int fd)
+ 	return (enum array_state) sysfs_match_word(buf, array_states);
+ }
+ 
++/*
++ * The array has stopped since read_and_act() read its state - mdadm -S
++ * writes "inactive" as md ends the sync it ran, the end leaves it
++ * write-pending.  Read anew, not from the file the monitor waits on: its
++ * change is to wake the monitor for the stop.
++ */
++static bool array_stopped_since(struct active_array *a)
++{
++	char buf[SYSFS_MAX_BUF_SIZE];
++
++	if (sysfs_get_str(&a->info, NULL, "array_state", buf, sizeof(buf)) <= 0)
++		return true;
++	return sysfs_match_word(buf, array_states) <= inactive;
++}
++
+ static enum sync_action read_action( int fd)
+ {
+ 	char buf[SYSFS_MAX_BUF_SIZE];
+@@ -607,6 +622,16 @@ static int read_and_act(struct active_array *a)
+ 	dprintf("(%d): state:%s action:%s next(", a->info.container_member,
+ 		array_states[a->curr_state], sync_actions[a->curr_action]);
+ 
++	/*
++	 * Writing the metadata takes a while: an array stopped meanwhile
++	 * would run again on "active" or "read-auto" (md.c array_state_store:
++	 * do_md_run) - and a reshape go on, with nothing that manages it.
++	 * The next pass sees it stopped.
++	 */
++	if ((a->next_state == active || a->next_state == read_auto) &&
++	    array_stopped_since(a))
++		a->next_state = bad_word;
++
+ 	/* Effect state changes in the array */
+ 	if (a->next_state != bad_word) {
+ 		dprintf_cont(" state:%s", array_states[a->next_state]);
+-- 
+2.47.3
+

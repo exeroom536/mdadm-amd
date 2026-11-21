@@ -1,6 +1,6 @@
 # Test suite
 
-Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 791 checks in 74
+Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 797 checks in 77
 stages, on images of real AMD RAID disks, of disks made by the board's own RAID firmware in emulation, and of
 disks this mdadm makes. Everything runs on loop devices of sparse files (plus LIO SCSI disks backed by files for
 the udev stages); no real disk is touched unless you provide the optional AMD controller disks below.
@@ -56,7 +56,7 @@ images elsewhere; `ALLOW_MD=1` runs although md arrays are active. The output al
 and every check is written to the kernel log (`amd-test: ok …`), so `dmesg` shows which check the kernel
 messages belong to.
 
-The whole suite takes about 80 minutes in a VM with 2 vCPUs and 2 GB (Debian 13, kernel 6.12), `PART=2` about 35
+The whole suite takes about 100 minutes in a VM with 2 vCPUs and 2 GB (Debian 13, kernel 6.12), `PART=2` about 65
 minutes and `PART=1` the rest; most of it is waiting for md (resync at chosen speeds, rebuilds stopped midway, the md
 bitmap daemon), not CPU. Without the AMD controller disks three blocks are skipped (in stages 21, 23 and 27).
 
@@ -130,6 +130,9 @@ about the X399 fixture (its dump has no LBA 0), printed by `-E` inside checks.
 | 59 | `-A` of a volume by `--uuid` or `--name` with its container, IMSM and AMD: no "has wrong uuid" about the other volumes of the container, nor next to "already assembled"; a UUID no volume has, a foreign container and a foreign member are still refused with it; `-As` by mdadm.conf |
 | 60 | a member that does not take the transform log is failed in md where the volume runs on without it: a RAID5 of 3 → 4 goes on degraded to its end and is rebuilt onto a spare, an initialization degrades; a RAID0 of 2 → 3 (no member to spare) waits with the writes to the region held until the log goes through; md frozen midway through a region: the region held; the data as written, md check 0 |
 | 61 | md fails a disk in one volume (a write error, `--fail`): failed there alone as the AMD driver does - the disk's RAID0 or RAID1 in service, its PD ONLINE, configurations go on to it; assembled again without it in that volume, a spare rebuilt instead; a disk that goes away (`mdadm -If`) is failed everywhere and its PD OFFLINE, as is a disk a configuration write fails on |
+| 62 | a RAID10 stopped with `mdadm -S` midway through a stripe size change, 24 times at random moments (`Q62N=` sets how many): assembled, it goes on to the end with the data as written, `md` check 0 |
+| 63 | a RAID10 of 3 × 2 and of 2 × 2 stopped midway through a stripe size change, in different regions and at a region's end: after assembly it goes on (not read-only), ends with the new chunk, the data as written, `md` check 0 |
+| 64 | a RAID10 stopped midway through a stripe size change: a second migration manager on the running volume (as udev started one after `mdadm -S`) goes on from the AMD log, not ahead of md; md interrupted unfrozen (`idle`) several times; `mdmon` does not run the volume stopped with `mdadm -S` again - each assembled, run to the end with the data as written, `md` check 0 |
 
 Fixtures and where they come from: [fixtures/README.md](fixtures/README.md). `helpers/` has the scripts that
 forge metadata with valid checksums for some stages; `../tools/amdraid_dump.py` parses it.

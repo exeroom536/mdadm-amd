@@ -1,5 +1,5 @@
 diff --git a/Assemble.c b/Assemble.c
-index 65204dc6..a9fcef9b 100644
+index 65204dc6..22dc4924 100644
 --- a/Assemble.c
 +++ b/Assemble.c
 @@ -350,6 +350,9 @@ static int select_devices(struct mddev_dev *devlist,
@@ -234,7 +234,7 @@ index 65204dc6..a9fcef9b 100644
  			/* If reshape progress is 0 - we are assembling the
  			 * array that was stopped, before reshape has started.
  			 * Array needs to be started as active, Grow_continue()
-@@ -2181,15 +2309,36 @@ int assemble_container_content(struct supertype *st, int mdfd,
+@@ -2181,15 +2309,38 @@ int assemble_container_content(struct supertype *st, int mdfd,
  			return 1;
  
  		if (st->ss->external) {
@@ -258,7 +258,9 @@ index 65204dc6..a9fcef9b 100644
 +		if (st->ss->external &&
 +		    container_reshape_pending(st->container_devnm,
 +					      content->sys_name)) {
-+			int data = get_data_disks(content->array.level,
++			/* md counts a RAID10 reshape in sectors of the array */
++			int data = content->array.level == 10 ? 1 :
++				   get_data_disks(content->array.level,
 +						  content->new_layout,
 +						  content->array.raid_disks);
 +			unsigned long long held = 0;
@@ -275,7 +277,7 @@ index 65204dc6..a9fcef9b 100644
  	} else switch(content->array.level) {
  		case LEVEL_LINEAR:
  		case LEVEL_MULTIPATH:
-@@ -2200,11 +2349,14 @@ int assemble_container_content(struct supertype *st, int mdfd,
+@@ -2200,11 +2351,14 @@ int assemble_container_content(struct supertype *st, int mdfd,
  		default:
  			err = sysfs_set_str(content, NULL, "array_state",
  					    "readonly");
@@ -373,10 +375,28 @@ index 2dc27d0a..70255dd2 100644
  			    st->minor_version >= 1 &&
  			    did_default &&
 diff --git a/Grow.c b/Grow.c
-index c49df9e5..e17ad41e 100644
+index c49df9e5..d09416c7 100644
 --- a/Grow.c
 +++ b/Grow.c
-@@ -1853,6 +1853,26 @@ error:
+@@ -923,7 +923,16 @@ int start_reshape(struct mdinfo *sra, int already_running,
+ 		err = err ?: sysfs_set_num(sra, NULL, "suspend_lo",
+ 					   sra->reshape_progress);
+ 	}
+-	if (before_data_disks <= data_disks)
++	if (sra->array.level == 10)
++		/*
++		 * md counts the reshape of a RAID10 in sectors of the array
++		 * (raid10.c reshape_request), not of a member of the new
++		 * layout as that of a RAID5: held where it goes on from.
++		 * Divided by the data disks, that need not be a multiple of
++		 * the chunk, as md requires (md.c max_sync_store).
++		 */
++		sync_max_to_set = sra->reshape_progress;
++	else if (before_data_disks <= data_disks)
+ 		sync_max_to_set = sra->reshape_progress / data_disks;
+ 	else
+ 		sync_max_to_set = (sra->component_size * data_disks
+@@ -1853,6 +1862,26 @@ error:
  	return 1;
  }
  
@@ -403,7 +423,7 @@ index c49df9e5..e17ad41e 100644
  int Grow_reshape(char *devname, int fd,
  		 struct mddev_dev *devlist,
  		 struct context *c, struct shape *s)
-@@ -1961,12 +1981,14 @@ int Grow_reshape(char *devname, int fd,
+@@ -1961,12 +1990,14 @@ int Grow_reshape(char *devname, int fd,
  			goto release;
  		}
  
@@ -419,7 +439,7 @@ index c49df9e5..e17ad41e 100644
  	}
  
  	added_disks = 0;
-@@ -2011,6 +2033,7 @@ int Grow_reshape(char *devname, int fd,
+@@ -2011,6 +2042,7 @@ int Grow_reshape(char *devname, int fd,
  	/* ========= set size =============== */
  	if (s->size > 0 && (s->size == MAX_SIZE || s->size != (unsigned)array.size)) {
  		unsigned long long orig_size = get_component_size(fd) / 2;
@@ -427,7 +447,7 @@ index c49df9e5..e17ad41e 100644
  		unsigned long long min_csize;
  		struct mdinfo *mdi;
  		int raid0_takeover = 0;
-@@ -2057,6 +2080,16 @@ int Grow_reshape(char *devname, int fd,
+@@ -2057,6 +2089,16 @@ int Grow_reshape(char *devname, int fd,
  			}
  		}
  
@@ -444,7 +464,7 @@ index c49df9e5..e17ad41e 100644
  		/* Update the size of each member device in case
  		 * they have been resized.  This will never reduce
  		 * below the current used-size.  The "size" attribute
-@@ -2360,16 +2393,8 @@ size_change_error:
+@@ -2360,16 +2402,8 @@ size_change_error:
  	} else {
  		/* get spare devices from external metadata
  		 */
@@ -463,7 +483,7 @@ index c49df9e5..e17ad41e 100644
  
  		/* Impose these changes on a single array.  First
  		 * check that the metadata is OK with the change.
-@@ -2391,6 +2416,17 @@ release:
+@@ -2391,6 +2425,17 @@ release:
  	return rv;
  }
  
@@ -481,7 +501,25 @@ index c49df9e5..e17ad41e 100644
  /* verify_reshape_position()
   *	Function checks if reshape position in metadata is not farther
   *	than position in md.
-@@ -2703,6 +2739,53 @@ fallback:
+@@ -2416,9 +2461,14 @@ static int verify_reshape_position(struct mdinfo *info, int level)
+ 
+ 		dprintf("Read sync_max sysfs entry is: %s\n", buf);
+ 		if (!(ep == buf || (*ep != 0 && *ep != '\n' && *ep != ' '))) {
+-			position *= get_data_disks(level,
+-						   info->new_layout,
+-						   info->array.raid_disks);
++			/*
++			 * md counts a RAID10 reshape in sectors of the array
++			 * (raid10.c reshape_request), and so is it held.
++			 */
++			if (level != 10)
++				position *= get_data_disks(level,
++							   info->new_layout,
++							   info->array.raid_disks);
+ 			if (info->reshape_progress < position) {
+ 				dprintf("Corrected reshape progress (%llu) to md position (%llu)\n",
+ 					info->reshape_progress, position);
+@@ -2703,6 +2753,53 @@ fallback:
  	return 1;
  }
  
@@ -535,7 +573,7 @@ index c49df9e5..e17ad41e 100644
  static int raid10_reshape(char *container, int fd, char *devname,
  			  struct supertype *st, struct mdinfo *info,
  			  struct reshape *reshape,
-@@ -3112,6 +3195,9 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3112,6 +3209,9 @@ static int reshape_array(char *container, int fd, char *devname,
  	unsigned long blocks;
  	unsigned long long array_size;
  	int done;
@@ -545,7 +583,7 @@ index c49df9e5..e17ad41e 100644
  	int *backup_fdp = NULL;
  	struct mdinfo *sra = NULL;
  	char buf[SYSFS_MAX_BUF_SIZE];
-@@ -3166,6 +3252,7 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3166,6 +3266,7 @@ static int reshape_array(char *container, int fd, char *devname,
  	}
  
  	if (st->ss->external && restart && (info->reshape_progress == 0) &&
@@ -553,7 +591,7 @@ index c49df9e5..e17ad41e 100644
  	    !((sysfs_get_str(info, NULL, "sync_action",
  			     buf, sizeof(buf)) > 0) &&
  	      (strncmp(buf, "reshape", 7) == 0))) {
-@@ -3175,6 +3262,8 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3175,6 +3276,8 @@ static int reshape_array(char *container, int fd, char *devname,
  		 * Check if md has the same opinion, and reshape is restarted
  		 * from 0. If so, this is regular reshape start after reshape
  		 * switch in metadata to next array only.
@@ -562,7 +600,16 @@ index c49df9e5..e17ad41e 100644
  		 */
  		if ((verify_reshape_position(info, reshape.level) >= 0) &&
  		    (info->reshape_progress == 0))
-@@ -3345,6 +3434,16 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3193,7 +3296,7 @@ static int reshape_array(char *container, int fd, char *devname,
+ 		/* Need 'sra' down at 'started:' */
+ 		sra = sysfs_read(fd, NULL,
+ 				 GET_COMPONENT|GET_DEVS|GET_OFFSET|GET_STATE|
+-				 GET_CHUNK|GET_CACHE);
++				 GET_CHUNK|GET_CACHE|GET_LEVEL);
+ 		if (!sra) {
+ 			pr_err("%s: Cannot get array details from sysfs\n",
+ 			       devname);
+@@ -3345,6 +3448,16 @@ static int reshape_array(char *container, int fd, char *devname,
  		    array.raid_disks !=
  		    (info->array.raid_disks + info->delta_disks)) {
  			array.raid_disks += info->delta_disks;
@@ -579,7 +626,7 @@ index c49df9e5..e17ad41e 100644
  			if (md_set_array_info(fd, &array) != 0) {
  				pr_err("failed to set raid disks\n");
  				goto release;
-@@ -3410,7 +3509,16 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3410,7 +3523,16 @@ static int reshape_array(char *container, int fd, char *devname,
  		goto release;
  	}
  
@@ -597,7 +644,16 @@ index c49df9e5..e17ad41e 100644
  		/* Reshaping RAID10 does not require any data backup by
  		 * user-space.  Instead it requires that the data_offset
  		 * is changed to avoid the need for backup.
-@@ -3433,15 +3541,39 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3424,7 +3546,7 @@ static int reshape_array(char *container, int fd, char *devname,
+ 	}
+ 	sra = sysfs_read(fd, NULL,
+ 			 GET_COMPONENT|GET_DEVS|GET_OFFSET|GET_STATE|GET_CHUNK|
+-			 GET_CACHE);
++			 GET_CACHE|GET_LEVEL);
+ 	if (!sra) {
+ 		pr_err("%s: Cannot get array details from sysfs\n",
+ 			devname);
+@@ -3433,15 +3555,39 @@ static int reshape_array(char *container, int fd, char *devname,
  	if (!info->reshape_active)
  		remove_backup_link(sra->sys_name);
  
@@ -642,7 +698,7 @@ index c49df9e5..e17ad41e 100644
  		update_cache_size(container, sra, info,
  				  min(reshape.before.data_disks,
  				      reshape.after.data_disks),
-@@ -3501,6 +3633,9 @@ started:
+@@ -3501,6 +3647,9 @@ started:
  	 * unit.  The number we have so far is just a minimum
  	 */
  	blocks = reshape.backup_blocks;
@@ -652,7 +708,7 @@ index c49df9e5..e17ad41e 100644
  	if (reshape.before.data_disks ==
  	    reshape.after.data_disks) {
  		/* Make 'blocks' bigger for better throughput, but
-@@ -3509,7 +3644,7 @@ started:
+@@ -3509,7 +3658,7 @@ started:
  		 */
  		while (blocks * 32 < sra->component_size && blocks < 16*1024*2)
  			blocks *= 2;
@@ -661,7 +717,7 @@ index c49df9e5..e17ad41e 100644
  		pr_err("Need to backup %luK of critical section..\n", blocks/2);
  
  	if (blocks >= sra->component_size/2) {
-@@ -3557,9 +3692,10 @@ started:
+@@ -3557,9 +3706,10 @@ started:
  		}
  	}
  
@@ -675,7 +731,7 @@ index c49df9e5..e17ad41e 100644
  
  	/* Right, everything seems fine. Let's kick things off.
  	 * If only changing raid_disks, use ioctl, else use
-@@ -3888,6 +4024,15 @@ int reshape_container(char *container, char *devname,
+@@ -3888,6 +4038,15 @@ int reshape_container(char *container, char *devname,
  		if (mdmon_running(container))
  			flush_mdmon(container);
  
@@ -1510,10 +1566,32 @@ index 227a68b2..26a93275 100644
  int mddev_busy(char *devnm);
  
 diff --git a/monitor.c b/monitor.c
-index b771707a..f138f250 100644
+index b771707a..3a8dea70 100644
 --- a/monitor.c
 +++ b/monitor.c
-@@ -361,7 +361,9 @@ static void signal_manager(void)
+@@ -118,6 +118,21 @@ static enum array_state read_state(int fd)
+ 	return (enum array_state) sysfs_match_word(buf, array_states);
+ }
+ 
++/*
++ * The array has stopped since read_and_act() read its state - mdadm -S
++ * writes "inactive" as md ends the sync it ran, the end leaves it
++ * write-pending.  Read anew, not from the file the monitor waits on: its
++ * change is to wake the monitor for the stop.
++ */
++static bool array_stopped_since(struct active_array *a)
++{
++	char buf[SYSFS_MAX_BUF_SIZE];
++
++	if (sysfs_get_str(&a->info, NULL, "array_state", buf, sizeof(buf)) <= 0)
++		return true;
++	return sysfs_match_word(buf, array_states) <= inactive;
++}
++
+ static enum sync_action read_action( int fd)
+ {
+ 	char buf[SYSFS_MAX_BUF_SIZE];
+@@ -361,7 +376,9 @@ static void signal_manager(void)
   *    device by writing '-blocked' to rd/state, and finally write 'remove' to
   *    rd/state.  Before a disk can be replaced it must be failed and removed
   *    from all container members, this will be preemptive for the other
@@ -1524,7 +1602,24 @@ index b771707a..f138f250 100644
   *
   *  sync completes
   *    sync_action was 'resync' and becomes 'idle' and resync_start becomes
-@@ -874,7 +876,7 @@ static int wait_and_act(struct supertype *container, int nowait)
+@@ -607,6 +624,16 @@ static int read_and_act(struct active_array *a)
+ 	dprintf("(%d): state:%s action:%s next(", a->info.container_member,
+ 		array_states[a->curr_state], sync_actions[a->curr_action]);
+ 
++	/*
++	 * Writing the metadata takes a while: an array stopped meanwhile
++	 * would run again on "active" or "read-auto" (md.c array_state_store:
++	 * do_md_run) - and a reshape go on, with nothing that manages it.
++	 * The next pass sees it stopped.
++	 */
++	if ((a->next_state == active || a->next_state == read_auto) &&
++	    array_stopped_since(a))
++		a->next_state = bad_word;
++
+ 	/* Effect state changes in the array */
+ 	if (a->next_state != bad_word) {
+ 		dprintf_cont(" state:%s", array_states[a->next_state]);
+@@ -874,7 +901,7 @@ static int wait_and_act(struct supertype *container, int nowait)
  	}
  
  	/* propagate failures across container members */
@@ -1604,10 +1699,10 @@ index f92a9a11..af1a26b8 100644
  int devpath_to_char(const char *dev_path, const char *entry, char *buf,
 diff --git a/super-amd.c b/super-amd.c
 new file mode 100644
-index 00000000..f44b588f
+index 00000000..9df903f9
 --- /dev/null
 +++ b/super-amd.c
-@@ -0,0 +1,14685 @@
+@@ -0,0 +1,14728 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * mdadm - support for AMD RAIDXpert2 ("RAIDCore") metadata.
@@ -7471,6 +7566,14 @@ index 00000000..f44b588f
 +	struct mdinfo *rest = NULL, **tail = &rest;
 +	int vol;
 +
++	/*
++	 * None loaded: Grow.c reshape_array() loads the metadata again after
++	 * the reshape, and the container may be gone by then -
++	 * reshape_container() asks for the arrays next (hardware:
++	 * mdadm-grow-continue@ SIGSEGV as the container stopped).
++	 */
++	if (!super)
++		return NULL;
 +	for (vol = 0; vol < super->nvol; vol++) {
 +		struct amd_vol *v = &super->vol[vol];
 +		struct mdinfo *this;
@@ -12958,7 +13061,14 @@ index 00000000..f44b588f
 + * status_resync).  For a RAID10: raid10 records the position in
 + * sync_completed only at its checkpoints (raid10.c reshape_request: every
 + * 10 s, or before it would write over data not recorded as moved), never
-+ * while sync_max holds it.  -1 if md shows no reshape of it.
++ * while sync_max holds it.  -1 if md shows no reshape of it - or the whole
++ * array: so it shows the reshape as it cleans up after its sync thread
++ * (status_resync: MD_RECOVERY_DONE), stopped or ended.  sync_action reads
++ * reshape then, unless md was frozen first: "idle" (Grow.c abort_reshape),
++ * or md stopped again as it ran after mdadm -S, a manager waiting meanwhile
++ * (hardware: md held at 0xb0000 of 0x400000 showed 0x400000 so).  A
++ * position md really has is short of the end: md ends there with no reshape
++ * position (amd_reshape_wait).
 + */
 +static long long amd_mdstat_reshaped(const char *devnm)
 +{
@@ -12978,13 +13088,25 @@ index 00000000..f44b588f
 +		if (p)
 +			p = strchr(p, '(');
 +		if (p && sscanf(p, "(%llu/%llu)", &done, &max) == 2) {
-+			rv = done * 2;
++			if (done < max)
++				rv = done * 2;
 +			break;
 +		}
 +	}
 +	if (f)
 +		fclose(f);
 +	return rv;
++}
++
++/* md runs @sra: it has a personality (md.c array_state_show) */
++static int amd_md_running(struct mdinfo *sra)
++{
++	char state[SYSFS_MAX_BUF_SIZE];
++
++	return sysfs_get_str(sra, NULL, "array_state", state,
++			     sizeof(state)) > 0 &&
++	       strncmp(state, "clear", 5) != 0 &&
++	       strncmp(state, "inactive", 8) != 0;
 +}
 +
 +/*
@@ -12997,6 +13119,11 @@ index 00000000..f44b588f
 + * where md has moved part of the region, which is copied again from the
 + * log at its start, over them (q16mon).  A stopped array has no
 + * sync_action (mdadm -S: md frozen, then inactive) and ends the wait.
++ * Before its sysfs goes, md clears it (md.c md_clean): no reshape
++ * position, nothing synced, as at the end of the reshape - but no
++ * personality (array_state "clear" or "inactive").  Taken for the end,
++ * the next region would be logged as reached, the one md stopped in
++ * never moved after.
 + */
 +static int amd_reshape_wait(struct mdinfo *sra, int fd, unsigned long long to,
 +			    int raid10)
@@ -13013,17 +13140,25 @@ index 00000000..f44b588f
 +			return -1;
 +		if (!raid10 && !str_is_none(buf))
 +			done = strtoull(buf, NULL, 10);
-+		if (done >= 0 && (unsigned long long)done >= to)
-+			return 0;
 +		/* no sync_action: the array is stopped (it may be assembled again) */
 +		if (sysfs_get_str(sra, NULL, "sync_action", action,
 +				  sizeof(action)) <= 0 ||
 +		    sysfs_get_str(sra, NULL, "reshape_position", pos,
 +				  sizeof(pos)) <= 0)
 +			return -1;
++		/*
++		 * raid10's progress in /proc/mdstat holds only while md
++		 * reshapes: stopped (mdadm -S) as it waited at a region's
++		 * end, it showed the next region done, which it never wrote
++		 * (q21chunk: RAID10 moving its data up).  Read before the
++		 * state: frozen first, md interrupts the reshape after.
++		 */
++		if (done >= 0 && (unsigned long long)done >= to &&
++		    (!raid10 || strncmp(action, "reshape", 7) == 0))
++			return 0;
 +		if (strncmp(action, "reshape", 7) != 0) {
 +			if (str_is_none(buf) && str_is_none(pos))
-+				return 0;
++				return amd_md_running(sra) ? 0 : -1;
 +			/*
 +			 * mdadm -S freezes md first, and the array goes with
 +			 * no event on sync_completed: seen at once, before
@@ -13223,7 +13358,7 @@ index 00000000..f44b588f
 +	struct amd_super *super = st->sb;
 +	int vol = super ? amd_devnm_volume(super, sra->sys_name) : -1;
 +	unsigned long long data = reshape->after.data_disks, unit = data;
-+	unsigned long long region, end, mark, next, logged;
++	unsigned long long region, end, mark, next;
 +	struct amd_vol *v;
 +	int fd, i, ok = 1;
 +	__u64 id;
@@ -13245,14 +13380,17 @@ index 00000000..f44b588f
 +	}
 +	end = sra->component_size * data;
 +	/*
-+	 * The mark of the log md goes on from (amd_reshape_content), or 0 -
-+	 * never behind the log on the disks: the source of the data below
-+	 * that mark is overwritten already, should Grow.c give a lower one.
++	 * From the log on the disks, as md after assembly
++	 * (amd_reshape_content), or 0: below it the source of the data is
++	 * overwritten already, and above it the region md is in is not moved
++	 * all yet.  Not from Grow.c's mark: going on with a reshape md runs
++	 * already (mdadm-grow-continue@, started by udev as md came back
++	 * after mdadm -S, its manager gone), it takes the sync_max that
++	 * manager held md at for where md is (verify_reshape_position) - the
++	 * end of a region md may not have reached.  Logged there, the rest of
++	 * that region would never be moved.
 +	 */
-+	mark = sra->reshape_progress;
-+	logged = amd_tlog_scan(super, v, v->link, AMD_TRANSFORM_NORMAL, 1);
-+	if (logged > mark)
-+		mark = logged;
++	mark = amd_tlog_scan(super, v, v->link, AMD_TRANSFORM_NORMAL, 1);
 +	fd = sysfs_get_fd(sra, NULL, "sync_completed");
 +	if (!is_fd_valid(fd))
 +		return 0;

@@ -1,5 +1,48 @@
 # Changes
 
+## 1.5.1 — 2026-11-21
+
+**Fixed.**
+- A RAID10 stopped with `mdadm -S` in the middle of a stripe size change (`mdadm --grow --chunk`) could come back
+  with part of one region left in the old layout: after assembly the volume read wrong data there, silently (`md`
+  check found nothing). While md cleans up the reshape it was stopped in, it shows the whole volume done for a few
+  milliseconds, and the migration manager took that for the end of the region and recorded the next one as
+  reached. In a VM 9 of 50 stops of small volumes went wrong with 1.5, none of 50 with the fix; RAID5 and RAID0
+  did not show it.
+- A RAID10 of six disks (3 × 2) whose stripe size change was stopped in every other region of the migration did
+  not go on after assembly: "Cannot continue reshape", the volume stayed read-only, and while it stood so it read
+  wrong data in the part md had moved already (the data on the disks were intact). mdadm held md where the
+  migration goes on from in the units of a RAID5, a position md refuses for a RAID10 of three mirror pairs; a
+  RAID10 of four disks went on by chance. A fix of mdadm's own `Grow.c`, and the same in `Assemble.c` for a volume
+  that waits for another migration of its container (that case not tried). The wrong reads are the kernel's: its
+  raid10 reads a reshape that stands still with the old data offset, native arrays too; with the fix the reshape
+  goes on instead.
+- A RAID10 whose stripe size change was stopped with `mdadm -S` could come back with up to a third of the volume
+  left in the old layout (on real hardware: a RAID10 of four disks stopped at 31 % was assembled at 64 %, and all
+  between read wrong data; `md` check found nothing). Three things went wrong together. `mdmon` wrote the metadata
+  as md ended the reshape it was stopped in, then told md to go on - and so ran the volume it had just stopped again
+  (a fix of mdmon's own `monitor.c`; Intel IMSM takes the same path, not tried). The volume that came back made udev
+  start a second migration manager (`mdadm-grow-continue@`) as the first one left; it took how far md had been let
+  go for where md was - for a RAID10 twice that, as mdadm's `Grow.c` counted a RAID10's position as a RAID5's (fixed
+  too) - and recorded the migration in the AMD log there, where md went on from after assembly. The manager now goes
+  on from the AMD log on the disks, as md and the AMD driver do after assembly. It also no longer takes the whole
+  volume that `/proc/mdstat` shows for a moment as md is interrupted without being frozen first for the end of a
+  region, and no longer crashes (SIGSEGV) when the container was stopped by the time it ended. In a VM, a second
+  manager on a running volume left the data wrong every time before the fix (3 of 3) and never with it; `mdadm -S`
+  ran the volume again in 21 of 24 stops before, in none of 9 with it.
+
+**Tests.** Stages 62 (a RAID10 stopped with `mdadm -S` midway through a stripe size change, 24 times), 63 (a
+RAID10 of 3 × 2 and of 2 × 2 stopped at different places goes on after assembly) and 64 (a second migration
+manager on a running RAID10, md interrupted without being frozen, `mdmon` and a volume stopped with `mdadm -S`):
+797 checks in 77 stages, all pass in a VM with the emulated AMD controllers. mdadm's own tests pass as
+before (67 pass, 1 skipped, as upstream).
+
+**On real hardware** (the board, Windows with driver 9.3.3.218): a RAID10 of two HDDs and two SSDs stopped with
+`mdadm -S` midway through a stripe size change (five times; and twice in a row, then finished by Windows),
+and a second migration manager forced on it - every sector right after assembly, `md` check clean
+([docs/testing.md](docs/testing.md#hardware)). The BIOS menu was not looked at with this fix (it showed such a
+volume as "Transform" with the first one).
+
 ## 1.5 — 2026-11-19
 
 **New.**
