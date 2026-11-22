@@ -1,5 +1,32 @@
 # Changes
 
+## 1.6.1 — 2026-11-22
+
+**Fixed.**
+- Growing a RAID1, RAID10 or RAID5 in place (`mdadm --grow --size`, since 1.4), stopped midway and then finished
+  by the Windows driver, left a strip of the new part without its mirror copy or parity: from where md had
+  stopped to the end of the region mdmon had logged (a region is 9 MiB of the volume for a RAID1, 16 MiB for a
+  RAID10, 9 MiB a data disk for a RAID5). The Windows driver (9.3.3.218) takes the region at the log's mark as done
+  and goes on from the next one; AMD's Linux driver repeats it. mdmon now logs the region below the one md is in,
+  so that either driver goes on at or below where md stopped. User data written before the growth were not
+  touched; a disk failing there later would have read wrong data back. Found on real hardware: a RAID5 finished
+  by Windows had 7680 sectors of wrong parity, exactly in that strip.
+- If such a growth of yours was finished by Windows, a check shows it (`echo check >
+  /sys/block/mdX/md/sync_action`, then `mismatch_cnt`), and `repair` instead of `check` rewrites it.
+- Growing in place refuses a volume smaller than one region of the log: there is no region
+  below its old end to log.
+
+**Tests.** Stage 70: the new part of a RAID1 different on its two halves, the growth stopped midway — md has
+mirrored everything below the end of the logged region, where the Windows driver goes on; the growth of a too
+small volume is refused. Stage 48 checks the log a region lower. 845 checks in 83 stages, all pass in a VM with
+the emulated AMD controllers. mdadm's own tests on `4cd7d33c`: 69 pass, 0 fail, 1 skipped.
+
+**On real hardware** (MSI X870E, BIOS 1.A93, kernel 7.3.5). A RAID5 of three disks, a RAID10 2 × 2 and a RAID1,
+1 GiB a member grown to 2 GiB, the new part filled with random data first, stopped with `mdadm -S` twice and
+going on after assembly, then finished by the Windows driver: `md` check clean on all three, every sector of the
+old part right (with 1.6 the RAID5 showed the bug above). The BIOS menu shows the RAID5 of 1.6's second migration
+as Normal, 128 KB, all disks online, and writes nothing to the disks.
+
 ## 1.6 — 2026-11-22
 
 **Base.** The patch and the series now apply to upstream mdadm `4cd7d33c` (mdadm-4.6-132, 20 November 2026) instead

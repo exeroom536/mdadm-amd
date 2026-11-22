@@ -1,7 +1,7 @@
 From 19cf302466aeab16e6f75d726b1859a6a6739062 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:50 +0500
-Subject: [PATCH 42/53] super-amd: add disks, delete and update volumes
+Subject: [PATCH 42/54] super-amd: add disks, delete and update volumes
 
 - --add to the container: a new disk becomes an AMD global hot spare,
   as the BIOS menu initializes and assigns one; a former member failed

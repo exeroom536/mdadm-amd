@@ -1,7 +1,7 @@
 From 7d1e5a566b920f7ce45c9daa8cbc195efc407982 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 23:23:34 +0500
-Subject: [PATCH 51/53] super-amd: a second migration onto more disks, in place
+Subject: [PATCH 51/54] super-amd: a second migration onto more disks, in place
  through AMD's log of the data
 
 A volume whose data a migration onto more disks moved already sits at

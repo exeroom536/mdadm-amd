@@ -13,7 +13,7 @@ pkgname=('mdadm-amd' 'md-bitmap-ext-dkms')
 _commit=4cd7d33c1d2672c40ee3653006c36fe84cd1a545   # mdadm-4.6-132-g4cd7d33c, 2026-11-20 (GitHub main)
 _mdadmver=4.6.r132.g4cd7d33c   # the mdadm it is built from (provides)
 # the mdadm-amd release; a build between releases: <last release>.r<n>
-pkgver=1.6
+pkgver=1.6.1
 pkgrel=1
 arch=('x86_64')
 license=('GPL-2.0-or-later')
@@ -49,7 +49,7 @@ for _b in "${_mdbases[@]}"; do
 	done
 done
 sha256sums=('523685bd7cb3d574ff829f78c3bd74aa533b6d716472be470e029c21aa3881c9'
-            '008b2c6b3f296a8f0fdb4c7ec9863940f8fce63fb3c75e660bc938b85fbde8de'
+            '96329d9eb05cf2bb936494bb3c58ffdbaea35ef4d2f635177bcbe0c779d5552b'
             '52b7a3e7f6d4785234c79fd394f2009a9aa389230fa742250058bd1f310330d1'
             'c1472503c7f6e4ece43dc139b6ab80a1b564631de96490b253e9f60e2dc6fb7b'
             '1dfff7905e6db439a38f19deede2535e405387bda6d6d7e8ef5e71661ada019f'

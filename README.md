@@ -75,9 +75,9 @@ More — spares, RAIDABLE, the md bitmap, failed disks, booting — in [docs/usa
 ## Limitations
 
 - One AMD board tested so far; NVMe arrays only in emulation. See [docs/testing.md](docs/testing.md).
-- Migrations tried on real hardware, with the BIOS menu and Windows: growing a RAID1 in place, more disks for a
-  RAID0 or a RAID5, a RAID1 of two into a RAID5, the stripe size of a RAID5 and of a RAID10. Growing a RAID5 or a
-  RAID10 in place and RAID0 → RAID10 only in emulation.
+- Migrations tried on real hardware, with the BIOS menu and Windows: growing a RAID1, a RAID10 or a RAID5 in place
+  (the BIOS menu looked at for the RAID1), more disks for a RAID0 or a RAID5, a RAID1 of two into a RAID5, the
+  stripe size of a RAID5 and of a RAID10. RAID0 → RAID10 only in emulation.
 - A second migration of a volume whose data a migration moved already (more disks again in place, through AMD's
   log of the data; the stripe size, the data going back up): on real hardware a RAID5 and a RAID10, finished by
   the Windows driver; other levels in emulation with AMD's Linux driver. More disks and another stripe size at once are refused for such a volume.
@@ -95,7 +95,7 @@ More — spares, RAIDABLE, the md bitmap, failed disks, booting — in [docs/usa
 | [Usage](docs/usage.md) | creating and managing arrays, spares, failures, compatibility with the BIOS and Windows |
 | [Testing](docs/testing.md) | what was tested where, what was not, what is not supported |
 | [Development](docs/development.md) | repository layout, the patch series, the kernel and util-linux patches |
-| [Tests](tests/README.md) | the test suite (842 checks on loop devices) and how to run it |
+| [Tests](tests/README.md) | the test suite (845 checks on loop devices) and how to run it |
 | [Format](docs/format.md) | the on-disk format, with a source for each statement (in Russian) |
 | [Firmware bugs](docs/firmware-bugs.md) | known problems of the AMD RAID firmware |
 | [AMD drivers](docs/amd-drivers.md) | how AMD's drivers, firmware and menu behave differently from md, and what mdadm does about it |

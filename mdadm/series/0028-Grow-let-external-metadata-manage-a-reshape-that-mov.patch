@@ -1,7 +1,7 @@
 From 97294b41d88fd0be2403401a98d40cc83706ec91 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:10 +0500
-Subject: [PATCH 28/53] Grow: let external metadata manage a reshape that moves
+Subject: [PATCH 28/54] Grow: let external metadata manage a reshape that moves
  the data
 
 When md can move the data (new_offset), reshape_array() starts the

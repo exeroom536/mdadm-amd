@@ -1,7 +1,7 @@
 From 3791602ec6b45549667a27788457ebcc2d8ca4ca Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:57 +0500
-Subject: [PATCH 44/53] super-amd: follow the AMD firmware and driver in what
+Subject: [PATCH 44/54] super-amd: follow the AMD firmware and driver in what
  they check
 
 What mdadm writes is only of use if the AMD BIOS and the Windows driver

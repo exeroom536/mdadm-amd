@@ -1,7 +1,7 @@
 From 6f11e805e1d24bf4f1c6cbb170f9fd331d02357d Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:54:04 +0500
-Subject: [PATCH 46/53] super-amd: grow volumes in place, and a RAID0 into a
+Subject: [PATCH 46/54] super-amd: grow volumes in place, and a RAID0 into a
  RAID10
 
 The AMD driver (rcadm -T, RAIDXpert2) changes a volume by a migration:

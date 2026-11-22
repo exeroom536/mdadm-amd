@@ -121,7 +121,13 @@ started. No SELinux denials. The tree the script lays out is the same, file for 
   (`mdadm-grow-continue@` went on from the AMD log), every sector right, stopped at 60 %: Windows (driver
   9.3.3.218) finished it; Linux then found 64 KiB, every sector right, `md` check clean. A RAID5 of two HDDs and an
   SSD (64 → 128 KiB, its data moved down) got the fourth disk in place, stopped at 30 % and 60 % the same way;
-  Windows finished it: 3 GiB, every sector right, `md` check clean. The BIOS menu was not looked at.
+  Windows finished it: 3 GiB, every sector right, `md` check clean. The BIOS menu showed that RAID5 Normal, 128 KB,
+  its four disks online, and wrote nothing to the disks.
+- 1.6.1, the same disks: a RAID5 of two HDDs and an SSD, a RAID10 of the four disks and a RAID1 of the HDDs, each
+  grown in place from 1 to 2 GiB a member, the new part holding random data first, stopped with `mdadm -S` twice
+  and assembled (going on from the AMD log), finished by Windows (driver 9.3.3.218): `md` check clean on all
+  three, every sector of the old part right. With 1.6 the RAID5 so finished had 7680 sectors of wrong parity:
+  the Windows driver goes on from the region after the log's mark, see the changelog.
 
 ## Emulation
 
@@ -188,11 +194,11 @@ An ASRock X670E RAID0 of two NVMe drives (our dump) and an ASUS X399 RAID10 (pub
 ## Test suites
 
 - The test suite in [tests/](../tests/README.md), on loop devices with metadata of real disks and of the emulated
-  board: 842 checks, all pass on a VM with the emulated AMD controllers (1.6; 797 for 1.5.1, 791 for 1.5, 639 for 1.4, 586 for 1.3, 573 for 1.2, 545 for
+  board: 845 checks, all pass on a VM with the emulated AMD controllers (1.6.1; 842 for 1.6, 797 for 1.5.1, 791 for 1.5, 639 for 1.4, 586 for 1.3, 573 for 1.2, 545 for
   1.1; for 1.0: 530 checks, 504 of them also on a plain VM without the controllers).
 - The same suite with mdadm and mdmon built with AddressSanitizer and UBSan: no reports. A fuzzer on the metadata
   parser: no crashes. (Both for 1.0.)
-- The upstream mdadm test suite: no regressions (1.6: 69 pass, 0 fail, 1 skipped on upstream `4cd7d33c`; 1.5 and
+- The upstream mdadm test suite: no regressions (1.6 and 1.6.1: 69 pass, 0 fail, 1 skipped on upstream `4cd7d33c`; 1.5 and
   1.1: 67 pass, 0 fail, 1 skipped, the same as upstream `5542bf40` alone). The upstream CI build matrix; no new
   compiler warnings on the distributions above and on i686, s390x, powerpc and musl (for 1.0; for 1.1 to 1.6 each
   patch of the series builds with gcc and clang without new warnings).
@@ -204,8 +210,9 @@ started degraded); the md bitmap with the AMD drivers on real hardware; the
 controller check refusing a disk on real hardware; distributions other than the test machine's on real hardware;
 GRUB with shim; root file systems other than ext4 on a volume; booting from a volume on Manjaro, EndeavourOS, Linux
 Mint and the distributions checked by build only; RHEL itself; the md bitmap module under Secure Boot (with the
-DKMS key enrolled) and its rebuild by DKMS on a kernel update outside Arch; growing a RAID5 or RAID10 in place and
-RAID0 → RAID10 on real hardware, with the Windows driver or the BIOS menu (a RAID1 was, see Hardware); a RAID1 →
+DKMS key enrolled) and its rebuild by DKMS on a kernel update outside Arch; RAID0 → RAID10 on real hardware, with
+the Windows driver or the BIOS menu; the BIOS menu after growing a RAID5 or a RAID10 in place (Windows finished
+both, see Hardware); a RAID1 →
 RAID5 or a RAID10 stripe size change stopped midway and finished by Windows, and migrations with the Windows
 driver 9.5 or 9.3.3.329, on real hardware (in a VM they were); reading a RAID10 on real disks while Windows
 finishes its stripe size change; two migrations left in one container, and a volume the AMD driver recorded offline taken back,

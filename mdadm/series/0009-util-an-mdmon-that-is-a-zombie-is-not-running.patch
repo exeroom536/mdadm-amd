@@ -1,7 +1,7 @@
 From 88d72ac6af5891b449dc10858df576a92d666d68 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:52:04 +0500
-Subject: [PATCH 09/53] util: an mdmon that is a zombie is not running
+Subject: [PATCH 09/54] util: an mdmon that is a zombie is not running
 
 mdmon_running() takes an mdmon for running while kill(pid, 0) finds it.
 A zombie it still finds.  In the shutdown ramfs (systemd's exitrd,

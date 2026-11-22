@@ -1,7 +1,7 @@
 From f12be332698a5193e45caa32afe9a879998f7fbb Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:25 +0500
-Subject: [PATCH 35/53] mdadm: add --update-subarray options for a volume's
+Subject: [PATCH 35/54] mdadm: add --update-subarray options for a volume's
  cache policy
 
 AMD RAIDXpert2 keeps a cache policy in each volume's metadata: read

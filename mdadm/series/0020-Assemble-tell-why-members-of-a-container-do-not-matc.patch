@@ -1,7 +1,7 @@
 From 6b5200665a57f748d276542eadb402131832c750 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:52:50 +0500
-Subject: [PATCH 20/53] Assemble: tell why members of a container do not match
+Subject: [PATCH 20/54] Assemble: tell why members of a container do not match
  only if none does
 
 Assembling an array of a container by --uuid or --name with the

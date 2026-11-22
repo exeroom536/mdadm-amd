@@ -4441,6 +4441,19 @@ static void amd_tlog_fill(const struct amd_vol *v, const struct amd_ld *tl,
 		if (v->grow != AMD_GROW_RESHAPE &&
 		    (flags & 3) != AMD_TFLAGS_FROM_END)
 			done -= done % protect;
+		/*
+		 * More capacity in place: the region below the one md is
+		 * in.  rcraid.sys 9.3.3.218 goes on with such a migration
+		 * from the region after ProtectStart - the rest of the one
+		 * md stopped in it leaves without parity or a mirror copy
+		 * (22.11 on hardware, RAID5 of 3: 18 chunks past md's last
+		 * stripe, up to the region's end); rcblob repeats the
+		 * region (RC_RestartTask).  Either goes on at or below md
+		 * then.  amd_reshape_size refuses a volume with no region
+		 * below its old capacity.
+		 */
+		if (amd_grow_shape(v->ld, tl) == AMD_GROW_SIZE)
+			done = done >= protect ? done - protect : 0;
 		start = done;
 		flags &= ~(AMD_TFLAGS_DATA_LOG | AMD_TFLAGS_DATA_PHASES);
 		if ((flags & 3) == AMD_TFLAGS_FROM_END) {
@@ -11130,6 +11143,12 @@ static int amd_reshape_size(struct supertype *st, int vol, struct shape *shape,
 		pr_err("%s: AMD makes a volume larger only, by a MiB a member at least: it has %llu MiB a member%s\n",
 		       shape->dev, old / AMD_MIB,
 		       shape->size == MAX_SIZE ? ", and no more room where they are" : "");
+		return 1;
+	}
+	/* the log lags a region behind md (amd_tlog_fill): one below the old end */
+	if (__le64_to_cpu(v->ld->capacity) < amd_protect_size(v)) {
+		pr_err("%s: AMD logs a growth in regions of %llu KiB: a smaller volume cannot be grown in place\n",
+		       shape->dev, amd_protect_size(v) / 2);
 		return 1;
 	}
 	if (amd_md_keep_size(st, v, shape->dev) != 0)

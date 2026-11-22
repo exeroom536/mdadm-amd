@@ -1,7 +1,7 @@
 From f0dff41cc863fa7afd2b2cb95366e3f726f3bb1f Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:33 +0500
-Subject: [PATCH 37/53] platform-intel: export read_efi_variable() and
+Subject: [PATCH 37/54] platform-intel: export read_efi_variable() and
  EFI_GUID()
 
 Platforms other than Intel's also tell the OS about their RAID firmware in

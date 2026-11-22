@@ -1,7 +1,7 @@
 From d768a76eadf1039bb9b648b42dff671d7a89a163 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:52:37 +0500
-Subject: [PATCH 17/53] Create: do not warn about a partition table the
+Subject: [PATCH 17/54] Create: do not warn about a partition table the
  metadata keeps
 
 AMD RAIDXpert2 writes a partition of its own (type 0x82, over the whole

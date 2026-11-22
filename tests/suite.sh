@@ -4580,10 +4580,10 @@ OUT=$($M --grow /dev/$B --size=1200M 2>&1); sleep 3
 check "48: --size=1200M of the RAID1 behind it (read-auto): md 1200 MiB a member, resyncing from 256 MiB" "echo \"\$OUT\" | grep -q '256 -> 1200 MiB a member' && [ \$(cat /sys/block/$B/md/component_size) = $((1200 * 1024)) ] && [ \$(cat /sys/block/$B/md/sync_action) = resync ] && [ \$(cut -d' ' -f1 /sys/block/$B/md/sync_completed) -ge $((256 * 2048)) ]"
 S1=$(qgld $WQ/q48/d0.img $BID $((G0 + 1)))
 check "48: start packet (the next one): the RAID1 NORMAL 0x2024241, protect 0x4800, Flags 0x20010, Link 1; the one it becomes - TransformType 0, LastOperation NORMAL, 0x2024241, 1200 MiB, generation of the packet, extents grown in place (as rcadm -T -s, q8m-e3dpost)" "[ \$(echo \"\$S1\" | wc -l) = 2 ] && echo \"\$S1\" | head -1 | grep -q 'tt=5354 lo=5354 ts=0 cap=80000 ps=0 .* tf=2024241 psz=4800 fl=20010 lk=1 pct=0 at=1' && echo \"\$S1\" | tail -1 | grep -q \"tt=0 lo=5354 ts=0 cap=258000 ps=0 gen=$(printf %x $((G0 + 1))) fs=1x2 tf=2024241 psz=0 fl=0 lk=0 pct=0 at=1 e0=[0-9a-f]*:185000+25d000:18a000+258000:0 e1=[0-9a-f]*:185000+25d000:18a000+258000:0\""
-check "48: the log first: NORMAL, STARTED from the old capacity (its region), I/O 0x600, 12 to the region, on both members" "T=\$(qgtlog $(qgl 0) 0x185000); [ \"\$T\" = \"\$(qgtlog $(qgl 1) 0x185000)\" ] && echo \"\$T\" | grep -qE '^5354 [0-9a-f]+ 1 600 2024241 4800 c$' && [ \$((0x\$(echo \$T | cut -d' ' -f2))) -ge $((0x7e000)) ]"
+check "48: the log first: NORMAL, STARTED a region below the old capacity's (0x7e000; stage 70), I/O 0x600, 12 to the region, on both members" "T=\$(qgtlog $(qgl 0) 0x185000); [ \"\$T\" = \"\$(qgtlog $(qgl 1) 0x185000)\" ] && echo \"\$T\" | grep -qE '^5354 [0-9a-f]+ 1 600 2024241 4800 c$' && [ \$((0x\$(echo \$T | cut -d' ' -f2))) = $((0x7e000 - 0x4800)) ]"
 sleep 6; $M -S /dev/$B >/dev/null 2>&1; sleep 1
 T=$(qgtlog $(qgl 0) 0x185000); D=$((0x$(echo $T | cut -d' ' -f2)))
-check "48: stopped midway: the log is on, past the old capacity, at a region; -E says the migration" "[ \"\$T\" = \"\$(qgtlog $(qgl 1) 0x185000)\" ] && [ $D -gt $((0x7e000)) ] && [ $((D % 0x4800)) = 0 ] && $M -E $(qgl 0) | grep -q 'Migration : RAID10N 1 x 2, 256 MiB -> RAID10N 1 x 2, 1200 MiB; [0-9]*% done'"
+check "48: stopped midway: the log is on, from a region below the old capacity's on, at a region; -E says the migration" "[ \"\$T\" = \"\$(qgtlog $(qgl 1) 0x185000)\" ] && [ $D -ge $((0x7e000 - 0x4800)) ] && [ $((D % 0x4800)) = 0 ] && $M -E $(qgl 0) | grep -q 'Migration : RAID10N 1 x 2, 256 MiB -> RAID10N 1 x 2, 1200 MiB; [0-9]*% done'"
 echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
 $M -I /dev/$CN >/dev/null 2>&1; sleep 1; B=$(qgmd b48)
 check "48: assembled again: 1200 MiB a member, md resyncs from the log ($D)" "[ \$(cat /sys/block/$B/md/component_size) = $((1200 * 1024)) ] && [ \$(cut -d' ' -f1 /sys/block/$B/md/sync_completed) -ge $D ]"
@@ -6612,6 +6612,42 @@ check "69d: done: md raid10 of 128 KiB, the data as written, md check 0; the LD 
 q66fast; qgdrop q66; rm -f $WQ/q66fin.img
 fi
 # --- end of stage 69 ---
+
+# --- stage 70: growing in place - the transform log a region behind md. Real hardware (1.4 to 1.6): the AMD Windows
+# driver 9.3.3.218 goes on with such a growth from the region after ProtectStart, taking that one as done; the rest
+# of the region md had stopped in was left without parity or a mirror copy (a RAID5 finished by Windows: md check
+# 7680, exactly from md's last stripe to the end of the logged region). The new part of the two halves of a RAID1
+# random and different, the growth slow, md -S midway: below ProtectStart + ProtectSize md has mirrored everything,
+# the halves are equal there; md then ends it, md check 0. A volume smaller than a region of the log is refused.
+if want 70; then
+cd "$MDADM_DIR"
+stopall
+qgmk q70 4 1
+$M -C /dev/md/amd70 -e amd -n 4 $QGL --run >/dev/null 2>&1; CN=$(cont1)
+$M -C /dev/md/g70 -e amd -l1 -n2 -z 64M $(qgl 0) $(qgl 1) --run >/dev/null 2>&1
+$M -C /dev/md/s70 -e amd -l1 -n2 -z 8M $(qgl 2) $(qgl 3) --run >/dev/null 2>&1
+sleep 1; waitrec; G=$(qgmd g70); S=$(qgmd s70)
+check "70: a RAID1 of 8 MiB, less than a region of the log (0x4800): --grow --size refused" "$M --grow /dev/$S --size=16M 2>&1 | grep -q 'AMD logs a growth in regions of 9216 KiB: a smaller volume cannot be grown in place' && [ \$(cat /sys/block/$S/md/component_size) = 8192 ]"
+L0=$(qgl 0); L1=$(qgl 1)
+O0=$(cat /sys/block/$G/md/dev-${L0#/dev/}/offset); O1=$(cat /sys/block/$G/md/dev-${L1#/dev/}/offset)
+OLD=$((64 * 2048)); NEW=$((256 * 2048)); P=$((0x4800))
+for l in "$L0 $O0" "$L1 $O1"; do set -- $l
+	sudo dd if=/dev/urandom of=$1 bs=512 seek=$(($2 + OLD)) count=$((NEW - OLD)) oflag=direct status=none; done
+# legs <from> <to>: the two halves hold the same from..to (sectors of the member's data)
+legs() { cmp -s <(sudo dd if=$L0 bs=512 skip=$((O0 + $1)) count=$(($2 - $1)) iflag=direct status=none) \
+	<(sudo dd if=$L1 bs=512 skip=$((O1 + $1)) count=$(($2 - $1)) iflag=direct status=none); }
+echo 3000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+$M --grow /dev/$G --size=256M >/dev/null 2>&1; sleep 9
+$M -S /dev/$G >/dev/null 2>&1; sleep 1
+T=$(qgtlog $L0 $((O0 - 0x5000))); D=$((0x$(echo $T | cut -d' ' -f2)))
+check "70: stopped midway ($D): md has mirrored all below the log's region end - where the Windows driver goes on - the rest not yet" "echo \"\$T\" | grep -qE '^5354 [0-9a-f]+ 1 600 2024241 4800 c$' && [ $((D % P)) = 0 ] && [ $D -ge $((OLD - OLD % P - P)) ] && legs $OLD $((D + P)) && ! legs $((NEW - P)) $NEW"
+echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+$M -I /dev/$CN >/dev/null 2>&1; sleep 1; G=$(qgmd g70); waitrec; sleep 3
+echo check | sudo tee /sys/block/$G/md/sync_action >/dev/null; sleep 1; waitrec
+check "70: assembled again, md ends it: 256 MiB, the halves equal, md check 0" "[ \$(cat /sys/block/$G/md/component_size) = $((256 * 1024)) ] && legs 0 $NEW && [ \$(cat /sys/block/$G/md/mismatch_cnt) = 0 ]"
+qgdrop q70
+fi
+# --- end of stage 70 ---
 
 # the ASRock and X399 snapshots are untouched: attached before stage 7, assembled only in stage 1
 if want 1; then

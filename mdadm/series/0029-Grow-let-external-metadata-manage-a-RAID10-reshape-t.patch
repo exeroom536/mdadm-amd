@@ -1,7 +1,7 @@
 From d59400ad1289ab3352a29e34f906a7babb211d6a Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:12 +0500
-Subject: [PATCH 29/53] Grow: let external metadata manage a RAID10 reshape
+Subject: [PATCH 29/54] Grow: let external metadata manage a RAID10 reshape
  that moves the data
 
 reshape_array() hands a RAID10 reshape to raid10_reshape(), which moves

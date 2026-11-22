@@ -110,9 +110,12 @@ As with the AMD migrations, a volume grows only into the free space right behind
 volume after it on the same disks leaves no room. The data stay where they are; md resyncs the new part, or copies
 each disk onto its new mirror. The migration is recorded as the AMD driver records it; stopped midway, it goes on
 from where it was at the next assembly. Not supported: growing a RAID0 or a Volume, other layouts and numbers
-of disks for RAID10. Growing a RAID1 in place was tried on real hardware: the BIOS menu shows the new size, and
-the Windows driver reads the volume and finishes such a growth stopped midway. RAID5, RAID10 and RAID0 → RAID10
-were tried in emulation with AMD's Linux driver, which takes and finishes these migrations as its own.
+of disks for RAID10, a volume smaller than one region of AMD's log of the migration (9 MiB for a RAID1, 16 MiB
+for a RAID10, 9 MiB a data disk for a RAID5). Growing a RAID1, a RAID10 or a RAID5 in place was tried on real
+hardware: the Windows driver reads the volume and finishes such a growth stopped midway (with mdadm before 1.6.1
+it left a strip of the new part out of sync, see the changelog), and the BIOS menu shows a grown RAID1 with its
+new size. RAID0 → RAID10 was tried in emulation with AMD's Linux driver, which takes and finishes these
+migrations as its own.
 
 ## More disks, RAID1 → RAID5, stripe size
 

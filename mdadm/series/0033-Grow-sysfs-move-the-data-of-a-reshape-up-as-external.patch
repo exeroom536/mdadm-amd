@@ -1,7 +1,7 @@
 From b61287f022b502b93a246ca5010efe8f170f76a9 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Fri, 20 Nov 2026 12:55:12 +0500
-Subject: [PATCH 33/53] Grow, sysfs: move the data of a reshape up as external
+Subject: [PATCH 33/54] Grow, sysfs: move the data of a reshape up as external
  metadata records it
 
 External metadata may move the data of a reshape up: AMD RAIDXpert2

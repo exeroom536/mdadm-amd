@@ -1,7 +1,7 @@
 From 1c1f0f46a1b57772e267f9b8c2970edc29f6c499 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:35 +0500
-Subject: [PATCH 38/53] super-amd: read AMD RAIDXpert2 (RAIDCore) metadata
+Subject: [PATCH 38/54] super-amd: read AMD RAIDXpert2 (RAIDCore) metadata
 
 AMD RAIDXpert2 is the RAID of AMD chipsets (X399, X570, X670, X870...):
 the BIOS (RAIDCoreDxe) and the AMD Windows driver keep the arrays in

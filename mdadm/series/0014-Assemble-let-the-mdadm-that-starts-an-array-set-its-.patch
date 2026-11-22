@@ -1,7 +1,7 @@
 From e2d52c9da7e32a25268bd20ab49fdd04034d89dc Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:52:17 +0500
-Subject: [PATCH 14/53] Assemble: let the mdadm that starts an array set its
+Subject: [PATCH 14/54] Assemble: let the mdadm that starts an array set its
  resync point
 
 With incremental assembly (mdadm -I per disk, run by udev in parallel at

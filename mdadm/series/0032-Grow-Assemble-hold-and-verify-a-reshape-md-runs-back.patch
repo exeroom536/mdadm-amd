@@ -1,7 +1,7 @@
 From bd1da305a5a326694ed081f9a068e7b8ee849b65 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Fri, 20 Nov 2026 12:55:12 +0500
-Subject: [PATCH 32/53] Grow, Assemble: hold and verify a reshape md runs
+Subject: [PATCH 32/54] Grow, Assemble: hold and verify a reshape md runs
  backwards where it is
 
 md reshapes an array backwards - from the end - with fewer data disks,

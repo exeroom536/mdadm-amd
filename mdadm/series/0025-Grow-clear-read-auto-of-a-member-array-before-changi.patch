@@ -1,7 +1,7 @@
 From b7358a784363d5c47f75c691c8aff478edb23135 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:04 +0500
-Subject: [PATCH 25/53] Grow: clear read-auto of a member array before changing
+Subject: [PATCH 25/54] Grow: clear read-auto of a member array before changing
  its size
 
 md changes the component size of a writable array only (update_size()

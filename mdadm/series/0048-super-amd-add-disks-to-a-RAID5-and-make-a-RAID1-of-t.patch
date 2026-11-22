@@ -1,7 +1,7 @@
 From 0d6691c8cf457bbb0188e22cac719ffcd059ac83 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:54:12 +0500
-Subject: [PATCH 48/53] super-amd: add disks to a RAID5, and make a RAID1 of
+Subject: [PATCH 48/54] super-amd: add disks to a RAID5, and make a RAID1 of
  two a RAID5
 
 mdadm --grow <RAID5> --raid-devices=N and <RAID1 of two> --level=5
