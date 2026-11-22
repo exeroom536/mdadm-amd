@@ -113,8 +113,8 @@ from where it was at the next assembly. Not supported: growing a RAID0 or a Volu
 of disks for RAID10, a volume smaller than one region of AMD's log of the migration (9 MiB for a RAID1, 16 MiB
 for a RAID10, 9 MiB a data disk for a RAID5). Growing a RAID1, a RAID10 or a RAID5 in place was tried on real
 hardware: the Windows driver reads the volume and finishes such a growth stopped midway (with mdadm before 1.6.1
-it left a strip of the new part out of sync, see the changelog), and the BIOS menu shows a grown RAID1 with its
-new size. RAID0 → RAID10 was tried in emulation with AMD's Linux driver, which takes and finishes these
+it left a strip of the new part out of sync, see the changelog), and the BIOS menu shows each grown volume with
+its new size. RAID0 → RAID10 was tried in emulation with AMD's Linux driver, which takes and finishes these
 migrations as its own.
 
 ## More disks, RAID1 → RAID5, stripe size

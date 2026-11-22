@@ -127,7 +127,8 @@ started. No SELinux denials. The tree the script lays out is the same, file for 
   grown in place from 1 to 2 GiB a member, the new part holding random data first, stopped with `mdadm -S` twice
   and assembled (going on from the AMD log), finished by Windows (driver 9.3.3.218): `md` check clean on all
   three, every sector of the old part right. With 1.6 the RAID5 so finished had 7680 sectors of wrong parity:
-  the Windows driver goes on from the region after the log's mark, see the changelog.
+  the Windows driver goes on from the region after the log's mark, see the changelog. A RAID10 and a RAID5 grown
+  so by Linux to the end: the BIOS menu shows each Normal with 4.2 GB, and writes nothing to the disks.
 
 ## Emulation
 
@@ -211,8 +212,7 @@ controller check refusing a disk on real hardware; distributions other than the 
 GRUB with shim; root file systems other than ext4 on a volume; booting from a volume on Manjaro, EndeavourOS, Linux
 Mint and the distributions checked by build only; RHEL itself; the md bitmap module under Secure Boot (with the
 DKMS key enrolled) and its rebuild by DKMS on a kernel update outside Arch; RAID0 → RAID10 on real hardware, with
-the Windows driver or the BIOS menu; the BIOS menu after growing a RAID5 or a RAID10 in place (Windows finished
-both, see Hardware); a RAID1 →
+the Windows driver or the BIOS menu; a RAID1 →
 RAID5 or a RAID10 stripe size change stopped midway and finished by Windows, and migrations with the Windows
 driver 9.5 or 9.3.3.329, on real hardware (in a VM they were); reading a RAID10 on real disks while Windows
 finishes its stripe size change; two migrations left in one container, and a volume the AMD driver recorded offline taken back,

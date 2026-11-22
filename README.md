@@ -75,8 +75,8 @@ More — spares, RAIDABLE, the md bitmap, failed disks, booting — in [docs/usa
 ## Limitations
 
 - One AMD board tested so far; NVMe arrays only in emulation. See [docs/testing.md](docs/testing.md).
-- Migrations tried on real hardware, with the BIOS menu and Windows: growing a RAID1, a RAID10 or a RAID5 in place
-  (the BIOS menu looked at for the RAID1), more disks for a RAID0 or a RAID5, a RAID1 of two into a RAID5, the
+- Migrations tried on real hardware, with the BIOS menu and Windows: growing a RAID1, a RAID10 or a RAID5 in place,
+  more disks for a RAID0 or a RAID5, a RAID1 of two into a RAID5, the
   stripe size of a RAID5 and of a RAID10. RAID0 → RAID10 only in emulation.
 - A second migration of a volume whose data a migration moved already (more disks again in place, through AMD's
   log of the data; the stripe size, the data going back up): on real hardware a RAID5 and a RAID10, finished by

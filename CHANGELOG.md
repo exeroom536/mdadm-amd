@@ -25,7 +25,8 @@ the emulated AMD controllers. mdadm's own tests on `4cd7d33c`: 69 pass, 0 fail, 
 1 GiB a member grown to 2 GiB, the new part filled with random data first, stopped with `mdadm -S` twice and
 going on after assembly, then finished by the Windows driver: `md` check clean on all three, every sector of the
 old part right (with 1.6 the RAID5 showed the bug above). The BIOS menu shows the RAID5 of 1.6's second migration
-as Normal, 128 KB, all disks online, and writes nothing to the disks.
+as Normal, 128 KB, all disks online, and writes nothing to the disks; after the release, a RAID10 and a RAID5
+grown by Linux: Normal with the new size, nothing written.
 
 ## 1.6 — 2026-11-22
 
