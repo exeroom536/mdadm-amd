@@ -149,7 +149,10 @@ The board's RAIDCoreDxe in QEMU with emulated AMD SATA and NVMe controllers:
   this mdadm with the data intact; Volume, RAID10 and RAID5 the other way round too; members that come back after
   Windows ran without them. Initialization, rebuild and the RAIDABLE → RAID1 migration go on from the other one's
   mark both ways. Volumes with an md bitmap: the driver leaves its area alone; after Windows wrote a volume, `mdmon`
-  does not trust the md bits.
+  does not trust the md bits. 1.6.1 (9.3.3.218 in a VM): a RAID0 → RAID10 and a RAIDABLE → RAID1 migration
+  stopped midway are finished by the driver from the start of the region in the AMD log, repeating it, so nothing
+  is left out (the future mirrors held random data first); growing in place goes on from the region after it -
+  with 1.6 that left a strip out of sync, with 1.6.1 nothing (the same as on real hardware, see the changelog).
 - **Windows driver** 9.5.0-00201 (in a VM): takes RAID0, RAID1, RAID10 and RAID5 volumes made by this mdadm with the
   data intact, and the other way round (a RAID5 it made, data it wrote); a rebuild it started is finished by
   `mdmon`; a member that fell behind during its rebuild is not taken back. After Linux crashed while writing, it
