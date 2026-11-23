@@ -1,7 +1,7 @@
 From 141226e27bc11adc5fd5050b25093723148b6736 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:08 +0500
-Subject: [PATCH 27/54] Grow: take the new data offsets that external metadata
+Subject: [PATCH 27/56] Grow: take the new data offsets that external metadata
  records
 
 A reshape that moves the data needs a new_offset for each device.

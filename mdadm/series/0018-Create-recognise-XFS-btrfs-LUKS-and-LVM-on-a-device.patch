@@ -1,7 +1,7 @@
 From 6a80c5a13928c20125c30a80eca214ee3df359bb Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:52:38 +0500
-Subject: [PATCH 18/54] Create: recognise XFS, btrfs, LUKS and LVM on a device
+Subject: [PATCH 18/56] Create: recognise XFS, btrfs, LUKS and LVM on a device
 
 Create warns about an ext2/3/4 or reiserfs file system on a device it is
 about to use, and asks before it goes on; it says nothing about the

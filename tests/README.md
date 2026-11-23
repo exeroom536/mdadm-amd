@@ -1,6 +1,6 @@
 # Test suite
 
-Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 845 checks in 83
+Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 850 checks in 84
 stages, on images of real AMD RAID disks, of disks made by the board's own RAID firmware in emulation, and of
 disks this mdadm makes. Everything runs on loop devices of sparse files (plus LIO SCSI disks backed by files for
 the udev stages); no real disk is touched unless you provide the optional AMD controller disks below.
@@ -138,6 +138,8 @@ about the X399 fixture (its dump has no LBA 0), printed by `-E` inside checks.
 | 67 | a migration in place held midway through a stripe of the old layout, with a reader there: no hang between md and mdadm (the window of held writes moves only where stripes of both layouts end); rcraid's own and ours, mdadm killed midway |
 | 68 | chunk changes of one volume one after another without a pause (RAID10, RAID5: down forwards, up backwards): each held, in its direction, with AMD's log of a region; `mdadm --grow` through a pipe comes back as the migration ends |
 | 69 | the backwards chunk change of stage 66 carried on by `mdadm --grow --continue` (as the `mdadm-grow-continue@` unit under systemd): the manager killed at the start, midway and after `-S` and assembly - the new one lets md on from the AMD log; the end as rcraid's |
+| 70 | growing in place: the transform log a region behind md - a RAID1 whose new part differs on its two halves, stopped midway: md has mirrored all below the end of the logged region, where the Windows driver goes on; assembled again, md ends it, md check 0; a volume smaller than a region refused |
+| 71 | the end of the AMD driver's own migrations cut short in their last milliseconds (rcraid's records of those moments): a RAID0 of 2 → 3 with its log "completed" goes on from the log's mark, with its "100 %" record (67.29 %, the log there or cleared) runs at once as a RAID0 of 3; a RAID5 of 3 → 4 with its log "completed" at the end runs at once as a RAID5 of 4 and is ended by mdmon as the AMD driver ends it |
 
 Fixtures and where they come from: [fixtures/README.md](fixtures/README.md). `helpers/` has the scripts that
 forge metadata with valid checksums for some stages; `../tools/amdraid_dump.py` parses it.

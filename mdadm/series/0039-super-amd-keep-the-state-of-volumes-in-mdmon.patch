@@ -1,7 +1,7 @@
 From 7b47c9d9fa275383139cf4b4bd2a4bde9a12f962 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:42 +0500
-Subject: [PATCH 39/54] super-amd: keep the state of volumes in mdmon
+Subject: [PATCH 39/56] super-amd: keep the state of volumes in mdmon
 
 RAID1, RAID10 and RAID5 volumes (they have an AMD write-intent bitmap)
 and RAIDABLE ones (it has none) now run read-write: mdmon keeps their

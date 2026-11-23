@@ -189,7 +189,10 @@ The board's RAIDCoreDxe in QEMU with emulated AMD SATA and NVMe controllers:
   driver takes a stripe size change, which its tools do not offer, through to the end too. Two migrations the
   driver left in one container are finished by mdadm one after the other. A volume the driver recorded offline,
   whose disks went away together and came back, is taken back by mdadm without a rebuild and is normal under the
-  driver again.
+  driver again. 1.6.3: the driver's own migrations onto more disks (a RAID0 of 2 → 3, a RAID5 of 3 → 4) cut
+  short in their last milliseconds, after its log went "completed" and before its final record, go on from
+  the log's mark or run as they are, the data the same; 1.6.1 reshaped them from the start and lost the data (1.5 to
+  1.6.2 have the same code).
 
 ## Metadata only
 
@@ -198,13 +201,14 @@ An ASRock X670E RAID0 of two NVMe drives (our dump) and an ASUS X399 RAID10 (pub
 ## Test suites
 
 - The test suite in [tests/](../tests/README.md), on loop devices with metadata of real disks and of the emulated
-  board: 845 checks, all pass on a VM with the emulated AMD controllers (1.6.1; 842 for 1.6, 797 for 1.5.1, 791 for 1.5, 639 for 1.4, 586 for 1.3, 573 for 1.2, 545 for
+  board: 850 checks, all pass on a VM with the emulated AMD controllers (1.6.3; 845 for 1.6.1, 842 for 1.6, 797 for 1.5.1, 791 for 1.5, 639 for 1.4, 586 for 1.3, 573 for 1.2, 545 for
   1.1; for 1.0: 530 checks, 504 of them also on a plain VM without the controllers).
 - The same suite with mdadm and mdmon built with AddressSanitizer and UBSan: no reports. A fuzzer on the metadata
   parser: no crashes. (Both for 1.0.)
 - The upstream mdadm test suite: no regressions (1.6 and 1.6.1: 69 pass, 0 fail, 1 skipped on upstream `4cd7d33c`; 1.5 and
-  1.1: 67 pass, 0 fail, 1 skipped, the same as upstream `5542bf40` alone). The upstream CI build matrix; no new
-  compiler warnings on the distributions above and on i686, s390x, powerpc and musl (for 1.0; for 1.1 to 1.6 each
+  1.1: 67 pass, 0 fail, 1 skipped, the same as upstream `5542bf40` alone; not run again for 1.6.3, whose fix is in `super-amd.c`
+  alone). The upstream CI build matrix; no new
+  compiler warnings on the distributions above and on i686, s390x, powerpc and musl (for 1.0; for 1.1 to 1.6.3 each
   patch of the series builds with gcc and clang without new warnings).
 
 ## Not tested
@@ -225,6 +229,7 @@ drivers in a VM it was), and a disk that goes away or fails in every volume it s
 hardware (it needs a disk unplugged; SATA hot plug was tried with an earlier release, see Hardware);
 the BIOS menu with the second migration of a volume whose data a migration moved already and with the stripe size
 change of such a volume (1.6; on real hardware the Windows driver finished both, see Hardware);
+how the Windows driver ends its own migrations onto more disks (1.6.3 takes them as rcraid ends them);
 other boards and BIOS versions.
 
 ## Not supported

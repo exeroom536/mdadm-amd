@@ -338,6 +338,7 @@ struct amd_tlog {
 } __attribute__((packed));
 
 #define AMD_TLOG_STARTED	1
+#define AMD_TLOG_COMPLETED	2
 #define AMD_TFLAGS_RESTORE	0x241	/* TransformFlags of RESTORE_SEGMENTS */
 #define AMD_TFLAGS_CREATE	0x211	/* of CREATE_REDUNDANCY (menu, mdadm -C) */
 /*
@@ -4642,6 +4643,10 @@ static unsigned long long amd_tlog_mark(const struct amd_tlog *t)
  * Volume sectors done by transform @type of @v, from its transform log on
  * the column-0 elements of @tl (written by us or by the AMD driver), or 0
  * if no copy is valid (rcblob RC_IsTransformLogValid, RC_RestartTask).
+ * A log COMPLETED is valid too: rcraid 9.3.3-00302 marks it so at the end
+ * of the copy, before its "100 %" packet - all done up to ProtectStart -
+ * and clears it after (dumps/2026-11-23-q26r0b); the AMD driver ends the
+ * transform on it without I/O (RC_CheckTransformLogs, RC_RestartTask).
  * The least of the valid copies: a copy on a disk that was missing lags
  * behind, or predates a restart from 0 (amd_target_behind); copying more
  * is harmless, less is not.  Data moving onto more disks are the other way
@@ -4684,7 +4689,8 @@ static unsigned long long amd_tlog_pick(struct amd_super *super,
 		    __le64_to_cpu(t->checksum) != amd_tlog_checksum(t) ||
 		    t->id.id != v->ld->id.id || !t->flags ||
 		    __le32_to_cpu(t->type) != type ||
-		    __le32_to_cpu(t->status) != AMD_TLOG_STARTED)
+		    (__le32_to_cpu(t->status) != AMD_TLOG_STARTED &&
+		     __le32_to_cpu(t->status) != AMD_TLOG_COMPLETED))
 			continue;
 		mark = amd_tlog_mark(t);
 		/* backwards the furthest is the lowest */
@@ -4761,12 +4767,20 @@ static unsigned long long amd_short_of_end(unsigned long long done,
  * The "100 %" packet of the transform recorded for @v is the live one -
  * TransformState COMPLETED, 100000 per cent: all is copied, the log may be
  * cleared already.  The AMD driver then ends the transform without I/O
- * (rcblob RC_RestartTask).
+ * (rcblob RC_RestartTask: TransformState COMPLETED is enough there).  Of
+ * a migration onto more disks also one short of 100 % that is past the
+ * data the volume had: rcraid 9.3.3-00302 ends a RAIDABLE -> RAID0 of
+ * twice the capacity so, at the old capacity rounded up to its region
+ * (50.27 %, dumps/2026-11-23-q26r0) - the rest of the RAID0 is new.
  */
 static int amd_transform_copied(const struct amd_vol *v)
 {
-	return __le32_to_cpu(v->ld->transform_percent) == AMD_PERCENT_DONE &&
-	       __le32_to_cpu(v->ld->transform_state) == AMD_TRANSFORM_COMPLETED;
+	if (__le32_to_cpu(v->ld->transform_state) != AMD_TRANSFORM_COMPLETED)
+		return 0;
+	return __le32_to_cpu(v->ld->transform_percent) == AMD_PERCENT_DONE ||
+	       (v->grow == AMD_GROW_RESHAPE &&
+		__le64_to_cpu(v->ld->transform_protect_start) >=
+		__le64_to_cpu(v->ld->capacity));
 }
 
 /*
@@ -6220,6 +6234,9 @@ static void amd_print_volume(struct amd_super *super, int vol)
 		/* backwards what is moved is from the mark up */
 		if (v->grow == AMD_GROW_RESHAPE && amd_data_up(ld, v->link))
 			done = cap - min(amd_reshape_mark(super, v), cap);
+		/* its "100 %" packet: the log may be cleared already */
+		if (amd_transform_copied(v))
+			done = cap;
 		/* the chunk, if it changes (only mdadm changes it) */
 		if (ld->cache_tag_size != v->link->cache_tag_size) {
 			snprintf(from, sizeof(from), ", %d KiB chunk",

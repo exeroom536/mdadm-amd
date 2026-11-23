@@ -6649,6 +6649,46 @@ qgdrop q70
 fi
 # --- end of stage 70 ---
 
+# --- stage 71: the end of a migration the AMD driver began itself. rcraid 9.3.3-00302 ends one onto more disks so:
+# the transform log goes COMPLETED (status 2, ProtectStart where the copy ended), 2 to 6 ms later the "100 %" packet,
+# then the log is cleared and the final packet written (rcblob RC_CheckTransformLogs takes a log COMPLETED for valid,
+# RC_RestartTask ends the transform on it without I/O). Fixture 2026-11-23-rcraid-migration-end: moments of that
+# window from rcraid's own bytes (the commit block and the log as rcraid wrote them then, newer packets of the ring
+# zeros), a RAID0 2 -> 3 of the largest capacity (its "100 %" is 67.29 %, at the old capacity, 0x5f7c00) and a
+# RAID5 3 -> 4. md must not reshape from 0 - it would read the old layout over the data moved already (1.6.1-1.6.2
+# did, the volume was lost): c3-f1 (the start packet and the log COMPLETED) from the log's mark; c3-f2, c3-f3 ("100 %"
+# with the log and without) a RAID0 of 3 at once; r5g-f1 (the start packet, the log COMPLETED at the end) a RAID5 of
+# 4 at once, ended by mdmon. A RAID0 taken as finished keeps AMD's "100 %" (no mdmon for a RAID0; the AMD driver
+# ends it without I/O at its next start) - not checked.
+if want 71; then
+cd "$MDADM_DIR"
+stopall
+Q71D=$FIXT/2026-11-23-rcraid-migration-end
+# q71fix <snapshot>: four disks of 2 GiB - the snapshot's metadata (LBA 0...0x6000) and the start of the extents
+# (0x100 sectors from 0x100000: the transform log)
+q71fix() { local n; qgdrop q71; mkdir -p $WQ/q71; QGL=""
+	for n in 0 1 2 3; do truncate -s 2G $WQ/q71/d$n.img
+		xz -dc $Q71D/$1-sata$n-lba0-6000.img.xz | dd of=$WQ/q71/d$n.img conv=notrunc status=none
+		xz -dc $Q71D/$1-sata$n-lba0x100000-100.img.xz | dd of=$WQ/q71/d$n.img bs=512 seek=$((0x100000)) conv=notrunc status=none
+		QGL="$QGL $(sudo losetup -f --show $WQ/q71/d$n.img)"; done; }
+q71vol() { for m in $(ls /sys/block | grep ^md); do grep -q '^external:[-/]md' /sys/block/$m/md/metadata_version 2>/dev/null && echo $m; done | head -1; }
+echo 1000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+q71fix c3-f1; qgasm; V=$(q71vol); sleep 2
+RS=$(cat /sys/block/$V/md/reshape_position 2>/dev/null)
+check "71: c3-f1 (rcraid's RAID0 2 -> 3: the start packet live, its log COMPLETED at 0x5f7c00): md raid4 reshapes on from the log's mark, not from 0" "[ -n '$V' ] && [ \$(cat /sys/block/$V/md/level) = raid4 ] && [ \"\$RS\" -ge $((0x5f7c00)) ] && [ \"\$RS\" -lt $((0x5f7c00 + 0x40000)) ]"
+for f in c3-f2 c3-f3; do
+	q71fix $f; qgasm; V=$(q71vol); sleep 2
+	check "71: $f (rcraid's \"100 %\" of the RAID0 2 -> 3, 67.29 %, the log $([ $f = c3-f2 ] && echo COMPLETED || echo cleared)): md raid0 of 3 at once, no reshape, at the new capacity; -E 100% done" "[ -n '$V' ] && [ \$(cat /sys/block/$V/md/level) = raid0 ] && [ \$(cat /sys/block/$V/md/raid_disks) = 3 ] && [ \$(cat /sys/block/$V/size) = $((0x8f1000)) ] && [ -z \"\$(mdof raid4)\" ] && $M -E $(qgl 0) | grep -q 'Migration : .*; 100% done'"
+done
+q71fix r5g-f1; qgasm; V=$(q71vol); sleep 2
+check "71: r5g-f1 (rcraid's RAID5 3 -> 4: the start packet live, its log COMPLETED at the end, 0x8f1000): md raid5 of 4 at once, no reshape from 0" "[ -n '$V' ] && [ \$(cat /sys/block/$V/md/level) = raid5 ] && [ \$(cat /sys/block/$V/md/raid_disks) = 4 ] && [ \"\$(cat /sys/block/$V/md/sync_action)\" != reshape ] && [ \$(cat /sys/block/$V/size) = $((0x8f1000)) ]"
+for i in $(seq 1 30); do [ $(qgld $WQ/q71/d0.img 811bf40a3e20 | wc -l) = 1 ] && break; sleep 1; done
+check "71: r5g-f1 ... ended by mdmon: one LD, a RAID5 of 4, NORMAL COMPLETED, the log cleared" "qgld $WQ/q71/d0.img 811bf40a3e20 | grep -qE '^type=[0-9a-f]+ st=200 tt=0 lo=5354 ts=a1a6 cap=8f1000 .* fs=1x4 tf=0 ' && [ \$(qgld $WQ/q71/d0.img 811bf40a3e20 | wc -l) = 1 ] && [ \"\$(qgtlog $(qgl 0) 0x100000)\" = '0 0 0 0 0 0 0' ]"
+echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+qgdrop q71
+fi
+# --- end of stage 71 ---
+
 # the ASRock and X399 snapshots are untouched: attached before stage 7, assembled only in stage 1
 if want 1; then
 # reg <image> <fixture> <LBA>: the image has the fixture (xz or raw) at that LBA

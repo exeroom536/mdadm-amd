@@ -1,7 +1,7 @@
 From 74efabb03278bf1fe41872a0895355810b664007 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:14 +0500
-Subject: [PATCH 30/54] Assemble, Grow: go on with a reshape that moves the
+Subject: [PATCH 30/56] Assemble, Grow: go on with a reshape that moves the
  data from its start
 
 assemble_container_content() starts an array whose reshape is at 0 as

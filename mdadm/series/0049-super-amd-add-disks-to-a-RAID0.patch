@@ -1,7 +1,7 @@
 From 4f98d886e3b6f6f431562c81bd27e0899c2f6c99 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:54:17 +0500
-Subject: [PATCH 49/54] super-amd: add disks to a RAID0
+Subject: [PATCH 49/56] super-amd: add disks to a RAID0
 
 mdadm --grow <RAID0> --raid-devices=N is recorded as the AMD driver
 records the migration (rcadm -T -r0): the volume's LD with NORMAL, its

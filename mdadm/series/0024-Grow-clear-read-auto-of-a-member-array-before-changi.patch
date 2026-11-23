@@ -1,7 +1,7 @@
 From d0687567ce908bf679e4d7ca2611e7a4af5eeb6b Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:02 +0500
-Subject: [PATCH 24/54] Grow: clear read-auto of a member array before changing
+Subject: [PATCH 24/56] Grow: clear read-auto of a member array before changing
  raid_disks
 
 md changes raid_disks of a writable array only (update_raid_disks()

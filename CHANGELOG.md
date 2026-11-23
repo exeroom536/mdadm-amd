@@ -1,5 +1,48 @@
 # Changes
 
+## 1.6.3 — 2026-11-23
+
+**Fixed.**
+- A migration onto more disks that the AMD driver itself was carrying out — more disks for a RAID0 or a RAID5, a
+  RAID1 into a RAID5 (`rcadm -T`; the Windows driver's Transform is not tried) — and that was cut short in its last
+  milliseconds was reshaped by mdadm again from the start when it assembled the volume: md read the old layout over
+  the data the AMD driver had moved already, and the whole volume was lost. The AMD driver ends such a migration
+  so: its log of the migration goes "completed", a few milliseconds later the "100 %" record, then the log is
+  cleared and the final record written. A power cut, a crash or a reset after the log went "completed" and before
+  the final record left a state mdadm did not take as far as it was: it took only a log "started", and only a
+  "100 %" of exactly 100 % (the AMD driver writes the "100 %" of a RAID0 that grows its capacity at the old
+  capacity: 67.29 % for a RAID0 of two onto three). Now md goes on from where the copy ended, or runs the volume
+  as it is when the copy is done, as the AMD driver does.
+- Who is hit: a volume whose migration the AMD driver began, cut short in that window and then assembled by this
+  mdadm — 1.5 to 1.6.2 have the same code (tried with 1.6.1; 1.6.2 has the same mdadm). In emulation the window
+  was 10 to 60 ms at the end of a migration of a RAID0, 2 to 6 ms of a RAID5. Migrations this mdadm began are not
+  hit: mdmon writes no "completed" log, and its "100 %" is 100 %. If the AMD driver's migration of yours was cut
+  short and the volume has not been assembled by mdadm since, install 1.6.3 first. A volume already hit cannot be
+  repaired by mdadm.
+
+**Known issues.** A bug of md in the kernel (`raid0`, kernels 6.6 to 6.17 and the stable 5.15.y, 6.1.y, 6.6.y
+and 6.12.y; fixed in 6.18 along the way, commit e0ed2bca7bef): I/O that reaches md in the moment a RAID0 grown
+onto more disks (`mdadm --grow --raid-devices`, with any metadata, not only AMD) changes from raid4 back to
+raid0 can read data of other places and write to the wrong places, silently. Found in a VM on kernel 6.12.116,
+reproduced with md 1.2 and IMSM too. On those kernels grow a RAID0 with the volume idle (unmounted, or nothing
+reading or writing it until the growth ends); on 6.18 and later there is no need. A workaround in mdadm will
+come in the next release. Otherwise as in 1.6.1.
+
+**Tests.** Stage 71: the end of migrations of AMD's Linux driver (rcraid 9.3.3-00302) cut short at moments of that
+window, the disks made from rcraid's own records of those moments — a RAID0 of 2 → 3 (the log "completed"; the
+"100 %" record with the log and without it) and a RAID5 of 3 → 4: md goes on from the log's mark or runs the volume
+at once at its new size, and the RAID5 is ended by mdmon as the AMD driver ends it. 850 checks in 84 stages, all
+pass in a VM with the emulated AMD controllers.
+
+**Checked.** In emulation with rcraid 9.3.3-00302, on volumes with random data: the four states of stage 71 with
+their data — 1.6.1 reshaped the RAID0 and the RAID5 from the start, and the volume read back different, also after
+it was assembled again; 1.6.3 reads them back as written, also after assembling them again; rcraid itself finishes
+the same states with the data intact. A RAID1 into a RAID5 ends with the same records and was not tried with
+data. Not tried: the Windows driver (whether it ends its migrations the same way),
+real hardware. Each of the 56 patches of the series builds with gcc and clang without new warnings, and together
+they give the tree of the patch; the Arch packages build with the PKGBUILD of `packaging/arch/`. mdadm's own test
+suite was not run again: the fix is in the AMD handler (`super-amd.c`) alone.
+
 ## 1.6.2 — 2026-11-23
 
 Packaging only: mdadm and mdmon are the same as in 1.6.1.

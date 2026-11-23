@@ -1,7 +1,7 @@
 From 90b4516c1b9040ba13d3238901d96c90b297e191 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:52:18 +0500
-Subject: [PATCH 15/54] mdadm: pass --force to metadata handlers for --create
+Subject: [PATCH 15/56] mdadm: pass --force to metadata handlers for --create
  and --add
 
 A metadata handler may refuse a disk it could use, e.g. one behind a

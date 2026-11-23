@@ -1,7 +1,7 @@
 From dcd8506adcb008413fcdf49e59cff9457ef74562 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Sun, 22 Nov 2026 16:12:44 +0500
-Subject: [PATCH 53/54] super-amd: log a growth in place a region behind md
+Subject: [PATCH 53/56] super-amd: log a growth in place a region behind md
 
 The AMD Windows driver (rcraid.sys 9.3.3.218) goes on with a growth in
 place from the region after ProtectStart of the transform log: it takes

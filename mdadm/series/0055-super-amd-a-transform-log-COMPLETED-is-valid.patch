@@ -1,0 +1,62 @@
+From 3a5f921d2d9d22e85f228e14c55718aae5672f43 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:55:03 +0500
+Subject: [PATCH 55/56] super-amd: a transform log COMPLETED is valid
+
+AMD's Linux driver (rcraid 9.3.3-00302) ends each migration onto more
+disks (a RAID0 or a RAID5 and a disk, a RAID1 into a RAID5) so: the
+transform log goes COMPLETED with ProtectStart where the copy ended, a
+few milliseconds later comes the "100 %" packet, then the log is
+cleared and the final packet written.  The driver takes a log COMPLETED
+for valid (rcblob RC_CheckTransformLogs) and ends the transform on it
+without I/O (RC_RestartTask).
+
+amd_tlog_pick() took a log STARTED alone.  Stopped between the log
+COMPLETED and the "100 %" packet - a power cut in the last milliseconds
+of the migration - the volume had no mark, and md reshaped it again
+from 0, reading the old layout over the data the driver had moved: a
+RAID0 or a RAID5 lost its data.  Take a log COMPLETED too: md goes on
+from where the copy ended, or runs the volume as it is when that is
+its end.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ super-amd.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index ce0d60ae..1274756e 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -338,6 +338,7 @@ struct amd_tlog {
+ } __attribute__((packed));
+ 
+ #define AMD_TLOG_STARTED	1
++#define AMD_TLOG_COMPLETED	2
+ #define AMD_TFLAGS_RESTORE	0x241	/* TransformFlags of RESTORE_SEGMENTS */
+ #define AMD_TFLAGS_CREATE	0x211	/* of CREATE_REDUNDANCY (menu, mdadm -C) */
+ /*
+@@ -4642,6 +4643,10 @@ static unsigned long long amd_tlog_mark(const struct amd_tlog *t)
+  * Volume sectors done by transform @type of @v, from its transform log on
+  * the column-0 elements of @tl (written by us or by the AMD driver), or 0
+  * if no copy is valid (rcblob RC_IsTransformLogValid, RC_RestartTask).
++ * A log COMPLETED is valid too: rcraid 9.3.3-00302 marks it so at the end
++ * of the copy, before its "100 %" packet - all done up to ProtectStart -
++ * and clears it after (dumps/2026-11-23-q26r0b); the AMD driver ends the
++ * transform on it without I/O (RC_CheckTransformLogs, RC_RestartTask).
+  * The least of the valid copies: a copy on a disk that was missing lags
+  * behind, or predates a restart from 0 (amd_target_behind); copying more
+  * is harmless, less is not.  Data moving onto more disks are the other way
+@@ -4684,7 +4689,8 @@ static unsigned long long amd_tlog_pick(struct amd_super *super,
+ 		    __le64_to_cpu(t->checksum) != amd_tlog_checksum(t) ||
+ 		    t->id.id != v->ld->id.id || !t->flags ||
+ 		    __le32_to_cpu(t->type) != type ||
+-		    __le32_to_cpu(t->status) != AMD_TLOG_STARTED)
++		    (__le32_to_cpu(t->status) != AMD_TLOG_STARTED &&
++		     __le32_to_cpu(t->status) != AMD_TLOG_COMPLETED))
+ 			continue;
+ 		mark = amd_tlog_mark(t);
+ 		/* backwards the furthest is the lowest */
+-- 
+2.47.3
+

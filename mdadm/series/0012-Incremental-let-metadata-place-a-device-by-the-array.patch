@@ -1,7 +1,7 @@
 From 70d98fa831c3b1951f499da7557f9f20b0ad14d2 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:52:13 +0500
-Subject: [PATCH 12/54] Incremental: let metadata place a device by the arrays
+Subject: [PATCH 12/56] Incremental: let metadata place a device by the arrays
  assembled
 
 Incremental() picks the container for a device by the UUID that

@@ -1,7 +1,7 @@
 From 12f163c216ab2002186828e9542e74de3881752d Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Fri, 20 Nov 2026 12:55:12 +0500
-Subject: [PATCH 52/54] super-amd: another chunk for data a migration moved
+Subject: [PATCH 52/56] super-amd: another chunk for data a migration moved
  already, back up from the end
 
 A volume whose data an AMD migration moved to AllocatedSpace + 0x800

@@ -1,7 +1,7 @@
 From 0a87ce52e300a18bb2fbad6c6227ee2f56c8a693 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:53 +0500
-Subject: [PATCH 43/54] super-amd: dedicated hot spares
+Subject: [PATCH 43/56] super-amd: dedicated hot spares
 
 AMD volumes can have up to four spares of their own, taken before the
 global ones.  With the subarray_spare method:

@@ -148,6 +148,11 @@ migration used part of it, as with AMD. For a RAID5, `--chunk` goes with `--raid
   change moves them back up 9 MiB, from the end of the volume, as AMD would. More disks and another stripe size
   at once are refused then: one, then the other. Growing in place still works.
 - Not supported: fewer disks, more disks for a RAID10, the stripe size of a RAID0.
+- **A RAID0 onto more disks on kernels 6.6 to 6.17 and the stable 5.15.y, 6.1.y, 6.6.y and 6.12.y: keep the
+  volume idle** (unmounted, or nothing reading or writing it) until the growth ends. A bug of md there (fixed in
+  6.18) lets I/O that comes in the moment md turns the volume from raid4 back into raid0 read data of other
+  places and write to the wrong places, silently - with any metadata, not only AMD (found in a VM on kernel
+  6.12.116, reproduced with md 1.2 and IMSM too). A workaround in mdadm will come in the next release.
 
 Tried on real hardware with the BIOS menu and Windows: RAID5 of 3 → 4 disks, RAID0 of 2 → 3 disks, RAID1 of two
 → RAID5 of 3, the stripe size of a RAID5 (64 → 128 KiB) and of a RAID10 (64 → 256 KiB). RAID5 of 3 → 4, RAID0 of

@@ -1,7 +1,7 @@
 From 528e48540fc62aa0a74faf29d20a410b0fd23f06 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:53:19 +0500
-Subject: [PATCH 34/54] mdmon: let the metadata keep a member failure to its
+Subject: [PATCH 34/56] mdmon: let the metadata keep a member failure to its
  subarray
 
 When md fails a device in one member array, mdmon fails it in every
