@@ -1,5 +1,21 @@
 # Changes
 
+## 1.6.2 — 2026-11-23
+
+Packaging only: mdadm and mdmon are the same as in 1.6.1.
+
+**Fixed.**
+- `md-bitmap-ext-dkms` was built for kernels that load only modules signed by their own key
+  (`CONFIG_MODULE_SIG_FORCE`), such as `linux-cachyos-eac` of CachyOS (November 2026, for Easy Anti-Cheat). Such a
+  kernel refuses the module DKMS signs with its own key, even with that key enrolled, and does not fall back to its
+  own `md_mod`: no md array would start there, and a system with its root on a volume would not boot with that
+  kernel. DKMS now skips such kernels, and they keep their own `md_mod` (arrays work, without the md bitmap).
+
+**Checked.** In an Arch container with the headers of `linux-cachyos-eac` and `linux-cachyos` 7.3.5-2 and DKMS
+3.4.5: 1.6.1 builds the module for both kernels; 1.6.2 skips the EAC kernel and builds for the other one. The
+packages built and installed on the test PC (kernels 7.3.5 and 6.18 LTS). The EAC kernel itself was not booted:
+that it refuses the module is read from its configuration (`MODULE_SIG_FORCE`, no machine keyring).
+
 ## 1.6.1 — 2026-11-22
 
 **Fixed.**

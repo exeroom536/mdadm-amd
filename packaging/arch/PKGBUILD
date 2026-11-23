@@ -13,7 +13,7 @@ pkgname=('mdadm-amd' 'md-bitmap-ext-dkms')
 _commit=4cd7d33c1d2672c40ee3653006c36fe84cd1a545   # mdadm-4.6-132-g4cd7d33c, 2026-11-20 (GitHub main)
 _mdadmver=4.6.r132.g4cd7d33c   # the mdadm it is built from (provides)
 # the mdadm-amd release; a build between releases: <last release>.r<n>
-pkgver=1.6.1
+pkgver=1.6.2
 pkgrel=1
 arch=('x86_64')
 license=('GPL-2.0-or-later')
@@ -58,7 +58,7 @@ sha256sums=('523685bd7cb3d574ff829f78c3bd74aa533b6d716472be470e029c21aa3881c9'
             'f6a9e8b3a7858d90ca811ed39c27f45455aac42695993c2a5d05e40561251b76'
             '5a0039a3424a39bed9d16737f6c81125d6f988d5440d2fa39ce1858e56ca22df'
             'e9db5531d1ca8d4deecf4d08d65b2dfebf054fb3bc96a9adaa3c48ecfdbf9880'
-            '02f8321b57857c698be3123ae625bccd07b8968ef40da49ed9610ae38d426504'
+            '085286ff5eb2b2bc8b873e3f0ef9c8599bba9a96c5cd7e2a64572f6f9234f8d0'
             'db4ca682da822c23eb06220035b02e2247d16a95eb1d359930535157260c5197'
             'b34a3d38e107de70583c4c70d8bd47131eaf56f28f431aa8b763a287793c22a6'
             'c491893084e4f1f288319b99ffb273ae1db2ea7a9e29fef7b728ad5d66d67ceb'
