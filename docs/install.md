@@ -393,6 +393,10 @@ boot (in the initramfs: "Loading of module with unavailable key is rejected"). T
 off for one boot, then enroll the key or uninstall. This was tried with `module.sig_enforce=1`, which makes the
 kernel check signatures as Secure Boot does, not with Secure Boot itself.
 
+A kernel built to load only modules signed by its own key (`CONFIG_MODULE_SIG_FORCE`, such as CachyOS
+`linux-cachyos-eac` for Easy Anti-Cheat) cannot take this module even with the key enrolled, so DKMS skips it: that
+kernel keeps its own `md_mod`, and arrays work there without the md bitmap.
+
 **Uninstall:**
 
 ```sh
