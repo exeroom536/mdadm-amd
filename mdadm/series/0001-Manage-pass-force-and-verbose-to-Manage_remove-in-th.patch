@@ -1,7 +1,7 @@
 From 45e7264e4e83a8d6a1f21ac5b073788a3d0cac14 Mon Sep 17 00:00:00 2001
 From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
 Date: Thu, 19 Nov 2026 12:51:48 +0500
-Subject: [PATCH 01/56] Manage: pass force and verbose to Manage_remove() in
+Subject: [PATCH 01/62] Manage: pass force and verbose to Manage_remove() in
  their order
 
 Manage_remove() takes force before verbose, but Manage_subdevs() has

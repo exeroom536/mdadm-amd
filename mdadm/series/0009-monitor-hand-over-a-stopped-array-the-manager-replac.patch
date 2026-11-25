@@ -1,0 +1,82 @@
+From c91783cac54a602382309bb284a738052afc82ab Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 17:53:41 +0500
+Subject: [PATCH 09/62] monitor: hand over a stopped array the manager replaces
+ only once
+
+If md stops an array while the manager replaces it (a spare added, a
+device removed), the monitor holds it twice: deactivated - read_and_act()
+has cleared ->container - and as ->replaces of the copy the manager put
+in front of it.  wait_and_act() hands it to the manager both ways: as
+stopped, then, once the manager has freed it, as replaced.  discard_this
+is then the freed array - free(): double free in remove_old() - or
+whatever malloc() has put at that address since: a live array, freed
+under the monitor.  The copy meanwhile goes on with the descriptors
+free_aa() closed for the stopped original, and closes them again.
+
+manage_member() looks at a->container after the wait for the metadata
+update of a spare ("managemon: no spare for an array md stopped while it
+was being added"), but the monitor takes the update and sees the array
+stopped in the same pass, and clears ->container only after it has
+written the metadata.  The manager replaces the array meanwhile.
+
+Leave a stopped array the manager is replacing (pending_discard) to the
+pass that hands over the replaced one.  There, if md stopped it, the copy
+is stopped too and takes its descriptors: the original gets ->container
+back, so that free_aa() leaves them to the copy, which closes them when
+it goes in turn.
+
+A debug hook that stops the volume as soon as the manager has handed the
+spare's update to the monitor (RAID1 on loop devices, a spare, --fail):
+AMD - mdmon aborts (double free) 3 of 3; with the metadata write 60 ms
+slower it lives, but closes 10 descriptors twice, 3 of 3.  IMSM - 6 of 6
+the manager frees the live array that has the address of the freed one.
+With this, 12 of 12: no abort, no descriptor closed twice, every array
+handed over once.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ monitor.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/monitor.c b/monitor.c
+index 7c4e4916..01e25c3b 100644
+--- a/monitor.c
++++ b/monitor.c
+@@ -756,10 +756,12 @@ static int wait_and_act(struct supertype *container, int nowait)
+ 	for (ap = aap ; *ap ;) {
+ 		a = *ap;
+ 		/* once an array has been deactivated we want to
+-		 * ask the manager to discard it.
++		 * ask the manager to discard it - unless the manager
++		 * is replacing it: then it goes as the replaced array,
++		 * below, or the manager frees it twice.
+ 		 */
+ 		if (!a->container || a->to_remove) {
+-			if (discard_this) {
++			if (discard_this || a == pending_discard) {
+ 				ap = &(*ap)->next;
+ 				continue;
+ 			}
+@@ -875,8 +877,17 @@ static int wait_and_act(struct supertype *container, int nowait)
+ 			for (ap = &a->next; *ap && *ap != a->replaces;
+ 			     ap = & (*ap)->next)
+ 				;
+-			if (*ap)
++			if (*ap) {
+ 				*ap = (*ap)->next;
++				if (!a->replaces->container) {
++					/* md stopped it meanwhile: so is the
++					 * copy, which closes the descriptors
++					 * they share (free_aa())
++					 */
++					a->replaces->container = container;
++					a->container = NULL;
++				}
++			}
+ 			discard_this = a->replaces;
+ 			a->replaces = NULL;
+ 			/* FIXME check if device->state_fd need to be cleared?*/
+-- 
+2.47.3
+

@@ -1076,6 +1076,20 @@ static int amd_slot_usable(const struct amd_vol *v, int i)
 }
 
 /*
+ * Slot @i of @v has its member in service in the LD and none in the
+ * second copy: a stale member the AMD BIOS took out of the second copy of
+ * an initialization only (stand snapshots 07, 11: the menu shows the
+ * volume Ready).
+ */
+static int amd_slot_left_out(const struct amd_vol *v, int i)
+{
+	const struct amd_element *other = amd_other_elements(v);
+
+	return other && !v->grow && amd_element_usable(&v->el[i]) &&
+	       !amd_element_usable(&other[i]);
+}
+
+/*
  * Element @i of @v was failed on errors (0x10 without the 0x20 of a
  * member found offline) in the LD or its second copy.
  */
@@ -9504,14 +9518,19 @@ static int store_super_amd(struct supertype *st, int fd)
  *    has the spare in the slot (amd_activate_spare, amd_finish_rebuild).
  * Other volumes are not taken.
  */
-static struct amd_vol *amd_active_vol(struct active_array *a)
+static struct amd_vol *amd_vol_of(struct amd_super *super,
+				  struct active_array *a)
 {
-	struct amd_super *super = a->container->sb;
 	int inst = a->info.container_member;
 
 	if (inst < 0 || inst >= super->nvol || !super->vol[inst].managed)
 		return NULL;
 	return &super->vol[inst];
+}
+
+static struct amd_vol *amd_active_vol(struct active_array *a)
+{
+	return amd_vol_of(a->container->sb, a);
 }
 
 /*
@@ -9656,15 +9675,15 @@ static int amd_set_trim(struct active_array *a, unsigned long long bytes)
  * The discard_granularity of @a's volume as mdmon capped TRIM, 0 if it did
  * not (amd_limit_trim): set it to @gran, the old one back.
  */
-static unsigned int amd_swap_trim_gran(struct active_array *a,
+static unsigned int amd_swap_trim_gran(struct amd_super *super,
+				       struct active_array *a,
 				       unsigned int gran)
 {
-	struct amd_super *super = a->container->sb;
 	unsigned int old = 0;
 	struct amd_vol *v;
 
 	amd_lock(super);
-	v = amd_active_vol(a);
+	v = amd_vol_of(super, a);
 	if (v) {
 		old = v->mon.trim_gran;
 		v->mon.trim_gran = gran;
@@ -9706,7 +9725,8 @@ static unsigned int amd_swap_trim_gran(struct active_array *a,
  * volume's queue, which waits for its writes - they may wait for the
  * monitor (blk-sysfs queue_attr_store): managemon, with the lock released.
  */
-static void amd_limit_trim(struct active_array *a, const struct mdinfo *spare)
+static void amd_limit_trim(struct amd_super *super, struct active_array *a,
+			   const struct mdinfo *spare)
 {
 	int level = a->info.array.level;
 	unsigned long long hw, gran;
@@ -9728,16 +9748,16 @@ static void amd_limit_trim(struct active_array *a, const struct mdinfo *spare)
 				 a->info.sys_name, why);
 			return;
 		}
-		amd_swap_trim_gran(a, gran);
+		amd_swap_trim_gran(super, a, gran);
 		amd_kmsg("TRIM off on %s as the AMD driver does: %s",
 			 a->info.sys_name, why);
 		return;
 	}
-	gran = amd_swap_trim_gran(a, 0);
+	gran = amd_swap_trim_gran(super, a, 0);
 	if (!gran)
 		return;		/* not capped by us */
 	if (amd_trim_veto(a, spare)) {
-		amd_swap_trim_gran(a, gran);
+		amd_swap_trim_gran(super, a, gran);
 		return;
 	}
 	hw = min(hw, (unsigned long long)UINT_MAX);
@@ -10529,6 +10549,12 @@ static void amd_ld_clear_transform(struct amd_ld *ld)
  * the volume is the LD it made (rcblob RC_TransformUpdateDriver).  The one
  * kept has TransformType 0, LastOperation = the transform and
  * TransformState @tstate.
+ * A stale member only the second copy keeps out (amd_slot_left_out) goes
+ * out of service in the one kept, as a member missing (0x30 with its ID,
+ * amd_mark_missing): else it would be in step there, and so in the LD a
+ * rebuild onto it copies from (amd_rebuild_ld) - stopped midway, rcraid
+ * then "rebuilt" it from itself, RAIDCoreDxe read the volume from it past
+ * the mark, mdadm took it in sync (notes/agent-q26un2.md).
  */
 static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
 			      __u32 tstate)
@@ -10537,7 +10563,14 @@ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
 	int made = v->grow && tstate == AMD_TRANSFORM_COMPLETED;
 	struct amd_ld *ld = made ? v->link : v->ld;
 	struct amd_ld *gone = made ? v->ld : v->link;
+	int i;
 
+	for (i = 0; i < v->nel; i++)
+		if (amd_slot_left_out(v, i) &&
+		    amd_fail_element(super, v, i, AMD_ELEMENT_OFFLINE))
+			amd_kmsg("subarray-%d: member %d (disk %016llx) is stale, recorded as offline",
+				 vol, i,
+				 (unsigned long long)__le64_to_cpu(v->el[i].id.id));
 	super->config_dirty = 1;
 	ld->transform_type = 0;
 	ld->last_operation = __cpu_to_le32(op);
@@ -14906,10 +14939,10 @@ static int amd_mdbm_place(struct amd_super *super, const struct amd_vol *v,
  * into the list @di (one for each slot of the array), the update in @u.
  * How many.
  */
-static int amd_activate_mirrors(struct active_array *a, struct amd_vol *v,
+static int amd_activate_mirrors(struct amd_super *super,
+				struct active_array *a, struct amd_vol *v,
 				struct mdinfo *di, struct amd_update_spare *u)
 {
-	struct amd_super *super = a->container->sb;
 	struct mdinfo *dev, *last = NULL;
 	int slot, n = 0;
 
@@ -14963,11 +14996,11 @@ static int amd_activate_mirrors(struct active_array *a, struct amd_vol *v,
  * 1: the spare is in @di, the update for the monitor in @u - zeroed, and
  * allocated before the lock (amd_mm_activate_spare).
  */
-static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
+static int amd_activate_spare(struct amd_super *super,
+			      struct active_array *a, struct mdinfo *di,
 			      struct amd_update_spare *u, long long bitmap_at)
 {
-	struct amd_super *super = a->container->sb;
-	struct amd_vol *v = amd_active_vol(a);
+	struct amd_vol *v = amd_vol_of(super, a);
 	struct amd_disk *d = NULL;
 	struct amd_element el;
 	struct mdinfo *dev;
@@ -14985,7 +15018,7 @@ static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
 		if (is_fd_valid(dev->state_fd) && (dev->curr_state & DS_FAULTY))
 			return 0;	/* wait for md to remove it */
 	if (v->grow == AMD_GROW_MIRRORS)
-		return amd_activate_mirrors(a, v, di, u);
+		return amd_activate_mirrors(super, a, v, di, u);
 
 	/*
 	 * A slot md runs without: out of service, or its member missing - a
@@ -15197,9 +15230,9 @@ static void amd_unlock(struct amd_super *super)
  * monitor leaves them alone meanwhile (md_bitmap 0), and writes them anew
  * if md keeps its bitmap after all.
  */
-static int amd_mdbm_stop(struct active_array *a, struct amd_vol *v)
+static int amd_mdbm_stop(struct amd_super *super, struct active_array *a,
+			 struct amd_vol *v)
 {
-	struct amd_super *super = a->container->sb;
 	unsigned int chunk;
 	int rv;
 
@@ -15304,7 +15337,7 @@ static int amd_mm_open_new(struct supertype *c, struct active_array *a,
 		len = amd_ld_size(super->vol[inst].ld) + sizeof(struct amd_element);
 	amd_unlock(super);
 	if (rv == 0)
-		amd_limit_trim(a, NULL);
+		amd_limit_trim(super, a, NULL);
 	/* managemon queues the update (manage_new), as imsm_open_new's */
 	if (!found || !c->update_tail) {
 		free(u);
@@ -15324,7 +15357,15 @@ static int amd_mm_open_new(struct supertype *c, struct active_array *a,
 static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
 					    struct metadata_update **updates)
 {
-	struct amd_super *super = a->container->sb;
+	/*
+	 * a->container is read once, and the helpers get the super from here:
+	 * the monitor clears it when md stops the array, and that may be just
+	 * now - mdadm -S of the container stops the volumes one by one, and a
+	 * rebuild that waited for another volume's transform comes here as
+	 * that volume stops (q26san: NULL a->container under ASan).
+	 */
+	struct supertype *c = a->container;
+	struct amd_super *super = c ? c->sb : NULL;
 	/*
 	 * Before the lock, as all managemon allocates (amd_mm_room): a spare
 	 * for each slot of the array (amd_activate_mirrors), freed one by one
@@ -15339,17 +15380,21 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
 	/* md's sysfs before the lock: the monitor is not to wait on md */
 	long long bitmap_at = amd_md_bitmap_at(a);
 
+	if (!super) {
+		free(u);
+		return NULL;
+	}
 	for (i = 0; i < a->info.array.raid_disks || !di; i++) {
 		*tail = xcalloc(1, sizeof(**tail));
 		tail = &(*tail)->next;
 	}
 	amd_lock(super);
-	found = amd_activate_spare(a, di, u, bitmap_at);
-	v = amd_active_vol(a);
+	found = amd_activate_spare(super, a, di, u, bitmap_at);
+	v = amd_vol_of(super, a);
 	drop = found && v && v->mon.mdbm_drop;
 	amd_unlock(super);
 	if (!found) {
-		amd_limit_trim(a, NULL);
+		amd_limit_trim(super, a, NULL);
 		goto none;
 	}
 	/* the ones not taken */
@@ -15363,15 +15408,15 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
 	 * before it takes the disk - without the lock, md waits for the
 	 * monitor's writes to end (mddev_suspend).
 	 */
-	if (drop && amd_mdbm_stop(a, v) != 0)
+	if (drop && amd_mdbm_stop(super, a, v) != 0)
 		goto none;
 	fd = amd_dev_open(di->disk.major, di->disk.minor, O_RDONLY);
 	u->features = amd_pd_features(fd, di->disk.major, di->disk.minor);
 	close_fd(&fd);
-	amd_limit_trim(a, di);
+	amd_limit_trim(super, a, di);
 	/* the LD the rebuild goes into: at most @v's own and an element */
 	amd_lock(super);
-	v = amd_active_vol(a);
+	v = amd_vol_of(super, a);
 	len = v ? amd_ld_size(v->ld) + sizeof(struct amd_element) : 0;
 	amd_unlock(super);
 	amd_mm_ldbuf(super, len);

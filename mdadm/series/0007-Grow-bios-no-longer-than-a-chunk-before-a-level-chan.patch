@@ -1,0 +1,124 @@
+From 0df0abd353e3211f0ed3a5702067f19618abbd61 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:49:00 +0500
+Subject: [PATCH 07/62] Grow: bios no longer than a chunk before a level change
+ to raid0
+
+raid0 maps a bio that crosses a chunk boundary as two parts: the first
+chunk, and all the rest on one member.  It relies on its queue limit
+max_hw_sectors = chunk for the rest to fit in one chunk (since commit
+319ff40a5427 ("md/raid0: Fix performance regression for large sequential
+writes"), Linux 6.6, and in the stable kernels from 5.15 on; 6.18 splits
+the rest again).  But md splits a bio under the limits of the personality
+it has when the bio comes in.  A bio that comes in while md is suspended
+for a level change raid4/5 -> raid0 is split under the raid4/5 limits
+(1 MiB) and then handed to raid0: 896 KiB of a 1 MiB read come from
+other places of one member, a write of them lands on other data, and
+the data the write was for stays old.
+
+This happens at the end of every RAID0 grow (raid0 -> raid4 -> reshape
+-> raid0) to I/O issued at that moment, and at the end of a size change
+of an external RAID0 (raid5 -> raid0).  Lower queue/max_sectors_kb of
+the array to the chunk size right before the level change.  The write
+freezes the queue, so when it returns no bio split under the old limit
+is still on its way into md; raid0 sets its own limits when it takes
+over.  It is skipped while a sync thread runs: the limits lock it takes
+first deadlocks with md suspending the array to update io_opt at the end
+of a reshape.
+
+Seen in a VM on Linux 6.12.116, growing a RAID0 with a 64 KiB chunk from
+two disks to three under 1 MiB O_DIRECT reads: a wrong read at every
+grow, with native 1.2, IMSM and AMD RAIDXpert2 metadata (later in this
+series) alike, and without mdadm by writing raid4, then raid0 to
+md/level; a 1 MiB O_DIRECT write in that moment left its own chunks old
+and wrote over others.  With the change, no wrong read or write in 15
+such grows.  Not seen on 7.2.12.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ Grow.c | 48 +++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/Grow.c b/Grow.c
+index c49df9e5..aaa364b1 100644
+--- a/Grow.c
++++ b/Grow.c
+@@ -1853,6 +1853,45 @@ error:
+ 	return 1;
+ }
+ 
++/*
++ * Before md takes an array over to raid0, keep the bios it accepts to one
++ * chunk.  raid0 maps a bio that crosses a chunk boundary as two parts, the
++ * first chunk and all the rest on one member, and relies on its queue limit
++ * (max_hw_sectors = chunk) for the rest to fit in a chunk: Linux 6.6 to
++ * 6.17 and stable kernels from 5.15 on with commit 319ff40a5427 ("md/raid0:
++ * Fix performance regression for large sequential writes"); 6.18 splits
++ * the rest again.  A bio md split under the limits of the level it leaves
++ * (raid4/5: 1 MiB) and that waits out the level change reaches raid0
++ * longer: a read returns other data, a write lands on other data.
++ *
++ * The write of max_sectors_kb freezes the queue, so once it returns no bio
++ * split under the old limit is left on its way into md.  It also takes the
++ * queue limits lock first: done while md suspends the array to update the
++ * limits itself (the end of a raid4/5 reshape) it deadlocks with I/O
++ * waiting for the array, so only with no sync thread running.  raid0 sets
++ * its own limits on takeover: nothing to restore.
++ */
++static void limit_bios_to_chunk(struct mdinfo *sra)
++{
++	char path[PATH_MAX], val[24], action[20];
++	unsigned long long chunk;
++	int fd;
++
++	if (sysfs_get_str(sra, NULL, "sync_action", action, sizeof(action)) > 0 &&
++	    strncmp(action, "idle", 4) != 0 && strncmp(action, "frozen", 6) != 0)
++		return;
++	if (sysfs_get_ll(sra, NULL, "chunk_size", &chunk) || chunk < 4096)
++		return;
++	snprintf(path, sizeof(path), "/sys/block/%s/queue/max_sectors_kb",
++		 sra->sys_name);
++	fd = open(path, O_WRONLY);
++	if (fd < 0)
++		return;
++	snprintf(val, sizeof(val), "%llu", chunk / 1024);
++	write_attr(val, fd);
++	close(fd);
++}
++
+ int Grow_reshape(char *devname, int fd,
+ 		 struct mddev_dev *devlist,
+ 		 struct context *c, struct shape *s)
+@@ -2134,6 +2173,7 @@ int Grow_reshape(char *devname, int fd,
+ 			sysfs_set_str(sra, NULL, "sync_action", "frozen");
+ 			/* go back to raid0, drop parity disk
+ 			 */
++			limit_bios_to_chunk(sra);
+ 			sysfs_set_str(sra, NULL, "level", "raid0");
+ 			md_get_array_info(fd, &array);
+ 		}
+@@ -3024,7 +3064,11 @@ static int impose_level(int fd, int level, char *devname, int verbose)
+ 	}
+ 	c = map_num(pers, level);
+ 	if (c) {
+-		int err = sysfs_set_str(&info, NULL, "level", c);
++		int err;
++
++		if (level == 0 && array.level != 0)
++			limit_bios_to_chunk(&info);
++		err = sysfs_set_str(&info, NULL, "level", c);
+ 		if (err) {
+ 			err = errno;
+ 			pr_err("%s: could not set level to %s\n",
+@@ -3751,6 +3795,8 @@ release:
+ 	free(offsets);
+ 	if (orig_level != UnSet && sra) {
+ 		c = map_num(pers, orig_level);
++		if (orig_level == 0)
++			limit_bios_to_chunk(sra);
+ 		if (c && sysfs_set_str(sra, NULL, "level", c) == 0)
+ 			pr_err("aborting level change\n");
+ 	}
+-- 
+2.47.3
+

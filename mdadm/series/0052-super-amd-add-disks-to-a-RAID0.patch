@@ -1,0 +1,943 @@
+From d7a690e4ca3550d35e6bcc85fd632d4aaa8de410 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:54:17 +0500
+Subject: [PATCH 52/62] super-amd: add disks to a RAID0
+
+mdadm --grow <RAID0> --raid-devices=N is recorded as the AMD driver
+records the migration (rcadm -T -r0): the volume's LD with NORMAL, its
+elements matched (0x10000), and the RAID0 of N it becomes, its elements
+on the extents of the old (0x30000) and on spares of the container
+(0x40000), the data of each moving from +0x5000 down to +0x800.  md
+takes the RAID0 over as a RAID4 without its parity, as Grow.c does for
+its own RAID0s, reshapes it held behind the transform log as a RAID5
+getting disks, and makes it a RAID0 again once mdmon has written the
+"100 %" and the final packet.  mdmon, which does not run for a container
+of RAID0s, is started for it.  A RAID0 midway through such a migration,
+ours or the AMD driver's, is assembled as that RAID4 reshaping from the
+mark of its log, its first new member in sync up to there.
+
+The region a transform copies at a time is now worked out from both
+LDs, as RC_TransformProtectSize does: 0x7e00 for a RAID0 of 2 getting a
+disk, in whole stripes of both - not of the new LD only.
+
+The AMD driver's second migration of a volume whose data moved already
+(a RAID0 of 3 given a fourth disk, the data at +0x800 stay) md goes on
+with in place, its offsets kept, each region as large as the new layout
+can take below the row of the old one at the mark, as the AMD driver
+works it out (RC_TransformUpdateNextDynamicRegionFromBeginning).  One
+still in its first stripes, which the AMD driver moves through a log of
+their data, is not assembled; one stopped there before anything moved
+runs as it was, the migration left recorded (mdmon does not run for a
+RAID0), and mdadm --grow drops it and starts anew.  mdadm starts no
+such migration.
+
+Tested on an AMD X870E board: a RAID0 of 2 SSDs given a HDD - the data
+the same, the BIOS menu shows it Normal with the new capacity, the AMD
+Windows driver reads the same data; one of ours stopped midway, the
+Windows driver finished itself; one stopped before its first region md
+went on with from 0 at the next assembly.  With rcraid 9.3.3 in a QEMU
+guest: either finishes the other's migration stopped midway, and md
+finishes the AMD driver's first and second ones, the data those rcraid
+finished.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ super-amd.c | 488 +++++++++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 392 insertions(+), 96 deletions(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index 6b12fe93..2435e22f 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -368,13 +368,28 @@ struct amd_tlog {
+ #define AMD_TFLAGS_DISKS	0x00012211
+ #define AMD_TFLAGS_DATA_LOW	0x00010000
+ #define AMD_TFLAGS_DATA_HIGH	0x00020000
++/*
++ * A second such migration, the data at +0x800 already (rcadm -T -r0 again:
++ * q8m-e1cmid, 0x112141): nowhere to move them down, so in place - the
++ * first stripes through a log of the data at AllocatedSpace + 0x600, while
++ * this bit is set (rcblob RC_SetupTransformParams, RC_MoveDataNextRegion
++ * @0018a770); the transform log past them has it no more (0x12141).
++ */
++#define AMD_TFLAGS_DATA_LOG	0x00100000
+ /*
+  * An element of a RAID0 a migration starts from that the LD it becomes
+  * takes over (rcblob RC_CheckMatchDevice): the AMD driver writes the flags of
+  * RAID0 elements unmasked (rcblob RC_BuildConfigMetadataFromMemory), so the
+- * start and "100 %" packets have it (q8m-e3amid, q8m-e3apost).
++ * start and "100 %" packets have it (q8m-e3amid, q8m-e3apost).  A RAID0
++ * getting disks has two more in the RAID0 it becomes (q8m-e1mid): an
++ * element laid on the extent of the one it matched (RC_CheckMatchDevice-
++ * SpaceConflict @001935f0), with AMD_ELEMENT_MATCHED, and one on a new
++ * disk, its space just allocated (RC_AllocateLogicalElementSpace
++ * @0013fff0).  The final packet has none of them (q8m-e1post).
+  */
+ #define AMD_ELEMENT_MATCHED	0x10000
++#define AMD_ELEMENT_IN_SOURCE	0x20000
++#define AMD_ELEMENT_ALLOCATED	0x40000
+ 
+ _Static_assert(sizeof(struct amd_element) == 0x40, "RC_LogicalElement_LE");
+ _Static_assert(sizeof(struct amd_tlog) == 0x68, "RC_TransformLogStruct_LE");
+@@ -531,7 +546,7 @@ struct amd_vol_mon {
+ 	int rebuild_done;	/* md finished it: record that at sync_metadata */
+ 	struct amd_element rebuild_el;
+ 	int rebuild_recorded;	/* RESTORE_SEGMENTS and its log are on disk */
+-	/* AMD_GROW_RESHAPE: md has ended the reshape */
++	/* AMD_GROW_RESHAPE: 1 md has ended the reshape, -1 md runs it as it was */
+ 	int reshape_done;
+ 	unsigned long long rebuild_ckpt; /* member sectors md has recovered */
+ 	int tlog_dirty;		/* write rebuild_ckpt to the transform log */
+@@ -681,6 +696,8 @@ static int amd_label_spare(int fd, __u64 id, __u32 spare);
+ static int amd_pd_index(struct amd_super *super, __u64 id);
+ static int amd_disk_in_volumes(struct amd_super *super, __u64 id);
+ static int amd_transform_copied(const struct amd_vol *v);
++static void amd_free_devs(struct mdinfo *dev);
++static void amd_reshape_dropped(struct amd_super *super, int vol);
+ static int amd_others_overlap(struct amd_super *super, const struct amd_vol *v,
+ 			      __u64 id, unsigned long long start,
+ 			      unsigned long long len);
+@@ -1111,14 +1128,24 @@ static int amd_data_gap(const struct amd_element *el, unsigned long long gap)
+ 	       __le64_to_cpu(el->allocated.offset) == gap;
+ }
+ 
++/* a RAID0: N x 1 (RC_Raid10NLogicalToPhysical) */
++static int amd_ld_raid0(const struct amd_ld *ld)
++{
++	return __le32_to_cpu(ld->device_type) == AMD_LDT_RAID10N &&
++	       __le32_to_cpu(ld->second_count) == 1;
++}
++
+ /*
+- * RAID5 or RAID1 of two @ld getting data disks as RAID5 @t, the chunk the
+- * same (amd_grow_shape checked ID, First and chunk), as rcadm -T -r5 records
+- * it (q8m-e2mid: RAID5 3 -> 4; q8m-e3bmid: RAID1 -> RAID5 3): each element
+- * of @ld on its disk as the same element of @t, at the same extent start,
+- * its data moving from +0x5000 down to +0x800; the new elements on other
++ * RAID5 or RAID1 of two @ld getting data disks as RAID5 @t, or RAID0 as
++ * RAID0, the chunk the same (amd_grow_shape checked ID and chunk), as rcadm
++ * -T -r5 and -r0 record it (q8m-e2mid: RAID5 3 -> 4; q8m-e3bmid: RAID1 ->
++ * RAID5 3; q8m-e1mid: RAID0 2 -> 3): each element of @ld on its disk as the
++ * same element of @t, at the same extent start, its data moving from
++ * +0x5000 down to +0x800 - or staying there, a migration that moved them
++ * once already (q8m-e1cmid: RAID0 3 -> 4) -; the new elements on other
+  * disks, their data at +0x800 too; the capacity no less.  md reshapes that,
+- * moving data_offset as AMD moves the data.
++ * moving data_offset as AMD moves the data (md runs a RAID0 as a RAID4
++ * without its parity, as for its own RAID0s).
+  */
+ static int amd_disks_shape(const struct amd_ld *ld, const struct amd_ld *t)
+ {
+@@ -1126,20 +1153,29 @@ static int amd_disks_shape(const struct amd_ld *ld, const struct amd_ld *t)
+ 	const struct amd_element *tel = amd_ld_elements(t);
+ 	int i, j, n = amd_ld_nel(ld), nt = amd_ld_nel(t);
+ 	__u32 type = __le32_to_cpu(ld->device_type);
++	unsigned long long gap = amd_data_gap(&el[0], AMD_MIB) ? AMD_MIB :
++				 AMD_SERVICE;
+ 
+-	if (__le32_to_cpu(t->device_type) != AMD_LDT_RAID50 ||
+-	    __le32_to_cpu(t->first_count) != 1 || nt <= n ||
++	if (amd_ld_raid0(ld) != amd_ld_raid0(t) || nt <= n ||
+ 	    __le64_to_cpu(t->capacity) < __le64_to_cpu(ld->capacity))
+ 		return 0;
++	if (!amd_ld_raid0(t) &&
++	    (__le32_to_cpu(t->device_type) != AMD_LDT_RAID50 ||
++	     __le32_to_cpu(t->first_count) != 1 ||
++	     t->first_count != ld->first_count))
++		return 0;
++	/* RAID5, RAID1 of two (1 x 2), RAID0 (N x 1) */
+ 	if (!(type == AMD_LDT_RAID50 && n >= 3) &&
+-	    !(type == AMD_LDT_RAID10N && n == 2))
++	    !(type == AMD_LDT_RAID10N && n == 2 &&
++	      __le32_to_cpu(ld->first_count) == 1) &&
++	    !amd_ld_raid0(ld))
+ 		return 0;
+ 	for (i = 0; i < nt; i++) {
+ 		if (!amd_data_gap(&tel[i], AMD_MIB))
+ 			return 0;
+ 		if (i < n && (tel[i].id.id != el[i].id.id ||
+ 			      tel[i].allocated.offset != el[i].allocated.offset ||
+-			      !amd_data_gap(&el[i], AMD_SERVICE)))
++			      !amd_data_gap(&el[i], gap)))
+ 			return 0;
+ 		for (j = 0; i >= n && j < n; j++)
+ 			if (tel[i].id.id == el[j].id.id)
+@@ -1164,8 +1200,13 @@ static int amd_grow_shape(const struct amd_ld *ld, const struct amd_ld *t)
+ 	__u32 s;
+ 	int i, n;
+ 
+-	if (t->id.id != ld->id.id || t->first_count != ld->first_count ||
+-	    t->cache_tag_size != ld->cache_tag_size)
++	if (t->id.id != ld->id.id || t->cache_tag_size != ld->cache_tag_size)
++		return 0;
++	/* a RAID0 gets data disks as columns (First), the others as Second */
++	if (amd_ld_raid0(ld) && amd_ld_raid0(t) &&
++	    t->first_count != ld->first_count)
++		return amd_disks_shape(ld, t);
++	if (t->first_count != ld->first_count)
+ 		return 0;
+ 	if (__le32_to_cpu(t->device_type) == AMD_LDT_RAID50 &&
+ 	    t->second_count != ld->second_count)
+@@ -3768,31 +3809,94 @@ static unsigned int amd_data_per_set(const struct amd_ld *ld)
+ 	}
+ }
+ 
+-/*
+- * RC_TransformProtectSize of the LD @ld a transform goes into: min(data
+- * elements x FirstCount x 0x4800, 0x8000) sectors (no cap for RAID5/6), cut
+- * down to whole stripes.
+- */
+-static unsigned long long amd_ld_protect_size(const struct amd_ld *ld)
++/* data elements of a stripe of @ld (FirstCount x RC_SecondElementCount) */
++static unsigned int amd_stripe_columns(const struct amd_ld *ld)
+ {
+-	unsigned long long f = __le32_to_cpu(ld->first_count);
+-	unsigned long long data = amd_data_per_set(ld);
+-	unsigned long long protect, stripe;
+ 	__u32 type = __le32_to_cpu(ld->device_type);
+ 
+-	stripe = amd_chunk_sectors(ld) * data * f;
+-	protect = data * f * 0x4800;
+-	if (protect > 0x8000 && type != AMD_LDT_RAID50 && type != AMD_LDT_RAID60)
+-		protect = 0x8000;
+-	if (stripe && protect >= stripe)
+-		protect -= protect % stripe;
++	if (type == AMD_LDT_VOLUME || type == AMD_LDT_RAIDABLE)
++		return amd_data_per_set(ld);
++	return __le32_to_cpu(ld->first_count) * amd_data_per_set(ld);
++}
++
++/*
++ * A stripe of both LD @s and LD @t (RC_TransformProtectSize): @s's over the
++ * power of two they share, times @t's - RAID0 2 -> 3 0x300, 3 -> 4 0x600.
++ */
++static unsigned long long amd_common_stripe(const struct amd_ld *s,
++					    const struct amd_ld *t)
++{
++	unsigned long long chunk = amd_chunk_sectors(s);
++	unsigned long long a = amd_stripe_columns(s) * chunk;
++	unsigned long long ts = amd_stripe_columns(t) * chunk, b = ts;
++
++	if (a == ts)
++		return ts;
++	while (a > 1 && b > 1 && !(a & 1) && !(b & 1)) {
++		a >>= 1;
++		b >>= 1;
++	}
++	return a * ts;
++}
++
++/*
++ * The region a transform of LD @s into LD @t copies at a time, as
++ * RC_TransformProtectSize @00190200 works it out (both in stripes of
++ * @s's chunk): 0x4800 sectors a data element of @t - whole stripes of both
++ * unless @s has as many data elements -, at most 0x8000 unless one is a
++ * RAID5/6, then in whole stripes of both.  Of one LD (a rebuild, an
++ * initialization, more capacity) min(data elements x 0x4800, 0x8000);
++ * RAID0 2 -> 3 0x7e00 (q8m-e1mid), RAID5 3 -> 4 0xd800 (q8m-e2mid).
++ */
++static unsigned long long amd_transform_protect_size(const struct amd_ld *s,
++						     const struct amd_ld *t)
++{
++	unsigned long long protect = amd_stripe_columns(t) * 0x4800ULL;
++	unsigned long long common = amd_common_stripe(s, t);
++	__u32 st = __le32_to_cpu(s->device_type), tt = __le32_to_cpu(t->device_type);
++
++	if (amd_stripe_columns(s) * 0x4800ULL != protect)
++		protect = common <= protect ? common * (protect / common) : common;
++	if (protect > 0x8000) {
++		if (st != AMD_LDT_RAID50 && tt != AMD_LDT_RAID50 &&
++		    st != AMD_LDT_RAID60 && tt != AMD_LDT_RAID60)
++			protect = 0x8000;
++		protect = common < protect ? common * (protect / common) : common;
++	}
+ 	return protect;
+ }
+ 
+-/* ... of the LD md runs @v as */
++/* ... of the LD md runs @v as, from the one it starts from */
+ static unsigned long long amd_protect_size(const struct amd_vol *v)
+ {
+-	return amd_ld_protect_size(v->shape);
++	return amd_transform_protect_size(v->ld, v->shape);
++}
++
++/*
++ * The region a migration of @v onto more disks (AMD_GROW_RESHAPE) copies
++ * from volume sector @mark on, as the AMD driver works it out: the protect
++ * size where the data move down - the new layout goes 0x4800 sectors below
++ * the old, it never reaches what is still to be read.  Where they stay
++ * (moved there by an earlier migration) as much of it as the new layout
++ * can take below the row of the old one at @mark, in whole stripes of
++ * both (rcblob RC_TransformUpdateNextDynamicRegionFromBeginning @0014e070):
++ * a copy of the region again after a crash still finds its data.  0 when
++ * not one stripe: there AMD copies stripe by stripe through a log of their
++ * data (AMD_TFLAGS_DATA_LOG), which mdadm does not write.
++ */
++static unsigned long long amd_reshape_region(const struct amd_vol *v,
++					     unsigned long long mark)
++{
++	unsigned long long protect = amd_protect_size(v), unit, room;
++	unsigned long long chunk = amd_chunk_sectors(v->ld);
++	unsigned long long ss = amd_stripe_columns(v->ld) * chunk;
++	unsigned long long ts = amd_stripe_columns(v->shape) * chunk;
++
++	if (!amd_data_gap(amd_ld_elements(v->ld), AMD_MIB))
++		return protect;
++	unit = amd_common_stripe(v->ld, v->shape);
++	room = mark / ss > mark / ts ? ts * (mark / ss - mark / ts) : 0;
++	return room >= protect ? protect : room - room % unit;
+ }
+ 
+ /*
+@@ -4092,16 +4196,20 @@ static unsigned long long amd_volume_to_sync(const struct amd_vol *v,
+ }
+ 
+ /*
+- * TransformFlags of the LD a migration into @t starts from, and of its log:
++ * TransformFlags of LD @ld a migration into @t starts from, and of its log:
+  * @t's, but for the bit of where the LD's own data are - AMD_TFLAGS_DISKS
+  * has the data of @t at +0x800, those of the LD it starts from are at
+- * +0x5000 (no migration starts from data moved already, amd_reshape_disks).
++ * +0x5000.  Of data an earlier migration moved there already, @t's - the
++ * log past the stripes logged with their data without AMD_TFLAGS_DATA_LOG
++ * (q8m-e1cmid; mdadm starts no such migration, amd_reshape_disks).
+  */
+-static __u32 amd_source_tflags(const struct amd_ld *t)
++static __u32 amd_source_tflags(const struct amd_ld *ld, const struct amd_ld *t)
+ {
+ 	__u32 flags = __le32_to_cpu(t->transform_flags);
+ 
+-	if (flags & AMD_TFLAGS_DATA_LOW)
++	if (amd_data_gap(amd_ld_elements(ld), AMD_MIB))
++		flags &= ~AMD_TFLAGS_DATA_LOG;
++	else if (flags & AMD_TFLAGS_DATA_LOW)
+ 		flags = (flags & ~AMD_TFLAGS_DATA_LOW) | AMD_TFLAGS_DATA_HIGH;
+ 	return __cpu_to_le32(flags);
+ }
+@@ -4118,16 +4226,17 @@ static __u64 amd_tlog_checksum(const struct amd_tlog *t)
+ /*
+  * The I/O of a migration's region as the AMD driver works it out for the
+  * LD @tl it makes (rcblob RC_MaxDynamicTransformIoSize @0018def0): the most
+- * stripes of @tl, 2 to 15, under 0x800 sectors that divide the protect
++ * stripes of @tl, 2 to 15, under 0x800 sectors that divide the @protect
+  * window in stripes - RAIDABLE -> RAID1 and a RAID1 grown 0x600 (12 to the
+  * 0x4800 region), RAID0 -> RAID10 2 x 2 0x400 (0x20 to 0x8000: q8m-e3amid),
+  * a RAID0 or RAID5 getting a disk 0x600 (q8m-e1mid, q8m-e2mid).
+  */
+-static unsigned int amd_grow_io_size(const struct amd_ld *tl)
++static unsigned int amd_grow_io_size(const struct amd_ld *tl,
++				     unsigned int protect)
+ {
+ 	unsigned int stripe = amd_chunk_sectors(tl) * amd_data_per_set(tl) *
+ 			      __le32_to_cpu(tl->first_count);
+-	unsigned int protect = amd_ld_protect_size(tl), k, n = 1;
++	unsigned int k, n = 1;
+ 
+ 	if (protect <= 0x800 || !stripe)
+ 		return protect;
+@@ -4167,14 +4276,18 @@ static void amd_tlog_fill(const struct amd_vol *v, const struct amd_ld *tl,
+ 		 * migration's manager): all below it is in that LD (rcblob
+ 		 * RC_TransformDiskLogNextRegion; rcraid 9.3.3: ProtectStart =
+ 		 * IOStart on a region boundary) -, its I/O, so many to the
+-		 * region, and the flags of the LD it starts from.
++		 * region, and the flags of the LD it starts from.  Data
++		 * moving onto more disks have their regions from the manager
++		 * (manage_reshape_amd): in place, less than one at first.
+ 		 */
+-		unsigned int protect = amd_ld_protect_size(tl);
+-		unsigned int io = amd_grow_io_size(tl);
++		unsigned int protect = amd_transform_protect_size(v->ld, tl);
++		unsigned int io = amd_grow_io_size(tl, protect);
+ 
+-		t->protect_start = __cpu_to_le64(done - done % protect);
++		if (v->grow != AMD_GROW_RESHAPE)
++			done -= done % protect;
++		t->protect_start = __cpu_to_le64(done);
+ 		t->protect_size = __cpu_to_le32(protect);
+-		t->flags = amd_source_tflags(tl);
++		t->flags = amd_source_tflags(v->ld, tl);
+ 		t->io_start = t->protect_start;
+ 		t->io_size = __cpu_to_le32(io);
+ 		t->dynamic_protect_stripe = __cpu_to_le32(protect / io);
+@@ -5582,6 +5695,54 @@ out:
+ 	return 0;
+ }
+ 
++/*
++ * The migration of @v onto more disks has moved nothing yet - its log at
++ * 0, or none - and md cannot begin it: the AMD driver moves the first
++ * stripes of data that stay in their extents (a second migration,
++ * q8m-e1cmid) with a log of their data (amd_reshape_region).  The data are
++ * all where they were: md runs @v as it was, its old members (@this from
++ * amd_volume_devs); mdmon drops the migration (amd_reshape_dropped).  A
++ * crash meanwhile resyncs the whole volume.
++ * A RAID0 runs without mdmon: its migration stays recorded, and the AMD
++ * driver would start it from 0 over the data where md writes them; mdadm
++ * --grow drops it (amd_reshape_disks) and takes its new disks again -
++ * spares to Grow.c.
++ */
++static void amd_reshape_not_begun(struct amd_vol *v, struct mdinfo *this)
++{
++	const struct amd_element *el = amd_ld_elements(v->ld);
++	int i, n = amd_ld_nel(v->ld);
++	struct mdinfo **dp = &this->devs, *dev;
++
++	if (amd_ld_raid0(v->ld)) {
++		this->array.layout = 0;
++		this->array.spare_disks += v->nel - n;
++	} else if (__le32_to_cpu(v->ld->device_type) != AMD_LDT_RAID50) {
++		this->array.level = 1;
++		this->array.layout = 0;
++		this->array.chunk_size = 0;
++	}
++	this->array.raid_disks = n;
++	this->component_size = __le64_to_cpu(el[0].user_data.size);
++	this->array.size = this->component_size / 2;
++	this->array.working_disks = 0;
++	for (i = 0; i < n; i++)
++		this->array.working_disks += amd_element_usable(&el[i]);
++	while ((dev = *dp)) {
++		i = dev->disk.raid_disk;
++		if (i < 0 || i >= n) {
++			*dp = dev->next;
++			free(dev);
++			continue;
++		}
++		dev->data_offset = __le64_to_cpu(el[i].user_data.offset);
++		dev->component_size = this->component_size;
++		dp = &dev->next;
++	}
++	if (!(this->array.state & (1 << MD_SB_CLEAN)))
++		this->resync_start = 0;
++}
++
+ /*
+  * Data moving onto more disks (AMD_GROW_RESHAPE, amd_disks_shape): md
+  * reshapes a RAID5 of the old number of disks - a RAID1 of two is one to
+@@ -5599,18 +5760,38 @@ out:
+  * (reshape_container), md holding the others where they are meanwhile.
+  * "100 %": all copied, md runs the new LD.  For mdadm --grow, which laid
+  * it out (amd_reshape_disks), the new disks are spares md is to take.
++ * A RAID0 md reshapes as a RAID4 of one disk more, its parity missing, as
++ * its own RAID0s (Grow.c) and IMSM's: its first new member takes the
++ * parity's place in the old layout - md fills it by the reshape, in sync
++ * up to the mark.  Data an earlier migration moved already stay where they
++ * are (q8m-e1cmid): md goes on only where AMD copies whole regions, past
++ * the first stripes it moves with a log of their data (amd_reshape_region).
+  */
+ static void amd_reshape_content(struct amd_super *super, struct amd_vol *v,
+ 				struct mdinfo *this)
+ {
+ 	const struct amd_element *el = amd_ld_elements(v->ld);
+ 	int n = amd_ld_nel(v->ld), grown = super->grown_vol == 1 + (v - super->vol);
++	unsigned long long gap = __le64_to_cpu(el[0].user_data.offset) -
++				 __le64_to_cpu(el[0].allocated.offset);
+ 	struct mdinfo *dev;
+ 
+ 	if (v->grow != AMD_GROW_RESHAPE || amd_transform_copied(v))
+ 		return;
+ 	this->reshape_progress = amd_tlog_scan(super, v, v->link,
+ 					       AMD_TRANSFORM_NORMAL, 1);
++	if (!grown && !amd_reshape_region(v, this->reshape_progress)) {
++		if (this->reshape_progress == 0) {
++			amd_reshape_not_begun(v, this);
++			return;
++		}
++		v->blocked = "AMD moves its first stripes with a log of their data, md cannot go on with that";
++		pr_err("subarray-%d: %s\n", (int)(v - super->vol), v->blocked);
++		this->array.state |= 1 << MD_SB_BLOCK_VOLUME;
++		amd_free_devs(this->devs);
++		this->devs = NULL;
++		return;
++	}
+ 	this->reshape_active = 1;
+ 	this->delta_disks = v->nel - n;
+ 	this->new_level = v->level;
+@@ -5618,6 +5799,10 @@ static void amd_reshape_content(struct amd_super *super, struct amd_vol *v,
+ 	this->new_chunk = this->array.chunk_size;
+ 	this->recovery_blocked = 1;
+ 	this->custom_array_size = __le64_to_cpu(v->ld->capacity);
++	if (v->level == 0) {
++		this->array.level = 4;
++		this->array.raid_disks++;
++	}
+ 	for (dev = this->devs; dev; dev = dev->next) {
+ 		int i = dev->disk.raid_disk;
+ 
+@@ -5625,11 +5810,14 @@ static void amd_reshape_content(struct amd_super *super, struct amd_vol *v,
+ 			continue;
+ 		dev->new_data_offset = __le64_to_cpu(v->el[i].user_data.offset);
+ 		dev->data_offset = i < n ? __le64_to_cpu(el[i].user_data.offset) :
+-				   __le64_to_cpu(v->el[i].allocated.offset) + AMD_SERVICE;
++				   __le64_to_cpu(v->el[i].allocated.offset) + gap;
+ 		dev->component_size = v->component_size;
+ 		if (i >= n && grown) {
+ 			dev->disk.state = 0;
+ 			dev->recovery_start = 0;
++		} else if (i == n && v->level == 0) {
++			dev->disk.state = 1 << MD_DISK_ACTIVE;
++			dev->recovery_start = this->reshape_progress / v->nel;
+ 		}
+ 	}
+ }
+@@ -9446,7 +9634,12 @@ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
+ 	v->mon.mdbm_drop = 0;
+ 	v->mon.mdbm_wipe = 0;
+ 	a->info.container_member = inst;
+-	v->mon.reshape_done = 0;
++	/*
++	 * md runs as it was a volume whose data were to move onto more disks:
++	 * nothing of it begun (amd_reshape_not_begun) - dropped by the monitor.
++	 */
++	v->mon.reshape_done = v->grow == AMD_GROW_RESHAPE &&
++			      a->info.array.raid_disks == amd_ld_nel(v->ld) ? -1 : 0;
+ 
+ 	/*
+ 	 * A recorded rebuild that container_content handed to md goes on -
+@@ -9896,10 +10089,17 @@ static void amd_mark_missing(struct active_array *a, struct amd_vol *v)
+ 	int i;
+ 
+ 	for (i = 0; i < v->nel; i++) {
++		/*
++		 * Not yet md's (the new members of a migration onto more
++		 * disks), or a RAID0's new member md fills by the reshape
++		 * (amd_reshape_content): out of sync for md until it ends.
++		 */
+ 		if ((!amd_slot_usable(v, i) &&
+ 		     (!amd_element_away(&v->el[i]) || amd_grow_target(v, i))) ||
+ 		    amd_md_in_sync(a, i) ||
+-		    (v->grow == AMD_GROW_RESHAPE && i >= a->info.array.raid_disks))
++		    (v->grow == AMD_GROW_RESHAPE && i >= a->info.array.raid_disks) ||
++		    (v->grow == AMD_GROW_RESHAPE && v->level == 0 &&
++		     i >= amd_ld_nel(v->ld)))
+ 			continue;
+ 		if (amd_fail_element(super, v, i, AMD_ELEMENT_OFFLINE))
+ 			amd_kmsg("subarray-%d: member %d (disk %016llx) is missing, recorded as offline",
+@@ -10336,10 +10536,10 @@ static int amd_record_transform(struct amd_super *super, int vol,
+ 	saved = *ld;
+ 	ld->transform_type = __cpu_to_le32(op);
+ 	ld->last_operation = ld->transform_type;
+-	ld->transform_flags = op == AMD_TRANSFORM_NORMAL ? amd_source_tflags(t) :
++	ld->transform_flags = op == AMD_TRANSFORM_NORMAL ? amd_source_tflags(ld, t) :
+ 						     t->transform_flags;
+ 	ld->transform_protect_start = 0;
+-	ld->transform_protect_size = __cpu_to_le32(amd_ld_protect_size(t));
++	ld->transform_protect_size = __cpu_to_le32(amd_transform_protect_size(ld, t));
+ 	/* nothing done yet: a per cent left over would say all (amd_resume_point) */
+ 	ld->transform_percent = 0;
+ 	ld->flags |= __cpu_to_le32(AMD_LDF_RESTORE_SRC);
+@@ -10530,11 +10730,14 @@ static struct amd_ld *amd_mirrors_ld(struct amd_super *super,
+ 
+ /*
+  * The RAID5 of @n disks a RAID5, or a RAID1 of two, @v becomes, as rcadm -T
+- * -r5 records it (q8m-e2mid, q8m-e3bmid): its members where they are, the
+- * new ones on spares of the container laid out as they are (amd_free_spare),
++ * -r5 records it (q8m-e2mid, q8m-e3bmid) - or the RAID0 of @n a RAID0
++ * becomes, as -T -r0 (q8m-e1mid): its members where they are, the new ones
++ * on spares of the container laid out as they are (amd_free_spare),
+  * distinct disks; the data of each at AllocatedSpace + 0x800 - they move
+  * down -, every element as large as the members (md keeps their size: the
+- * capacity grows by them).  Allocated; NULL if the spares are short.
++ * capacity grows by them).  A RAID0 has the flags of its elements as the
++ * AMD driver leaves them (AMD_ELEMENT_IN_SOURCE), and no write-intent
++ * bitmap.  Allocated; NULL if the spares are short.
+  */
+ static struct amd_ld *amd_disks_ld(struct amd_super *super, struct amd_vol *v,
+ 				   int n, unsigned int *size)
+@@ -10542,28 +10745,37 @@ static struct amd_ld *amd_disks_ld(struct amd_super *super, struct amd_vol *v,
+ 	unsigned int room = amd_ld_size(v->ld) +
+ 			    sizeof(struct amd_element) * (n - v->nel);
+ 	struct amd_ld *t = xmalloc(room);
++	int raid0 = v->level == 0, i;
+ 	struct amd_element *tel;
+-	int i;
+ 
+ 	*size = amd_ld_shell(v->ld, n, t, room);
+-	t->device_type = __cpu_to_le32(AMD_LDT_RAID50);
+-	t->first_count = __cpu_to_le32(1);
+-	t->second_count = __cpu_to_le32(n);
++	if (!raid0) {
++		t->device_type = __cpu_to_le32(AMD_LDT_RAID50);
++		t->first_count = __cpu_to_le32(1);
++		t->second_count = __cpu_to_le32(n);
++	} else {
++		t->first_count = __cpu_to_le32(n);
++	}
+ 	t->devices = __cpu_to_le32(n);
+ 	tel = amd_ld_elements(t);
+ 	for (i = 0; i < n; i++) {
+ 		if (i < v->nel) {
+ 			tel[i] = v->el[i];
+-			tel[i].flags = 0;
+-		} else if (!amd_free_spare(super, v, t, &tel[i])) {
++			tel[i].flags = raid0 ? __cpu_to_le32(AMD_ELEMENT_MATCHED |
++							    AMD_ELEMENT_IN_SOURCE) : 0;
++		} else if (amd_free_spare(super, v, t, &tel[i])) {
++			tel[i].flags = raid0 ? __cpu_to_le32(AMD_ELEMENT_ALLOCATED) : 0;
++		} else {
+ 			free(t);
+ 			return NULL;
+ 		}
+ 		tel[i].user_data.offset = __cpu_to_le64(
+ 			__le64_to_cpu(tel[i].allocated.offset) + AMD_MIB);
+ 	}
+-	t->capacity = __cpu_to_le64(v->component_size * (n - 1));
++	t->capacity = __cpu_to_le64(v->component_size * (raid0 ? n : n - 1));
+ 	amd_grow_fields(super, t, AMD_TFLAGS_DISKS);
++	if (raid0)
++		t->attribute = v->ld->attribute;
+ 	return t;
+ }
+ 
+@@ -10696,6 +10908,21 @@ static int amd_reshape_size(struct supertype *st, int vol, struct shape *shape,
+ 	return 0;
+ }
+ 
++/*
++ * mdmon does not run for a container of RAID0s, with nothing to record: a
++ * migration of one starts it, as Grow.c starts it for an array it takes
++ * over from a RAID0.
++ */
++static void amd_grow_mdmon(struct supertype *st)
++{
++	if (st->update_tail)
++		return;
++	if (!mdmon_running(st->container_devnm))
++		start_mdmon(st->container_devnm);
++	if (wait_for_mdmon(st->container_devnm) == MDADM_STATUS_SUCCESS)
++		st->update_tail = &st->updates;
++}
++
+ /*
+  * mdadm --grow <RAID0 of N> --level=10 [--raid-devices=2N]: the RAID10 N x 2
+  * rcadm -T -r10 makes of it (q8m-e3amid) - its members stay where they are
+@@ -10726,17 +10953,7 @@ static int amd_reshape_mirrors(struct supertype *st, int vol,
+ 		       shape->dev, v->nel, 2 * v->nel);
+ 		return 1;
+ 	}
+-	/*
+-	 * mdmon does not run for a container of RAID0s, with nothing to
+-	 * record: it starts now, as Grow.c starts it for an array it takes
+-	 * over from a RAID0.
+-	 */
+-	if (!st->update_tail) {
+-		if (!mdmon_running(st->container_devnm))
+-			start_mdmon(st->container_devnm);
+-		if (wait_for_mdmon(st->container_devnm) == MDADM_STATUS_SUCCESS)
+-			st->update_tail = &st->updates;
+-	}
++	amd_grow_mdmon(st);
+ 	if (!amd_grow_ready(st, v, shape->dev))
+ 		return 1;
+ 	t = amd_mirrors_ld(super, v, &size);
+@@ -10769,7 +10986,10 @@ static int amd_md_clean(struct supertype *st)
+ /*
+  * mdadm --grow <RAID5> --raid-devices=N, or <RAID1 of two> --level=5
+  * --layout=right-asymmetric --raid-devices=N: more data disks, as rcadm -T
+- * -r5 records it (amd_disks_ld).  md reshapes it, moving data_offset as AMD
++ * -r5 records it (amd_disks_ld) - and <RAID0> --raid-devices=N, as -T -r0:
++ * md takes it over as a RAID4 without its parity (Grow.c); mdmon, which
++ * does not run for a container of RAID0s, starts as for a RAID0 made a
++ * RAID10 (amd_reshape_mirrors).  md reshapes it, moving data_offset as AMD
+  * moves the data (container_content gives the new offsets for Grow.c,
+  * set_metadata_data_offset), held behind the transform log, which goes
+  * before each region as the AMD driver writes it (manage_reshape_amd):
+@@ -10780,24 +11000,46 @@ static int amd_md_clean(struct supertype *st)
+  * migration moved already: AMD moves them on with a log of the data
+  * (q8m-e1cmid, TransformFlags 0x100000), which mdadm does not write; nor
+  * with a backup file - nothing is backed up.
++ * A RAID0's migration recorded and not begun goes first: md runs the RAID0
++ * as it was (mdadm --grow stopped before md started, or
++ * amd_reshape_not_begun), and no mdmon dropped it.
+  */
+ static int amd_reshape_disks(struct supertype *st, int vol,
+ 			     struct shape *shape, struct context *c)
+ {
+ 	struct amd_super *super = st->sb;
+ 	struct amd_vol *v = &super->vol[vol];
+-	int n = v->raid_disks + shape->delta_disks, chunk = v->chunk_sectors * 512;
++	int n, chunk = v->chunk_sectors * 512;
+ 	unsigned int size;
+ 	struct amd_ld *t;
+ 	int i, fd;
+ 
++	if (v->level == 0)
++		amd_grow_mdmon(st);
++	if (v->level == 0 && v->grow == AMD_GROW_RESHAPE && st->update_tail &&
++	    !amd_tlog_scan(super, v, v->link, AMD_TRANSFORM_NORMAL, 1)) {
++		amd_send_migrate(st, vol, v->link, amd_ld_size(v->link), 1);
++		amd_ld_clear_transform(v->ld);
++		amd_end_transform(super, vol, AMD_TRANSFORM_NORMAL,
++				  AMD_TRANSFORM_FAILED);
++		v = &super->vol[vol];
++		if (c->verbose >= 0)
++			pr_err("%s: the migration recorded for it had not begun: dropped\n",
++			       shape->dev);
++	}
++	n = v->raid_disks + shape->delta_disks;
++	if (v->level == 0 && shape->layout != UnSet && shape->layout != 0) {
++		pr_err("%s: AMD keeps a RAID0 a RAID0: no layout\n", shape->dev);
++		return 1;
++	}
+ 	if (v->level == 1 && (v->raid_disks != 2 ||
+ 			      shape->layout != ALGORITHM_RIGHT_ASYMMETRIC)) {
+ 		pr_err("%s: AMD makes a RAID5 of a RAID1 of two disks, with its layout: --level=5 --layout=right-asymmetric --raid-devices=N\n",
+ 		       shape->dev);
+ 		return 1;
+ 	}
+-	if (shape->layout != UnSet && shape->layout != ALGORITHM_RIGHT_ASYMMETRIC) {
++	if (v->level != 0 && shape->layout != UnSet &&
++	    shape->layout != ALGORITHM_RIGHT_ASYMMETRIC) {
+ 		pr_err("%s: AMD RAID5 is right-asymmetric only\n", shape->dev);
+ 		return 1;
+ 	}
+@@ -10818,7 +11060,7 @@ static int amd_reshape_disks(struct supertype *st, int vol,
+ 		       shape->dev);
+ 		return 1;
+ 	}
+-	if (!v->managed) {
++	if (v->level != 0 && !v->managed) {
+ 		pr_err("%s: md runs this AMD volume read-only, mdmon keeps no state of it: it cannot be grown\n",
+ 		       shape->dev);
+ 		return 1;
+@@ -10860,7 +11102,8 @@ static int amd_reshape_disks(struct supertype *st, int vol,
+ 			       shape->dev);
+ 			return 1;
+ 		}
+-	if (!amd_md_clean(st)) {
++	/* a RAID0 has nothing to resync */
++	if (v->level != 0 && !amd_md_clean(st)) {
+ 		pr_err("%s: md is to resync it first\n", shape->dev);
+ 		return 1;
+ 	}
+@@ -10965,6 +11208,7 @@ static int reshape_super_amd(struct supertype *st, struct shape *shape,
+ 		return amd_reshape_mirrors(st, vol, shape, c);
+ 	if (shape->delta_disks != UnSet && shape->delta_disks > 0 &&
+ 	    ((v->level == 5 && (shape->level == UnSet || shape->level == 5)) ||
++	     (v->level == 0 && (shape->level == UnSet || shape->level == 0)) ||
+ 	     (v->level == 1 && !v->single && shape->level == 5)))
+ 		return amd_reshape_disks(st, vol, shape, c);
+ 	/* fewer disks: AMD makes no volume smaller ("Array size too small", rcblob) */
+@@ -10975,7 +11219,7 @@ static int reshape_super_amd(struct supertype *st, struct shape *shape,
+ 	if ((shape->level != UnSet && shape->level != 1) ||
+ 	    shape->layout != UnSet || shape->chunk ||
+ 	    (shape->delta_disks != 1 && shape->delta_disks != -1)) {
+-		pr_err("%s: AMD metadata grows a volume's capacity (--size), a RAIDABLE into a RAID1 (--raid-devices=2), a RAID0 into a RAID10 (--level=10), a RAID5 or a RAID1 of two by disks (--raid-devices=N, --level=5)\n",
++		pr_err("%s: AMD metadata grows a volume's capacity (--size), a RAIDABLE into a RAID1 (--raid-devices=2), a RAID0 into a RAID10 (--level=10), a RAID0, a RAID5 or a RAID1 of two by disks (--raid-devices=N, --level=5)\n",
+ 		       shape->dev);
+ 		return 1;
+ 	}
+@@ -11021,12 +11265,13 @@ static int reshape_super_amd(struct supertype *st, struct shape *shape,
+ 	return 0;
+ }
+ 
+-/* amd_on_disks of manage_reshape_amd: volume @id has all copied, or ended */
++/* amd_on_disks of manage_reshape_amd: volume @id has all copied (a RAID0: ended), or ended */
+ static int amd_copy_recorded(struct amd_super *super, const void *id)
+ {
+ 	const struct amd_vol *v = amd_vol_by_id(super, *(const __u64 *)id);
+ 
+-	return v && (v->grow != AMD_GROW_RESHAPE || amd_transform_copied(v));
++	return v && (v->grow != AMD_GROW_RESHAPE ||
++		     (v->level != 0 && amd_transform_copied(v)));
+ }
+ 
+ /* md runs @sra: it has a personality (md.c array_state_show) */
+@@ -11142,8 +11387,8 @@ static int amd_disk_out(struct amd_super *super, const void *arg)
+  * reads its copy.  md writes nothing to the array before that either (the
+  * member is blocked until mdmon has recorded it), but writes let into a
+  * region on the log of the others must not depend on that.  The number of
+- * disks so failed, or -1 if one md cannot do without (a RAID5 degraded
+- * already), or not recorded.
++ * disks so failed, or -1 if one md cannot do without (a RAID0 reshapes as
++ * a RAID4 without its parity, a RAID5 degraded already), or not recorded.
+  */
+ static int amd_fail_log_members(struct supertype *st, struct mdinfo *sra,
+ 				struct amd_vol *v)
+@@ -11257,11 +11502,13 @@ static int amd_reshape_log(struct supertype *st, struct mdinfo *sra,
+  * them.  md is let on to the region's end only (sync_max): moving it, md
+  * writes at most 0x4800 sectors below the old place of the data at the
+  * mark - those it has moved already (amd_disks_shape) -, what the copy
+- * reads stays.  At the end md gets the new LD's capacity, and its member
+- * size if it ran larger members for the data it moved (amd_classify);
+- * mdmon writes "100 %" and the final packet as md ends (amd_md_reshaped).
+- * Stopped (SIGTERM), md finishes the region in work, the log has its end,
+- * and md stays held there.  1 if md has reshaped it all.
++ * reads stays; data that stay where they are, below the old layout's row
++ * at the mark (amd_reshape_region).  At the end md gets the new LD's
++ * capacity, and its member size if it ran larger members for the data it
++ * moved (amd_classify); mdmon writes "100 %" and the final packet as md
++ * ends (amd_md_reshaped).  Stopped (SIGTERM), md finishes the region in
++ * work, the log has its end, and md stays held there.  1 if md has
++ * reshaped it all.
+  */
+ static int manage_reshape_amd(int afd, struct mdinfo *sra,
+ 			      struct reshape *reshape, struct supertype *st,
+@@ -11283,7 +11530,6 @@ static int manage_reshape_amd(int afd, struct mdinfo *sra,
+ 		return 0;
+ 	}
+ 	v = &super->vol[vol];
+-	region = amd_protect_size(v);
+ 	end = sra->component_size * data;
+ 	/*
+ 	 * From the log on the disks, as md after assembly
+@@ -11301,6 +11547,13 @@ static int manage_reshape_amd(int afd, struct mdinfo *sra,
+ 	if (!is_fd_valid(fd))
+ 		return 0;
+ 	while (ok && mark < end) {
++		region = amd_reshape_region(v, mark);
++		if (!region) {
++			pr_err("%s: AMD moves the first stripes with a log of their data: the reshape waits at %llu\n",
++			       sra->sys_name, mark);
++			ok = 0;
++			break;
++		}
+ 		next = mark + region < end ? mark + region : end;
+ 		ok = amd_reshape_log(st, sra, v, mark) == 0;
+ 		if (!ok)
+@@ -11326,7 +11579,8 @@ static int manage_reshape_amd(int afd, struct mdinfo *sra,
+ 	 * md is done, the log has the last region's start: writes to that
+ 	 * region wait until mdmon has the "100 %" packet on the disks
+ 	 * (amd_md_reshaped) - before it, the AMD driver would copy the region
+-	 * again from where its data were, over them.
++	 * again from where its data were, over them.  A RAID0 until the final
++	 * packet: Grow.c makes md a RAID0 again next, which mdmon leaves.
+ 	 */
+ 	id = __le64_to_cpu(v->ld->id.id);
+ 	for (i = 0; i < 300 && amd_on_disks(st, amd_copy_recorded, &id); i++) {
+@@ -11422,13 +11676,15 @@ static int amd_migration_fits(struct amd_super *super, struct amd_vol *v,
+  * by mdadm (amd_reshape_size, amd_reshape_mirrors) - before it changes md,
+  * as the AMD driver writes the start before it copies (rcblob
+  * RC_StartTransform): the log, then the two LDs.  A RAID0's elements the
+- * RAID10 keeps are marked so in it (AMD_ELEMENT_MATCHED).  For a RAID0 md is
+- * to take over as a RAID10, managemon then gives it the spares
+- * (amd_activate_mirrors).
++ * RAID10 or the RAID0 of more disks keeps are marked so in it
++ * (AMD_ELEMENT_MATCHED).  For a RAID0 md is to take over as a RAID10,
++ * managemon then gives it the spares (amd_activate_mirrors).
+  * Its cancel - Grow.c could not set md to the new size - drops the LD it was
+  * to make, as the AMD driver drops a migration the user cancels (rcblob
+  * RC_RemoveTransformUpdateDriver; amd_set_disk for a RAIDABLE's): the
+- * volume as it was, LastOperation NORMAL, FAILED.
++ * volume as it was, LastOperation NORMAL, FAILED.  So does the cancel of a
++ * RAID0's migration onto more disks md runs the RAID0 as it was for
++ * (amd_reshape_disks): not one md reshapes, mdmon would have it.
+  */
+ static void amd_migrate_update(struct supertype *st,
+ 			       const struct amd_update_migrate *u,
+@@ -11449,6 +11705,11 @@ static void amd_migrate_update(struct supertype *st,
+ 		return;
+ 	}
+ 	v = &super->vol[u->vol];
++	if (u->cancel && v->grow == AMD_GROW_RESHAPE) {
++		if (amd_ld_raid0(v->ld) && !amd_vol_array(st, u->vol))
++			amd_reshape_dropped(super, u->vol);
++		return;
++	}
+ 	if (u->cancel) {
+ 		if (v->grow != AMD_GROW_SIZE)
+ 			return;
+@@ -11481,7 +11742,8 @@ static void amd_migrate_update(struct supertype *st,
+ 	}
+ 	/* as it starts: in the packet it is written in */
+ 	v->link->generation = __cpu_to_le64(super->generation);
+-	if (v->grow == AMD_GROW_MIRRORS) {
++	if (v->grow == AMD_GROW_MIRRORS ||
++	    (v->grow == AMD_GROW_RESHAPE && amd_ld_raid0(v->ld))) {
+ 		el = amd_ld_elements(v->ld);
+ 		for (i = 0; i < amd_ld_nel(v->ld); i++)
+ 			el[i].flags |= __cpu_to_le32(AMD_ELEMENT_MATCHED);
+@@ -11755,8 +12017,15 @@ static void amd_grow_done(struct amd_super *super, int vol)
+ static void amd_end_grow(struct amd_super *super, int vol)
+ {
+ 	struct amd_vol *v = &super->vol[vol];
++	struct amd_element *el = amd_ld_elements(v->link);
++	int i;
+ 
+ 	amd_ld_clear_transform(v->link);
++	/* a RAID0's elements without the flags of the migration (q8m-e1post) */
++	for (i = 0; i < amd_ld_nel(v->link); i++)
++		el[i].flags &= ~__cpu_to_le32(AMD_ELEMENT_MATCHED |
++					      AMD_ELEMENT_IN_SOURCE |
++					      AMD_ELEMENT_ALLOCATED);
+ 	amd_end_transform(super, vol, AMD_TRANSFORM_NORMAL,
+ 			  AMD_TRANSFORM_COMPLETED);
+ 	v->ld->state = __cpu_to_le32(amd_volume_state(super, v));
+@@ -11766,10 +12035,33 @@ static void amd_end_grow(struct amd_super *super, int vol)
+ 	v->mon.reshape_done = 0;
+ }
+ 
++/*
++ * md runs volume @vol as it was, its migration onto more disks not begun
++ * (amd_reshape_not_begun): the migration goes, as the AMD driver drops one
++ * the user cancels (rcblob RC_RemoveTransformUpdateDriver; amd_migrate_update
++ * for more capacity) - its log, the LD it was to make; the volume as it was,
++ * LastOperation NORMAL, FAILED.  Its bitmap is written anew, as large as the
++ * volume is.
++ */
++static void amd_reshape_dropped(struct amd_super *super, int vol)
++{
++	struct amd_vol *v = &super->vol[vol];
++
++	if (amd_tlog_write(super, v, v->link, 1, 0, 0) != 0)
++		dprintf("volume %d: transform log not cleared\n", vol);
++	amd_ld_clear_transform(v->ld);
++	v->mon.reshape_done = 0;
++	v->mon.bitmap_dirty = -1;
++	amd_end_transform(super, vol, AMD_TRANSFORM_NORMAL, AMD_TRANSFORM_FAILED);
++	amd_kmsg("subarray-%d: its migration onto more disks had not begun: dropped, the volume as it was (mdadm --grow starts it again)",
++		 vol);
++}
++
+ /*
+  * md has ended the reshape of @v onto more disks: no reshape position, as
+- * many disks as the LD it makes - not while the reshape stops (frozen,
+- * idle with the position kept: it goes on from there).
++ * many disks as the LD it makes (a RAID0: md's RAID4, its parity missing,
++ * one more) - not while the reshape stops (frozen, idle with the position
++ * kept: it goes on from there).
+  */
+ static int amd_md_reshaped(struct active_array *a, const struct amd_vol *v)
+ {
+@@ -11783,7 +12075,7 @@ static int amd_md_reshaped(struct active_array *a, const struct amd_vol *v)
+ 	    !str_is_none(buf))
+ 		return 0;
+ 	return sysfs_get_ll(&a->info, NULL, "raid_disks", &disks) == 0 &&
+-	       disks == (unsigned long long)v->nel;
++	       disks == (unsigned long long)(v->nel + (v->level == 0));
+ }
+ 
+ /*
+@@ -12337,6 +12629,8 @@ static void amd_sync_transforms(struct amd_super *super)
+ 		 */
+ 		if (v->grow == AMD_GROW_RESHAPE && v->mon.reshape_done > 0)
+ 			amd_grow_done(super, vol);
++		else if (v->grow == AMD_GROW_RESHAPE && v->mon.reshape_done < 0)
++			amd_reshape_dropped(super, vol);
+ 	}
+ }
+ 
+@@ -13939,7 +14233,9 @@ static int amd_md_element(struct amd_super *super, struct amd_vol *v,
+  * of the last.  The update activate_spare made goes to the monitor again,
+  * from what md runs: a device in a slot it is not the member in service
+  * of, or not in sync.  1 if there is one, in @u.  (IMSM does not look
+- * for one: imsm_open_new.)
++ * for one: imsm_open_new.)  None while data move onto more disks: md
++ * rebuilds nothing then (amd_activate_spare) - the new member of a RAID0
++ * is out of sync until the reshape has filled it (amd_reshape_content).
+  */
+ static int amd_unrecorded_rebuild(struct amd_super *super,
+ 				  struct active_array *a, struct amd_vol *v,
+@@ -13947,7 +14243,7 @@ static int amd_unrecorded_rebuild(struct amd_super *super,
+ {
+ 	struct mdinfo *dev;
+ 
+-	if (v->mon.rebuilding)
++	if (v->mon.rebuilding || v->grow == AMD_GROW_RESHAPE)
+ 		return 0;
+ 	for (dev = a->info.devs; dev; dev = dev->next) {
+ 		int slot = dev->disk.raid_disk;
+-- 
+2.47.3
+

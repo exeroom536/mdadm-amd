@@ -1,6 +1,6 @@
 # Test suite
 
-Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 850 checks in 84
+Functional tests of mdadm's AMD RAIDXpert2 support (`--metadata=amd`, `super-amd.c`): 856 checks in 86
 stages, on images of real AMD RAID disks, of disks made by the board's own RAID firmware in emulation, and of
 disks this mdadm makes. Everything runs on loop devices of sparse files (plus LIO SCSI disks backed by files for
 the udev stages); no real disk is touched unless you provide the optional AMD controller disks below.
@@ -140,6 +140,8 @@ about the X399 fixture (its dump has no LBA 0), printed by `-E` inside checks.
 | 69 | the backwards chunk change of stage 66 carried on by `mdadm --grow --continue` (as the `mdadm-grow-continue@` unit under systemd): the manager killed at the start, midway and after `-S` and assembly - the new one lets md on from the AMD log; the end as rcraid's |
 | 70 | growing in place: the transform log a region behind md - a RAID1 whose new part differs on its two halves, stopped midway: md has mirrored all below the end of the logged region, where the Windows driver goes on; assembled again, md ends it, md check 0; a volume smaller than a region refused |
 | 71 | the end of the AMD driver's own migrations cut short in their last milliseconds (rcraid's records of those moments): a RAID0 of 2 → 3 with its log "completed" goes on from the log's mark, with its "100 %" record (67.29 %, the log there or cleared) runs at once as a RAID0 of 3; a RAID5 of 3 → 4 with its log "completed" at the end runs at once as a RAID5 of 4 and is ended by mdmon as the AMD driver ends it |
+| 72 | a stale member of an uninitialized RAID1 that the BIOS menu took out of the second LD copy only, the NVMe disks coming before the SATA ones: md rebuilds it, and as the initialization ends `mdmon` records it offline in the LD kept (CRITICAL), so that a rebuild cut short goes on from its mark (1.6.1 to 1.6.3 recorded it in service: assembled in sync after a cut) |
+| 73 | a RAID0 of 2 → 3 grown under O_DIRECT reads, AMD and md 1.2: no wrong read, also of the reads across the level change raid4 → raid0 at the end (a bug of md in kernels 6.6 to 6.17 and 5.15.y to 6.12.y, worked around in `--grow`; 1.6.3 fails on such a kernel), the data as written |
 
 Fixtures and where they come from: [fixtures/README.md](fixtures/README.md). `helpers/` has the scripts that
 forge metadata with valid checksums for some stages; `../tools/amdraid_dump.py` parses it.

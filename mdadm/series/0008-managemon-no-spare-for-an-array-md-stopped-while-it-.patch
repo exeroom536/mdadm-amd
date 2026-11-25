@@ -1,0 +1,93 @@
+From 96a2d977f92e1bcc380c62f812da2d5751c7cb9d Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 17:53:40 +0500
+Subject: [PATCH 08/62] managemon: no spare for an array md stopped while it
+ was being added
+
+manage_member() waits for the monitor to take the metadata update of the
+spares it adds before it replaces the array.  If md stops the array
+meanwhile, the monitor lets go of it: it clears a->container
+(read_and_act(), deactivate) and, on its next pass, makes it
+discard_this.  replace_array() then frees it in remove_old() - and
+manage_member() reads a->info right after (heap-use-after-free) - and
+puts in newa with ->replaces pointing at the freed array, which the
+monitor hands back as discard_this: freed again.
+
+The amd metadata later in this series makes this common: one transform
+at a time in a container, as the AMD driver, so a rebuild that waited
+is offered as the other volume stops - mdadm -S of the container stops
+the next volume a few ms later.  Seen with AddressSanitizer on loop
+devices with the metadata of a PC (a recorded rebuild waiting), mdadm -S
+of the container: heap-use-after-free in 3 of 6 and 4 of 8 runs; with
+the change, 0 of 10.
+
+Look at a->container after the wait: if the monitor let go of the array,
+drop newa, closing only the descriptors of the devices added to it - the
+others are a's, closed when a is discarded.  The window left is from
+this test to remove_old(), not the whole wait for the update.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ managemon.c | 32 ++++++++++++++++++++++++++------
+ 1 file changed, 26 insertions(+), 6 deletions(-)
+
+diff --git a/managemon.c b/managemon.c
+index fc7214e5..74aeb888 100644
+--- a/managemon.c
++++ b/managemon.c
+@@ -601,7 +601,7 @@ static void manage_member(struct mdstat_ent *mdstat,
+ 		struct metadata_update *updates = NULL;
+ 		struct mdinfo *newdev = NULL;
+ 		struct active_array *newa;
+-		struct mdinfo *d;
++		struct mdinfo *d, *shared;
+ 
+ 		a->check_degraded = 0;
+ 
+@@ -613,6 +613,8 @@ static void manage_member(struct mdstat_ent *mdstat,
+ 			return;
+ 
+ 		newa = duplicate_aa(a);
++		/* the new devices go in front of these, a's too */
++		shared = newa->info.devs;
+ 		/* prevent the kernel from activating the disk(s) before we
+ 		 * finish adding them
+ 		 */
+@@ -637,11 +639,29 @@ static void manage_member(struct mdstat_ent *mdstat,
+ 			check_update_queue(container);
+ 			sleep_for(0, MSEC_TO_NSEC(15), true);
+ 		}
+-		replace_array(container, a, newa);
+-		if (sysfs_set_str(&a->info, NULL,
+-				  "sync_action", "recover") == 0)
+-			newa->prev_action = recover;
+-		dprintf("recovery started on %s\n", a->info.sys_name);
++		if (!a->container) {
++			/*
++			 * md stopped the array meanwhile: the monitor has let
++			 * go of it, and may have made it discard_this already
++			 * - replace_array() would free it under us and leave
++			 * newa for an array md no longer runs.  Drop newa;
++			 * the descriptors it shares with a are a's to close.
++			 */
++			for (d = newa->info.devs; d != shared; d = d->next) {
++				close(d->recovery_fd);
++				close(d->state_fd);
++				close(d->bb_fd);
++				close(d->ubb_fd);
++			}
++			free_aa(newa);
++			dprintf("%s stopped, no recovery\n", a->info.sys_name);
++		} else {
++			replace_array(container, a, newa);
++			if (sysfs_set_str(&a->info, NULL,
++					  "sync_action", "recover") == 0)
++				newa->prev_action = recover;
++			dprintf("recovery started on %s\n", a->info.sys_name);
++		}
+ 
+ 		while (newdev) {
+ 			d = newdev->next;
+-- 
+2.47.3
+

@@ -1,0 +1,95 @@
+From 561bf4e012fe3a32ead33dca82e008e3d99c20a6 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 15:49:35 +0500
+Subject: [PATCH 59/62] super-amd: record offline a stale member the BIOS took
+ out of one LD copy
+
+The AMD BIOS takes a stale member out of the second LD copy of an
+initialization only: a disk that missed a configuration, present when
+the menu next writes one (Initialize Disk of another disk, say), stays
+in service in the LD.  mdadm leaves it out of md for that and md
+rebuilds it, but when mdmon recorded the initialization done it
+dropped that copy (amd_end_transform()), and the LD left had the member
+in service, in step with the others.  amd_spare_update() records it
+offline first only if the rebuild comes after that end; when it comes
+before - a RAID1 started with its first member, md resyncs nothing, the
+stale one next and the end waits for a disk still on its way (NVMe
+before SATA) - the rebuild was recorded from an LD with its target in
+service.  Stopped midway, it was lost: mdadm assembled the RAID1 [2/2]
+in sync with the mirrors apart past the mark (md check 273920), the
+menu showed it Normal; for a RAID10, rcraid 9.3.3-00302 "rebuilt" the
+member from itself.
+
+As the copy goes, record the member offline in the one kept, as a
+missing member (0x30 with its ID, as the AMD driver keeps a member it
+rebuilds in place).  The rebuild then copies from an LD without it:
+the menu shows the volume Critical, rcraid and mdadm go on from the
+mark.  Not as the volume starts (amd_mark_missing()): that write would
+come before the disks still arriving one by one, and they would miss
+it.
+
+Seen in a VM with the AMD UEFI driver (RAIDCoreDxe 9.3.3-00277) and
+rcraid 9.3.3-00302; with the change, the RAID1 and the RAID10 cut off
+midway were rebuilt to their data.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ super-amd.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/super-amd.c b/super-amd.c
+index 1274756e..6558f5a3 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -1075,6 +1075,20 @@ static int amd_slot_usable(const struct amd_vol *v, int i)
+ 	return !other || amd_element_usable(&other[i]);
+ }
+ 
++/*
++ * Slot @i of @v has its member in service in the LD and none in the
++ * second copy: a stale member the AMD BIOS took out of the second copy of
++ * an initialization only (stand snapshots 07, 11: the menu shows the
++ * volume Ready).
++ */
++static int amd_slot_left_out(const struct amd_vol *v, int i)
++{
++	const struct amd_element *other = amd_other_elements(v);
++
++	return other && !v->grow && amd_element_usable(&v->el[i]) &&
++	       !amd_element_usable(&other[i]);
++}
++
+ /*
+  * Element @i of @v was failed on errors (0x10 without the 0x20 of a
+  * member found offline) in the LD or its second copy.
+@@ -10529,6 +10543,12 @@ static void amd_ld_clear_transform(struct amd_ld *ld)
+  * the volume is the LD it made (rcblob RC_TransformUpdateDriver).  The one
+  * kept has TransformType 0, LastOperation = the transform and
+  * TransformState @tstate.
++ * A stale member only the second copy keeps out (amd_slot_left_out) goes
++ * out of service in the one kept, as a member missing (0x30 with its ID,
++ * amd_mark_missing): else it would be in step there, and so in the LD a
++ * rebuild onto it copies from (amd_rebuild_ld) - stopped midway, rcraid
++ * then "rebuilt" it from itself, RAIDCoreDxe read the volume from it past
++ * the mark, mdadm took it in sync (notes/agent-q26un2.md).
+  */
+ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
+ 			      __u32 tstate)
+@@ -10537,7 +10557,14 @@ static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
+ 	int made = v->grow && tstate == AMD_TRANSFORM_COMPLETED;
+ 	struct amd_ld *ld = made ? v->link : v->ld;
+ 	struct amd_ld *gone = made ? v->ld : v->link;
++	int i;
+ 
++	for (i = 0; i < v->nel; i++)
++		if (amd_slot_left_out(v, i) &&
++		    amd_fail_element(super, v, i, AMD_ELEMENT_OFFLINE))
++			amd_kmsg("subarray-%d: member %d (disk %016llx) is stale, recorded as offline",
++				 vol, i,
++				 (unsigned long long)__le64_to_cpu(v->el[i].id.id));
+ 	super->config_dirty = 1;
+ 	ld->transform_type = 0;
+ 	ld->last_operation = __cpu_to_le32(op);
+-- 
+2.47.3
+

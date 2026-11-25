@@ -4011,7 +4011,9 @@ mkdir -p $Q41 && rm -f $Q41/*
 Q41AS=$((0x100000)); Q41DATA=$((0x105000))	# AllocatedSpace and the data start of volumes -C makes on blank disks
 q41l() { sudo losetup -j $Q41/$1.img | cut -d: -f1; }
 q41vol() { local c=$(cont1) m; for m in $(ls /sys/block | grep ^md); do grep -qx "external:/$c/0" /sys/block/$m/md/metadata_version 2>/dev/null && echo $m; done; }
-q41nres() { sudo dmesg | grep -c 'md: resync of RAID array'; }
+# resyncs since a mark in the kernel log: late in a run its ring is full, and a count of all its lines may stay put
+q41mark() { Q41K="q41 $RANDOM$RANDOM"; echo "amd-test: $Q41K" | sudo tee /dev/kmsg >/dev/null; }
+q41nres() { sudo dmesg | sed -n "/amd-test: $Q41K\$/,\$p" | grep -c 'md: resync of RAID array'; }
 q41spoil() { head -c 1M /dev/urandom | dd of=$Q41/$1.img bs=1M seek=$(( Q41DATA / 2048 + $2 )) conv=notrunc status=none; }
 q41check() { echo check | sudo tee /sys/block/$1/md/sync_action >/dev/null; sleep 1; waitrec; cat /sys/block/$1/md/mismatch_cnt; }
 q41crash() {	# q41crash <md> <images...>: writes to the volume, copies of the images meanwhile, a clean stop, the copies put back
@@ -4044,7 +4046,7 @@ q41level() {	# q41level <level> <disks> [--bitmap=internal]
 	q41spoil l1 $([ $lv = 1 ] && echo 140 || echo 70); [ -n "$bm" ] && q41spoil l1 330
 	q41win $D
 	check "41 $tag: crash, then the AMD driver cleared the bitmap: -E shows mdmon's shadow dirty from bit 0" "q41shadow $D"
-	R=$(q41nres)
+	q41mark; R=$(q41nres)
 	$M -I /dev/$(cont1) >/dev/null 2>&1; sleep 2; V=$(q41vol); waitrec
 	check "41 $tag: ... assembled: resync ($R -> $(q41nres) in the kernel log)" "[ -n '$V' ] && [ \$(q41nres) -gt $R ]"
 	P=$(q41check $V)
@@ -4058,7 +4060,7 @@ q41level() {	# q41level <level> <disks> [--bitmap=internal]
 	# a dual boot without a crash: Linux stopped cleanly, Windows clears the (clean) AMD bitmap - no resync
 	q41win $D
 	check "41 $tag: clean stop, then the AMD driver: no shadow left dirty (-E)" "! q41shadow $D"
-	R=$(q41nres)
+	q41mark; R=$(q41nres)
 	$M -I /dev/$(cont1) >/dev/null 2>&1; sleep 2; V=$(q41vol); waitrec
 	check "41 $tag: ... assembled without resync" "[ -n '$V' ] && [ \$(q41nres) = $R ] && [ \$(cat /sys/block/$V/md/resync_start) = none ]"
 	stopall
@@ -4265,7 +4267,9 @@ q43asm() {
 	$M -A /dev/md/q43c -e amd $(for n in "$@"; do q43l $n; done) >/dev/null 2>&1
 	$M -I /dev/$(cont1) >/dev/null 2>&1; sleep 2
 }
-q43nres() { sudo dmesg | grep -c 'md: resync of RAID array'; }
+# resyncs since a mark in the kernel log: late in a run its ring is full, and a count of all its lines may stay put
+q43mark() { Q43K="q43 $RANDOM$RANDOM"; echo "amd-test: $Q43K" | sudo tee /dev/kmsg >/dev/null; }
+q43nres() { sudo dmesg | sed -n "/amd-test: $Q43K\$/,\$p" | grep -c 'md: resync of RAID array'; }
 q43rw() { local m=$(cat /sys/block/$1/md/metadata_version 2>/dev/null); case "$m" in external:/*) [ "$(cat /sys/block/$1/md/array_state)" != readonly ] ;; *) false ;; esac; }
 # q43ended <volume>: the end of the check recorded as the AMD driver records it: normal, Transform 0, last 0x5356, COMPLETED; one LD
 # without the transform flags (mask AMD_LDF_TRANSFORM), TransformFlags 0, no TransformLink
@@ -4280,7 +4284,7 @@ q43mk 2 1 256 q43v; stopall
 L=$(q43check g0 g1 | sort -n | head -1); L=${L:-0}; MK=$(( L / 2048 ))
 check "43 raid1: Windows' check stopped midway, at MiB $MK of 256 ($(q43lds g0); log $(q43log g0 g1))" "q43sec q43v | grep -q 'Transform : 0x5356, last 0x5356, state 0xa1a7' && [ $MK -ge 8 ] && [ $MK -le 200 ] && q43log g0 g1 | grep -q '^5356:$L 5356:$L '"
 LO=$(( MK / 2 )); q43junk g1 230; q43junk g1 $LO
-R0=$(q43nres)
+q43mark; R0=$(q43nres)
 q43asm g0 g1; V=$(mdof raid1); waitrec 120; sleep 4
 check "43 raid1: ... assembled read-write ($V: $(cat /sys/block/$V/md/metadata_version 2>/dev/null) $(cat /sys/block/$V/md/array_state 2>/dev/null)), md resynced it ($(( $(q43nres) - R0 )) resync)" "[ -n '$V' ] && q43rw $V && [ $(q43nres) -gt $R0 ]"
 check "43 raid1: ... ended as AMD ends a check: normal, last 0x5356, one LD, transform flags clear ($(q43lds g0)), log cleared ($(q43log g0 g1))" "q43ended q43v && [ \"\$(q43log g0 g1)\" = '- - ' ]"
@@ -4288,19 +4292,19 @@ check "43 raid1: ... resynced from the log, as AMD resumes a check: the junk abo
 echo repair | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; waitrec 120
 echo check | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; waitrec 120
 check "43 raid1: ... data as before (md5 ${Q43MD5:0:8}), md check 0" "[ \"\$(sudo md5sum /dev/$V | cut -c1-32)\" = $Q43MD5 ] && [ \"\$(cat /sys/block/$V/md/mismatch_cnt)\" = 0 ]"
-stopall; R0=$(q43nres); q43asm g0 g1; V=$(mdof raid1); waitrec 60
+stopall; q43mark; R0=$(q43nres); q43asm g0 g1; V=$(mdof raid1); waitrec 60
 check "43 raid1: ... assembled again: no resync, still ended" "[ -n '$V' ] && q43rw $V && [ $(q43nres) = $R0 ] && [ \"\$(cat /sys/block/$V/md/resync_start)\" = none ] && q43ended q43v"
 
 # RAID5: the same without garbage (md puts the parity right from the data - garbage in the data would not show)
 q43mk 3 5 128 q43r; stopall
 L=$(q43check g0 g1 g2 | sort -n | head -1); L=${L:-0}; MK=$(( L / 2048 ))
 check "43 raid5: Windows' check stopped midway, at MiB $MK of 256 ($(q43lds g0); log $(q43log g0 g1 g2))" "q43sec q43r | grep -q 'Transform : 0x5356, last 0x5356, state 0xa1a7' && [ $MK -ge 8 ] && [ $MK -le 200 ]"
-R0=$(q43nres)
+q43mark; R0=$(q43nres)
 q43asm g0 g1 g2; V=$(mdof raid5); waitrec 120; sleep 4
 check "43 raid5: ... assembled read-write ($V: $(cat /sys/block/$V/md/metadata_version 2>/dev/null)), md resynced it, ended as AMD ends a check ($(q43lds g0); log $(q43log g0 g1 g2))" "[ -n '$V' ] && q43rw $V && [ $(q43nres) -gt $R0 ] && q43ended q43r && [ \"\$(q43log g0 g1 g2)\" = '- - - ' ]"
 echo check | sudo tee /sys/block/$V/md/sync_action >/dev/null; sleep 1; waitrec 120
 check "43 raid5: ... data as before (md5 ${Q43MD5:0:8}), md check 0" "[ \"\$(sudo md5sum /dev/$V | cut -c1-32)\" = $Q43MD5 ] && [ \"\$(cat /sys/block/$V/md/mismatch_cnt)\" = 0 ]"
-stopall; R0=$(q43nres); q43asm g0 g1 g2; V=$(mdof raid5); waitrec 60
+stopall; q43mark; R0=$(q43nres); q43asm g0 g1 g2; V=$(mdof raid5); waitrec 60
 check "43 raid5: ... assembled again: no resync, still ended" "[ -n '$V' ] && q43rw $V && [ $(q43nres) = $R0 ] && [ \"\$(cat /sys/block/$V/md/resync_start)\" = none ] && q43ended q43r"
 q43clean; rmdir $Q43
 q43speed 400000
@@ -6204,6 +6208,8 @@ for q64i in $(seq 1 $Q64A); do
 	P=$(( ${P:-0} * 2 )); S=$(cat /sys/block/$V/md/sync_max)
 	sudo pkill -KILL -x mdadm; sleep 0.5
 	( $M --grow --continue /dev/$(qgmd amd64) >/dev/null 2>&1 & ); sleep 1
+	# md goes on until -S (at times in a burst up to sync_max): compare the log with where md is right before it
+	P2=$(q64pos $V); [ $(( ${P2:-0} * 2 )) -gt $P ] && P=$(( P2 * 2 ))
 	$M -S /dev/$V >/dev/null 2>&1; sleep 1
 	L=$((0x$(qgtlog $(qgl 0) 0x100000 | cut -d" " -f2)))
 	q64end
@@ -6688,6 +6694,119 @@ echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
 qgdrop q71
 fi
 # --- end of stage 71 ---
+
+# --- stage 72: a stale member of an uninitialized volume that the BIOS took out of the second LD copy only. Fixture
+# 2026-11-23-uninit-stale-member, made by the board's firmware in emulation from snapshot 04-r1 (a RAID5 and a RAID10
+# on SATA0-3, the RAID1 7e317001abc2 on NVMe0-1, all with CREATE_REDUNDANCY at 0 %): NVMe1 was away while mdmon wrote
+# a configuration (a member of another volume failed), then the menu wrote its own (Initialize Disk of a new SATA4) -
+# in the RAID1, NVMe1 is in service in the LD and out of the second copy. -I with the NVMe disks first (as udev often
+# brings them): the RAID1 starts with NVMe0, md rebuilds NVMe1, and the end of the initialization waits for the SATA
+# disks (amd_all_disks_here). mdmon dropped the second copy when md had taken NVMe1 for its rebuild already
+# (amd_spare_update records a member offline only if its slot is good in both copies), and the rebuild was recorded
+# from an LD with NVMe1 in service: cut short midway, 1.6.1 assembled the RAID1 [2/2] with no recovery (md check
+# 273920), the menu showed it Normal, rcraid "rebuilt" a RAID10 in that state from its stale member. 1.6.3 fails the
+# second check.
+if want 72; then
+cd "$MDADM_DIR"
+stopall
+Q72D=$FIXT/2026-11-23-uninit-stale-member
+qgdrop q72; mkdir -p $WQ/q72; QGL=""
+for n in nvme0 nvme1 sata0 sata1 sata2 sata3 sata4; do truncate -s 64G $WQ/q72/$n.img
+	xz -dc $Q72D/c-bios-$n-lba0-6000.img.xz | dd of=$WQ/q72/$n.img conv=notrunc status=none
+	for b in $Q72D/c-bios-$n-lba0x*.bin; do [ -e "$b" ] || continue; l=${b##*-lba}; l=${l%.bin}
+		dd if=$b of=$WQ/q72/$n.img bs=512 seek=$((l)) conv=notrunc status=none; done
+	QGL="$QGL $(sudo losetup -f --show $WQ/q72/$n.img)"; done
+echo 1000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+# NVMe0, NVMe1 (managemon has time to take NVMe1 into md), then SATA0-4
+$M -I $(qgl 0) >/dev/null 2>&1; $M -I $(qgl 1) >/dev/null 2>&1; sleep 2
+for i in 2 3 4 5 6; do $M -I $(qgl $i) >/dev/null 2>&1; done
+q72r1() { python3 $TOOLS/amdraid_dump.py --brief $WQ/q72/nvme0.img 2>/dev/null | grep ' 7e317001abc2 '; }
+for i in $(seq 1 20); do [ "$(qgld $WQ/q72/nvme0.img 7e317001abc2 | grep -c ' tt=5358 ')" = 2 ] && break; sleep 1; done	# RESTORE_SEGMENTS
+R1=$(mdof raid1)
+check "72: RAID1 started with NVMe0, md rebuilds the stale NVMe1" "[ -n '$R1' ] && [ \"\$(cat /sys/block/$R1/md/sync_action)\" = recover ]"
+check "72: the initialization ends with NVMe1 offline (0x30) in the LD kept, the rebuild (RESTORE_SEGMENTS) recorded from it: CRITICAL" "[ \$(qgld $WQ/q72/nvme0.img 7e317001abc2 | grep -c ' tt=5358 ') = 2 ] && q72r1 | grep -qE 'CRITICAL .* x2 .*7:8368/f30'"
+echo 400000 | sudo tee /proc/sys/dev/raid/speed_limit_max >/dev/null
+qgdrop q72
+fi
+# --- end of stage 72 ---
+
+# --- stage 73: a RAID0 grown under reads - the workaround of a bug of md raid0 in kernels 6.6 to 6.17 and the stable
+# 5.15.y to 6.12.y (with 319ff40a5427, without e0ed2bca7bef of 6.18). A bio that reaches md while it is suspended for
+# the level change raid4 -> raid0 at the end of a grow is split under the raid4 limits (1 MiB), and raid0 maps all of
+# it after the first chunk to one member: a read silently returns other data, a write lands on other data. Grow.c
+# sets queue/max_sectors_kb to the chunk before the level change (limit_bios_to_chunk). Volumes: an AMD RAID0 2 -> 3
+# (64 KiB chunk, AMD's default; a RAID1 beside it so that mdmon runs) and an md 1.2 RAID0 2 -> 3 (--add, room for
+# the reshape from --data-offset), under two O_DIRECT readers of 4 MiB (one round the volume, one at one place).
+# Checks: no wrong read, and at least one read across the level change (begun under raid4, ended under raid0;
+# without one the check would be empty); after the grow the disks hold the data written. Without the workaround
+# (1.6.3), on a kernel with the bug (6.12 here) the first check of each volume fails; on 6.18 and later there is no
+# bug, and the checks pass without it too.
+if want 73; then
+cd "$MDADM_DIR"
+stopall
+Q73=$WQ/q73
+qgdrop q73n; qgdrop q73; mkdir -p $Q73
+# rd.py <md> <data> <log> [fixed]: O_DIRECT reads of 4 MiB without pauses while <log>.run exists, compared with the
+# data (chunk after chunk round the volume; fixed: the first 4 MiB each time). Into the log: "reads N bad B cross C
+# badcross D" - cross: reads begun under raid4 and ended under raid0
+cat > $Q73/rd.py <<'PY'
+import mmap, os, sys
+dev, refp, logp = sys.argv[1:4]
+fixed = len(sys.argv) > 4
+ref = open(refp, "rb").read()
+size = 4 << 20
+lvl = "/sys/block/%s/md/level" % os.path.basename(os.path.realpath(dev))
+fd = os.open(dev, os.O_RDONLY | os.O_DIRECT)
+buf = mmap.mmap(-1, size)
+n = bad = cross = badx = off = 0
+while os.path.exists(logp + ".run"):
+	l1 = open(lvl).read().strip()
+	try:
+		ok = os.preadv(fd, [buf], off) == size and buf[:size] == ref[off:off + size]
+	except OSError:
+		ok = False
+	x = l1 == "raid4" and open(lvl).read().strip() == "raid0"
+	n += 1; bad += not ok; cross += x; badx += x and not ok
+	if not fixed:
+		off = (off + size) % len(ref)
+open(logp, "w").write("reads %d bad %d cross %d badcross %d\n" % (n, bad, cross, badx))
+PY
+head -c 128M /dev/urandom > $Q73/pat
+# q73grow <md> <grow command...>: the data into the volume, two readers, the grow; wait for a raid0 of 3, stop the readers
+q73grow() { local md=$1 p1 p2 i; shift
+	sudo dd if=$Q73/pat of=/dev/$md bs=1M oflag=direct status=none
+	rm -f $Q73/r1 $Q73/r2; touch $Q73/r1.run $Q73/r2.run
+	sudo python3 $Q73/rd.py /dev/$md $Q73/pat $Q73/r1 & p1=$!
+	sudo python3 $Q73/rd.py /dev/$md $Q73/pat $Q73/r2 fixed & p2=$!
+	sleep 1
+	"$@" > $Q73/grow.out 2>&1
+	for i in $(seq 1 600); do [ "$(cat /sys/block/$md/md/level)" = raid0 ] && [ "$(cat /sys/block/$md/md/raid_disks)" = 3 ] && break; sleep 0.5; done
+	sleep 2; rm -f $Q73/r1.run $Q73/r2.run; wait $p1 $p2
+	echo "  73: $(cat $Q73/r1); $(cat $Q73/r2)"; }
+# no wrong read by either reader, at least one across the level change
+q73reads() { [ -s $Q73/r1 ] && [ -s $Q73/r2 ] && cat $Q73/r1 $Q73/r2 | awk '{ b += $4; c += $6 } END { exit !(b == 0 && c > 0) }'; }
+q73data() { [ "$(cat /sys/block/$1/md/level)" = raid0 ] && [ "$(cat /sys/block/$1/md/raid_disks)" = 3 ] &&
+	sudo dd if=/dev/$1 bs=1M count=128 iflag=direct status=none | cmp -s - $Q73/pat; }
+# under other I/O md keeps a reshape at speed_limit_min: raise it, so that the grow takes seconds
+echo 100000 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null
+qgmk q73a 3 1
+$M -C /dev/md/amd73 -e amd -n 2 $(qgl 0) $(qgl 1) --run >/dev/null 2>&1; CN=$(cont1)
+$M -C /dev/md/z73 -e amd -l0 -n2 -z 64M $(qgl 0) $(qgl 1) --run >/dev/null 2>&1
+$M -C /dev/md/m73 -e amd -l1 -n2 -z 16M $(qgl 0) $(qgl 1) --run --assume-clean >/dev/null 2>&1
+sleep 1; $M /dev/$CN --add $(qgl 2) >/dev/null 2>&1; sleep 1; Z=$(qgmd z73)
+[ -n "$Z" ] && q73grow $Z $M --grow /dev/$Z --raid-devices=3
+check "73: AMD RAID0 2 -> 3 (chunk 64 KiB) under O_DIRECT reads of 4 MiB: no wrong read, also across the level change raid4 -> raid0" "[ -n '$Z' ] && q73reads"
+check "73: AMD RAID0 grown: raid0 of 3, the data as written" "[ -n '$Z' ] && q73data $Z"
+qgdrop q73a; mkdir -p $WQ/q73n; QGL=""
+for n in 0 1 2; do truncate -s 80M $WQ/q73n/d$n.img; QGL="$QGL $(sudo losetup -f --show $WQ/q73n/d$n.img)"; done
+$M -C /dev/md/n73 -e 1.2 -l0 -n2 -c 64 --data-offset=8M $(qgl 0) $(qgl 1) --run >/dev/null 2>&1; sleep 1; N=$(qgmd n73)
+[ -n "$N" ] && q73grow $N $M --grow /dev/$N --raid-devices=3 --add $(qgl 2)
+check "73: md 1.2 RAID0 2 -> 3 (chunk 64 KiB) under the same reads: no wrong read, also across the level change" "[ -n '$N' ] && q73reads"
+check "73: md 1.2 RAID0 grown: raid0 of 3, the data as written" "[ -n '$N' ] && q73data $N"
+echo 1000 | sudo tee /proc/sys/dev/raid/speed_limit_min >/dev/null
+qgdrop q73n; qgdrop q73
+fi
+# --- end of stage 73 ---
 
 # the ASRock and X399 snapshots are untouched: attached before stage 7, assembled only in stage 1
 if want 1; then

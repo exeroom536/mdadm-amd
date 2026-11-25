@@ -1,0 +1,159 @@
+From 9c09d23da298ad24003702d1271b4690627b7ac0 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 17:53:41 +0500
+Subject: [PATCH 60/62] super-amd: managemon reads a->container once in
+ activate_spare
+
+mdadm -S of a container stops its volumes one by one.  A rebuild that
+waited for another volume's transform (one at a time, as the AMD driver)
+is offered as that volume stops - and the monitor may clear the
+container of the array it is for meanwhile (read_and_act(), deactivate),
+as md stops that one too.  amd_mm_activate_spare() and its helpers read
+a->container->sb four times: under AddressSanitizer, a SEGV on a NULL
+a->container in amd_activate_spare().  Read it once and hand the super
+down; none taken when it is gone already.
+
+The array may also go while managemon waits for the monitor to take
+the update of the spare: that is manage_member()'s ("managemon: no
+spare for an array md stopped while it was being added").
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ super-amd.c | 47 ++++++++++++++++++++++++++++++++---------------
+ 1 file changed, 32 insertions(+), 15 deletions(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index 6558f5a3..9a657c75 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -9518,9 +9518,9 @@ static int store_super_amd(struct supertype *st, int fd)
+  *    has the spare in the slot (amd_activate_spare, amd_finish_rebuild).
+  * Other volumes are not taken.
+  */
+-static struct amd_vol *amd_active_vol(struct active_array *a)
++static struct amd_vol *amd_vol_of(struct amd_super *super,
++				  struct active_array *a)
+ {
+-	struct amd_super *super = a->container->sb;
+ 	int inst = a->info.container_member;
+ 
+ 	if (inst < 0 || inst >= super->nvol || !super->vol[inst].managed)
+@@ -9528,6 +9528,11 @@ static struct amd_vol *amd_active_vol(struct active_array *a)
+ 	return &super->vol[inst];
+ }
+ 
++static struct amd_vol *amd_active_vol(struct active_array *a)
++{
++	return amd_vol_of(a->container->sb, a);
++}
++
+ /*
+  * A message that must not get lost: once mdmon runs, its stderr is
+  * /dev/null (manage_fork_fds), so the message goes to the kernel log too.
+@@ -14933,10 +14938,10 @@ static int amd_mdbm_place(struct amd_super *super, const struct amd_vol *v,
+  * into the list @di (one for each slot of the array), the update in @u.
+  * How many.
+  */
+-static int amd_activate_mirrors(struct active_array *a, struct amd_vol *v,
++static int amd_activate_mirrors(struct amd_super *super,
++				struct active_array *a, struct amd_vol *v,
+ 				struct mdinfo *di, struct amd_update_spare *u)
+ {
+-	struct amd_super *super = a->container->sb;
+ 	struct mdinfo *dev, *last = NULL;
+ 	int slot, n = 0;
+ 
+@@ -14990,11 +14995,11 @@ static int amd_activate_mirrors(struct active_array *a, struct amd_vol *v,
+  * 1: the spare is in @di, the update for the monitor in @u - zeroed, and
+  * allocated before the lock (amd_mm_activate_spare).
+  */
+-static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
++static int amd_activate_spare(struct amd_super *super,
++			      struct active_array *a, struct mdinfo *di,
+ 			      struct amd_update_spare *u, long long bitmap_at)
+ {
+-	struct amd_super *super = a->container->sb;
+-	struct amd_vol *v = amd_active_vol(a);
++	struct amd_vol *v = amd_vol_of(super, a);
+ 	struct amd_disk *d = NULL;
+ 	struct amd_element el;
+ 	struct mdinfo *dev;
+@@ -15012,7 +15017,7 @@ static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
+ 		if (is_fd_valid(dev->state_fd) && (dev->curr_state & DS_FAULTY))
+ 			return 0;	/* wait for md to remove it */
+ 	if (v->grow == AMD_GROW_MIRRORS)
+-		return amd_activate_mirrors(a, v, di, u);
++		return amd_activate_mirrors(super, a, v, di, u);
+ 
+ 	/*
+ 	 * A slot md runs without: out of service, or its member missing - a
+@@ -15224,9 +15229,9 @@ static void amd_unlock(struct amd_super *super)
+  * monitor leaves them alone meanwhile (md_bitmap 0), and writes them anew
+  * if md keeps its bitmap after all.
+  */
+-static int amd_mdbm_stop(struct active_array *a, struct amd_vol *v)
++static int amd_mdbm_stop(struct amd_super *super, struct active_array *a,
++			 struct amd_vol *v)
+ {
+-	struct amd_super *super = a->container->sb;
+ 	unsigned int chunk;
+ 	int rv;
+ 
+@@ -15351,7 +15356,15 @@ static int amd_mm_open_new(struct supertype *c, struct active_array *a,
+ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
+ 					    struct metadata_update **updates)
+ {
+-	struct amd_super *super = a->container->sb;
++	/*
++	 * a->container is read once, and the helpers get the super from here:
++	 * the monitor clears it when md stops the array, and that may be just
++	 * now - mdadm -S of the container stops the volumes one by one, and a
++	 * rebuild that waited for another volume's transform comes here as
++	 * that volume stops (q26san: NULL a->container under ASan).
++	 */
++	struct supertype *c = a->container;
++	struct amd_super *super = c ? c->sb : NULL;
+ 	/*
+ 	 * Before the lock, as all managemon allocates (amd_mm_room): a spare
+ 	 * for each slot of the array (amd_activate_mirrors), freed one by one
+@@ -15366,13 +15379,17 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
+ 	/* md's sysfs before the lock: the monitor is not to wait on md */
+ 	long long bitmap_at = amd_md_bitmap_at(a);
+ 
++	if (!super) {
++		free(u);
++		return NULL;
++	}
+ 	for (i = 0; i < a->info.array.raid_disks || !di; i++) {
+ 		*tail = xcalloc(1, sizeof(**tail));
+ 		tail = &(*tail)->next;
+ 	}
+ 	amd_lock(super);
+-	found = amd_activate_spare(a, di, u, bitmap_at);
+-	v = amd_active_vol(a);
++	found = amd_activate_spare(super, a, di, u, bitmap_at);
++	v = amd_vol_of(super, a);
+ 	drop = found && v && v->mon.mdbm_drop;
+ 	amd_unlock(super);
+ 	if (!found) {
+@@ -15390,7 +15407,7 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
+ 	 * before it takes the disk - without the lock, md waits for the
+ 	 * monitor's writes to end (mddev_suspend).
+ 	 */
+-	if (drop && amd_mdbm_stop(a, v) != 0)
++	if (drop && amd_mdbm_stop(super, a, v) != 0)
+ 		goto none;
+ 	fd = amd_dev_open(di->disk.major, di->disk.minor, O_RDONLY);
+ 	u->features = amd_pd_features(fd, di->disk.major, di->disk.minor);
+@@ -15398,7 +15415,7 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
+ 	amd_limit_trim(a, di);
+ 	/* the LD the rebuild goes into: at most @v's own and an element */
+ 	amd_lock(super);
+-	v = amd_active_vol(a);
++	v = amd_vol_of(super, a);
+ 	len = v ? amd_ld_size(v->ld) + sizeof(struct amd_element) : 0;
+ 	amd_unlock(super);
+ 	amd_mm_ldbuf(super, len);
+-- 
+2.47.3
+

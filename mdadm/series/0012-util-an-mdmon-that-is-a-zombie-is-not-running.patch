@@ -1,0 +1,135 @@
+From 9dd09135b8f785fa365e11e062b1ba2370baab48 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:52:04 +0500
+Subject: [PATCH 12/62] util: an mdmon that is a zombie is not running
+
+mdmon_running() takes an mdmon for running while kill(pid, 0) finds it.
+A zombie it still finds.  In the shutdown ramfs (systemd's exitrd,
+dracut's shutdown) pid 1 does not reap, and an mdmon that left on
+SIGTERM keeps its pid file (the mdmon taking over is to clean up, see
+wait_and_act()): it is "running" for good.  mdadm --stop of its
+container then waits the full 5 s for it to leave and says "mdmon for
+... is still running"; mdmon_take_array() starts no new mdmon for a
+member array, which stays readonly; wait_for_mdmon() takes the zombie
+for the mdmon it waits for.
+
+Tell a zombie from a running mdmon in mdmon_running(): move is_zombie()
+from mdmon.c (try_kill_monitor() keeps using it) to util.c.
+
+IMSM containers on loop devices, and AMD RAIDXpert2 ones (later in this
+series), a RAID1 in each, in a pid namespace whose pid 1 does not reap;
+mdmon ended with SIGTERM.  Without the change, mdadm -I of the container
+leaves the RAID1 readonly with no mdmon, and mdadm --stop of the
+container takes 5.05 s and says "still running"; with it a new mdmon
+takes the RAID1 and --stop takes 24-36 ms.  With a pid 1 that reaps,
+the same steps without the change: a new mdmon, --stop in 23 ms.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ mdadm.h |  1 +
+ mdmon.c | 29 -----------------------------
+ util.c  | 31 ++++++++++++++++++++++++++++++-
+ 3 files changed, 31 insertions(+), 30 deletions(-)
+
+diff --git a/mdadm.h b/mdadm.h
+index 2f07d600..e3fb4e5f 100644
+--- a/mdadm.h
++++ b/mdadm.h
+@@ -1664,6 +1664,7 @@ extern int open_subarray(char *dev, char *subarray, struct supertype *st, int qu
+ extern struct superswitch *version_to_superswitch(char *vers);
+ 
+ extern mdadm_status_t wait_for_mdmon_control_socket(const char *container_devnm);
++extern bool is_zombie(pid_t pid);
+ extern int mdmon_running(const char *devnm);
+ extern int mdmon_pid(const char *devnm);
+ extern mdadm_status_t wait_for_mdmon(const char *devnm);
+diff --git a/mdmon.c b/mdmon.c
+index 81b79493..2fc92bb8 100644
+--- a/mdmon.c
++++ b/mdmon.c
+@@ -167,35 +167,6 @@ static int make_pidfile(char *devname)
+ 	return 0;
+ }
+ 
+-/*
+- * An mdmon that has exited but that nobody has reaped is a zombie: kill()
+- * still finds it.  In the shutdown ramfs (systemd's exitrd, dracut's
+- * shutdown) its parent is the shutdown program as pid 1, which does not
+- * reap.
+- */
+-static bool is_zombie(pid_t pid)
+-{
+-	char buf[64];
+-	char *p;
+-	int fd;
+-	int n;
+-
+-	sprintf(buf, "/proc/%lu/stat", (unsigned long) pid);
+-	fd = open(buf, O_RDONLY);
+-	if (fd < 0)
+-		return false;
+-
+-	n = read(fd, buf, sizeof(buf)-1);
+-	close(fd);
+-	if (n <= 0)
+-		return false;
+-	buf[n] = 0;
+-
+-	/* "pid (comm) state ...": the last ')' ends comm */
+-	p = strrchr(buf, ')');
+-	return p && p[1] == ' ' && p[2] == 'Z';
+-}
+-
+ static void try_kill_monitor(pid_t pid, char *devname, int sock)
+ {
+ 	char buf[100];
+diff --git a/util.c b/util.c
+index 8b614ce8..0d91a7ff 100644
+--- a/util.c
++++ b/util.c
+@@ -1930,12 +1930,41 @@ int mdmon_pid(const char *devnm)
+ 	return atoi(pid);
+ }
+ 
++/*
++ * An mdmon that has exited but that nobody has reaped is a zombie: kill()
++ * still finds it.  In the shutdown ramfs (systemd's exitrd, dracut's
++ * shutdown) its parent is the shutdown program as pid 1, which does not
++ * reap.
++ */
++bool is_zombie(pid_t pid)
++{
++	char buf[64];
++	char *p;
++	int fd;
++	int n;
++
++	sprintf(buf, "/proc/%lu/stat", (unsigned long) pid);
++	fd = open(buf, O_RDONLY);
++	if (fd < 0)
++		return false;
++
++	n = read(fd, buf, sizeof(buf)-1);
++	close(fd);
++	if (n <= 0)
++		return false;
++	buf[n] = 0;
++
++	/* "pid (comm) state ...": the last ')' ends comm */
++	p = strrchr(buf, ')');
++	return p && p[1] == ' ' && p[2] == 'Z';
++}
++
+ int mdmon_running(const char *devnm)
+ {
+ 	int pid = mdmon_pid(devnm);
+ 	if (pid <= 0)
+ 		return 0;
+-	if (kill(pid, 0) == 0)
++	if (kill(pid, 0) == 0 && !is_zombie(pid))
+ 		return 1;
+ 	return 0;
+ }
+-- 
+2.47.3
+

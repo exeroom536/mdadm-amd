@@ -1,0 +1,69 @@
+From 972d0b4f30b5676ad3a278bda336a0c44a27bb83 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:55:03 +0500
+Subject: [PATCH 57/62] super-amd: a migration onto more disks copied short of
+ 100 %
+
+AMD's Linux driver (rcraid 9.3.3-00302) ends a migration of a RAID0
+onto more disks that grows its capacity - a RAIDABLE into a RAID0 of
+twice the capacity, a RAID0 of two onto three - with a "100 %" packet
+short of 100 %: TransformState COMPLETED, TransformPercentDone 50.27 %
+or 67.29 %, ProtectStart the old capacity rounded up to a region of the
+log, Flags 0x24.  The rest of the RAID0 is new space with nothing to
+copy.  The driver takes TransformState COMPLETED alone for done (rcblob
+RC_RestartTask) and ends the transform without I/O.
+
+amd_transform_copied() wanted 100000 per cent too.  With such a packet
+live and the transform log cleared - the driver stopped before its
+final packet - md reshaped the volume again from 0, reading the old
+layout over the data the driver had moved, and the volume was lost.
+Take a migration onto more disks for copied once it is COMPLETED with
+ProtectStart past the capacity it had: md runs the RAID0 as it is, and
+-E says 100% done.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ super-amd.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index 002a6f66..ce0d60ae 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -4761,12 +4761,20 @@ static unsigned long long amd_short_of_end(unsigned long long done,
+  * The "100 %" packet of the transform recorded for @v is the live one -
+  * TransformState COMPLETED, 100000 per cent: all is copied, the log may be
+  * cleared already.  The AMD driver then ends the transform without I/O
+- * (rcblob RC_RestartTask).
++ * (rcblob RC_RestartTask: TransformState COMPLETED is enough there).  Of
++ * a migration onto more disks also one short of 100 % that is past the
++ * data the volume had: rcraid 9.3.3-00302 ends a RAIDABLE -> RAID0 of
++ * twice the capacity so, at the old capacity rounded up to its region
++ * (50.27 %, dumps/2026-11-23-q26r0) - the rest of the RAID0 is new.
+  */
+ static int amd_transform_copied(const struct amd_vol *v)
+ {
+-	return __le32_to_cpu(v->ld->transform_percent) == AMD_PERCENT_DONE &&
+-	       __le32_to_cpu(v->ld->transform_state) == AMD_TRANSFORM_COMPLETED;
++	if (__le32_to_cpu(v->ld->transform_state) != AMD_TRANSFORM_COMPLETED)
++		return 0;
++	return __le32_to_cpu(v->ld->transform_percent) == AMD_PERCENT_DONE ||
++	       (v->grow == AMD_GROW_RESHAPE &&
++		__le64_to_cpu(v->ld->transform_protect_start) >=
++		__le64_to_cpu(v->ld->capacity));
+ }
+ 
+ /*
+@@ -6220,6 +6228,9 @@ static void amd_print_volume(struct amd_super *super, int vol)
+ 		/* backwards what is moved is from the mark up */
+ 		if (v->grow == AMD_GROW_RESHAPE && amd_data_up(ld, v->link))
+ 			done = cap - min(amd_reshape_mark(super, v), cap);
++		/* its "100 %" packet: the log may be cleared already */
++		if (amd_transform_copied(v))
++			done = cap;
+ 		/* the chunk, if it changes (only mdadm changes it) */
+ 		if (ld->cache_tag_size != v->link->cache_tag_size) {
+ 			snprintf(from, sizeof(from), ", %d KiB chunk",
+-- 
+2.47.3
+

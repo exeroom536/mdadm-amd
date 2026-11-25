@@ -295,3 +295,16 @@ cf67d5989d8e7574f92f07691d6d22eebf33718b325a65b44f00cdc38881ebd5  2026-11-23-rcr
 3b4cefb08d59f758ce5d3cbc114630c0397abf0bc1c8c15372132640d9249770  2026-11-23-rcraid-migration-end/r5g-f1-sata2-lba0x100000-100.img.xz
 b28d3a92ab151f0ade138a549f66802196a9fcff74b9183175c657419d5c8418  2026-11-23-rcraid-migration-end/r5g-f1-sata3-lba0-6000.img.xz
 3b4cefb08d59f758ce5d3cbc114630c0397abf0bc1c8c15372132640d9249770  2026-11-23-rcraid-migration-end/r5g-f1-sata3-lba0x100000-100.img.xz
+6e51ede63ef1536d8fe2dd7d03f8ae583cc363141c1551178cdbd55d752518d8  2026-11-23-uninit-stale-member/c-bios-nvme0-lba0-6000.img.xz
+160ef4c613370e42345d9c6f8a6c7b64a3d30dc26f2bc5d808532d240094520c  2026-11-23-uninit-stale-member/c-bios-nvme0-lba0x100000.bin
+3747c0f6cfbba47acffd0aba0602d2f34446310a54eee64b592db879734626ca  2026-11-23-uninit-stale-member/c-bios-nvme1-lba0-6000.img.xz
+160ef4c613370e42345d9c6f8a6c7b64a3d30dc26f2bc5d808532d240094520c  2026-11-23-uninit-stale-member/c-bios-nvme1-lba0x100000.bin
+348429e8d8da65d49a382bd5d3de25c7a969c59c01cebe05d06c8cccd1f2a838  2026-11-23-uninit-stale-member/c-bios-sata0-lba0-6000.img.xz
+bbd87005aaa6b5042ff1b62f42b779347eda832aff5ce00584bcc7c668da6541  2026-11-23-uninit-stale-member/c-bios-sata0-lba0x100000.bin
+dbc5d0b88fd711136457a9ac6124369863437895ed3be1046973d41f9220eb55  2026-11-23-uninit-stale-member/c-bios-sata0-lba0x878000.bin
+614a97c950298b38d44fd49763f92be2b409e8efdc98b7d1a079bbede6191e44  2026-11-23-uninit-stale-member/c-bios-sata1-lba0-6000.img.xz
+bbd87005aaa6b5042ff1b62f42b779347eda832aff5ce00584bcc7c668da6541  2026-11-23-uninit-stale-member/c-bios-sata1-lba0x100000.bin
+dbc5d0b88fd711136457a9ac6124369863437895ed3be1046973d41f9220eb55  2026-11-23-uninit-stale-member/c-bios-sata1-lba0x878000.bin
+be025140dca0e209714343bff3c33eda78bc42dfdb751a1feca9820ef1808f7b  2026-11-23-uninit-stale-member/c-bios-sata2-lba0-6000.img.xz
+c5ee7281fc093e1e7679104ba2967f397f6651173f710c8aacdd8066aea0f6f0  2026-11-23-uninit-stale-member/c-bios-sata3-lba0-6000.img.xz
+cc7b6ccda1322dd4d13a7f07b0296580bc480d99aa29411ebdf7945655166862  2026-11-23-uninit-stale-member/c-bios-sata4-lba0-6000.img.xz

@@ -384,7 +384,7 @@ index e8c49ff0..ab1ba6e0 100644
  			    st->minor_version >= 1 &&
  			    did_default &&
 diff --git a/Grow.c b/Grow.c
-index c49df9e5..33e935a6 100644
+index c49df9e5..a1c92be9 100644
 --- a/Grow.c
 +++ b/Grow.c
 @@ -910,6 +910,55 @@ static int subarray_set_num(char *container, struct mdinfo *sra, char *name, int
@@ -466,7 +466,7 @@ index c49df9e5..33e935a6 100644
  
  	if (!already_running)
  		sysfs_set_num(sra, NULL, "sync_min", sync_max_to_set);
-@@ -1853,6 +1910,26 @@ error:
+@@ -1853,6 +1910,65 @@ error:
  	return 1;
  }
  
@@ -490,10 +490,49 @@ index c49df9e5..33e935a6 100644
 +	}
 +}
 +
++/*
++ * Before md takes an array over to raid0, keep the bios it accepts to one
++ * chunk.  raid0 maps a bio that crosses a chunk boundary as two parts, the
++ * first chunk and all the rest on one member, and relies on its queue limit
++ * (max_hw_sectors = chunk) for the rest to fit in a chunk: Linux 6.6 to
++ * 6.17 and stable kernels from 5.15 on with commit 319ff40a5427 ("md/raid0:
++ * Fix performance regression for large sequential writes"); 6.18 splits
++ * the rest again.  A bio md split under the limits of the level it leaves
++ * (raid4/5: 1 MiB) and that waits out the level change reaches raid0
++ * longer: a read returns other data, a write lands on other data.
++ *
++ * The write of max_sectors_kb freezes the queue, so once it returns no bio
++ * split under the old limit is left on its way into md.  It also takes the
++ * queue limits lock first: done while md suspends the array to update the
++ * limits itself (the end of a raid4/5 reshape) it deadlocks with I/O
++ * waiting for the array, so only with no sync thread running.  raid0 sets
++ * its own limits on takeover: nothing to restore.
++ */
++static void limit_bios_to_chunk(struct mdinfo *sra)
++{
++	char path[PATH_MAX], val[24], action[20];
++	unsigned long long chunk;
++	int fd;
++
++	if (sysfs_get_str(sra, NULL, "sync_action", action, sizeof(action)) > 0 &&
++	    strncmp(action, "idle", 4) != 0 && strncmp(action, "frozen", 6) != 0)
++		return;
++	if (sysfs_get_ll(sra, NULL, "chunk_size", &chunk) || chunk < 4096)
++		return;
++	snprintf(path, sizeof(path), "/sys/block/%s/queue/max_sectors_kb",
++		 sra->sys_name);
++	fd = open(path, O_WRONLY);
++	if (fd < 0)
++		return;
++	snprintf(val, sizeof(val), "%llu", chunk / 1024);
++	write_attr(val, fd);
++	close(fd);
++}
++
  int Grow_reshape(char *devname, int fd,
  		 struct mddev_dev *devlist,
  		 struct context *c, struct shape *s)
-@@ -1961,12 +2038,14 @@ int Grow_reshape(char *devname, int fd,
+@@ -1961,12 +2077,14 @@ int Grow_reshape(char *devname, int fd,
  			goto release;
  		}
  
@@ -509,7 +548,7 @@ index c49df9e5..33e935a6 100644
  	}
  
  	added_disks = 0;
-@@ -2011,6 +2090,7 @@ int Grow_reshape(char *devname, int fd,
+@@ -2011,6 +2129,7 @@ int Grow_reshape(char *devname, int fd,
  	/* ========= set size =============== */
  	if (s->size > 0 && (s->size == MAX_SIZE || s->size != (unsigned)array.size)) {
  		unsigned long long orig_size = get_component_size(fd) / 2;
@@ -517,7 +556,7 @@ index c49df9e5..33e935a6 100644
  		unsigned long long min_csize;
  		struct mdinfo *mdi;
  		int raid0_takeover = 0;
-@@ -2057,6 +2137,16 @@ int Grow_reshape(char *devname, int fd,
+@@ -2057,6 +2176,16 @@ int Grow_reshape(char *devname, int fd,
  			}
  		}
  
@@ -534,7 +573,15 @@ index c49df9e5..33e935a6 100644
  		/* Update the size of each member device in case
  		 * they have been resized.  This will never reduce
  		 * below the current used-size.  The "size" attribute
-@@ -2360,16 +2450,8 @@ size_change_error:
+@@ -2134,6 +2263,7 @@ int Grow_reshape(char *devname, int fd,
+ 			sysfs_set_str(sra, NULL, "sync_action", "frozen");
+ 			/* go back to raid0, drop parity disk
+ 			 */
++			limit_bios_to_chunk(sra);
+ 			sysfs_set_str(sra, NULL, "level", "raid0");
+ 			md_get_array_info(fd, &array);
+ 		}
+@@ -2360,16 +2490,8 @@ size_change_error:
  	} else {
  		/* get spare devices from external metadata
  		 */
@@ -553,7 +600,7 @@ index c49df9e5..33e935a6 100644
  
  		/* Impose these changes on a single array.  First
  		 * check that the metadata is OK with the change.
-@@ -2391,6 +2473,17 @@ release:
+@@ -2391,6 +2513,17 @@ release:
  	return rv;
  }
  
@@ -571,7 +618,7 @@ index c49df9e5..33e935a6 100644
  /* verify_reshape_position()
   *	Function checks if reshape position in metadata is not farther
   *	than position in md.
-@@ -2416,15 +2509,39 @@ static int verify_reshape_position(struct mdinfo *info, int level)
+@@ -2416,15 +2549,39 @@ static int verify_reshape_position(struct mdinfo *info, int level)
  
  		dprintf("Read sync_max sysfs entry is: %s\n", buf);
  		if (!(ep == buf || (*ep != 0 && *ep != '\n' && *ep != ' '))) {
@@ -616,7 +663,7 @@ index c49df9e5..33e935a6 100644
  				pr_err("Fatal error: array reshape was not properly frozen (expected reshape position is %llu, but reshape progress is %llu.\n",
  				       position, info->reshape_progress);
  				pr_err("Reassemble array to try to restore critical sector.\n");
-@@ -2703,6 +2820,66 @@ fallback:
+@@ -2703,6 +2860,66 @@ fallback:
  	return 1;
  }
  
@@ -683,7 +730,7 @@ index c49df9e5..33e935a6 100644
  static int raid10_reshape(char *container, int fd, char *devname,
  			  struct supertype *st, struct mdinfo *info,
  			  struct reshape *reshape,
-@@ -2892,10 +3069,12 @@ static int impose_reshape(struct mdinfo *sra,
+@@ -2892,10 +3109,12 @@ static int impose_reshape(struct mdinfo *sra,
  		sra->reshape_progress = info->reshape_progress;
  	} else {
  		sra->reshape_progress = 0;
@@ -699,7 +746,20 @@ index c49df9e5..33e935a6 100644
  	}
  
  	md_get_array_info(fd, &array);
-@@ -3112,6 +3291,9 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3024,7 +3243,11 @@ static int impose_level(int fd, int level, char *devname, int verbose)
+ 	}
+ 	c = map_num(pers, level);
+ 	if (c) {
+-		int err = sysfs_set_str(&info, NULL, "level", c);
++		int err;
++
++		if (level == 0 && array.level != 0)
++			limit_bios_to_chunk(&info);
++		err = sysfs_set_str(&info, NULL, "level", c);
+ 		if (err) {
+ 			err = errno;
+ 			pr_err("%s: could not set level to %s\n",
+@@ -3112,6 +3335,9 @@ static int reshape_array(char *container, int fd, char *devname,
  	unsigned long blocks;
  	unsigned long long array_size;
  	int done;
@@ -709,7 +769,7 @@ index c49df9e5..33e935a6 100644
  	int *backup_fdp = NULL;
  	struct mdinfo *sra = NULL;
  	char buf[SYSFS_MAX_BUF_SIZE];
-@@ -3166,6 +3348,7 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3166,6 +3392,7 @@ static int reshape_array(char *container, int fd, char *devname,
  	}
  
  	if (st->ss->external && restart && (info->reshape_progress == 0) &&
@@ -717,7 +777,7 @@ index c49df9e5..33e935a6 100644
  	    !((sysfs_get_str(info, NULL, "sync_action",
  			     buf, sizeof(buf)) > 0) &&
  	      (strncmp(buf, "reshape", 7) == 0))) {
-@@ -3175,6 +3358,8 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3175,6 +3402,8 @@ static int reshape_array(char *container, int fd, char *devname,
  		 * Check if md has the same opinion, and reshape is restarted
  		 * from 0. If so, this is regular reshape start after reshape
  		 * switch in metadata to next array only.
@@ -726,7 +786,7 @@ index c49df9e5..33e935a6 100644
  		 */
  		if ((verify_reshape_position(info, reshape.level) >= 0) &&
  		    (info->reshape_progress == 0))
-@@ -3193,7 +3378,7 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3193,7 +3422,7 @@ static int reshape_array(char *container, int fd, char *devname,
  		/* Need 'sra' down at 'started:' */
  		sra = sysfs_read(fd, NULL,
  				 GET_COMPONENT|GET_DEVS|GET_OFFSET|GET_STATE|
@@ -735,7 +795,7 @@ index c49df9e5..33e935a6 100644
  		if (!sra) {
  			pr_err("%s: Cannot get array details from sysfs\n",
  			       devname);
-@@ -3345,6 +3530,16 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3345,6 +3574,16 @@ static int reshape_array(char *container, int fd, char *devname,
  		    array.raid_disks !=
  		    (info->array.raid_disks + info->delta_disks)) {
  			array.raid_disks += info->delta_disks;
@@ -752,7 +812,7 @@ index c49df9e5..33e935a6 100644
  			if (md_set_array_info(fd, &array) != 0) {
  				pr_err("failed to set raid disks\n");
  				goto release;
-@@ -3410,7 +3605,16 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3410,7 +3649,16 @@ static int reshape_array(char *container, int fd, char *devname,
  		goto release;
  	}
  
@@ -770,7 +830,7 @@ index c49df9e5..33e935a6 100644
  		/* Reshaping RAID10 does not require any data backup by
  		 * user-space.  Instead it requires that the data_offset
  		 * is changed to avoid the need for backup.
-@@ -3424,7 +3628,7 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3424,7 +3672,7 @@ static int reshape_array(char *container, int fd, char *devname,
  	}
  	sra = sysfs_read(fd, NULL,
  			 GET_COMPONENT|GET_DEVS|GET_OFFSET|GET_STATE|GET_CHUNK|
@@ -779,7 +839,7 @@ index c49df9e5..33e935a6 100644
  	if (!sra) {
  		pr_err("%s: Cannot get array details from sysfs\n",
  			devname);
-@@ -3433,15 +3637,39 @@ static int reshape_array(char *container, int fd, char *devname,
+@@ -3433,15 +3681,39 @@ static int reshape_array(char *container, int fd, char *devname,
  	if (!info->reshape_active)
  		remove_backup_link(sra->sys_name);
  
@@ -824,7 +884,7 @@ index c49df9e5..33e935a6 100644
  		update_cache_size(container, sra, info,
  				  min(reshape.before.data_disks,
  				      reshape.after.data_disks),
-@@ -3501,6 +3729,9 @@ started:
+@@ -3501,6 +3773,9 @@ started:
  	 * unit.  The number we have so far is just a minimum
  	 */
  	blocks = reshape.backup_blocks;
@@ -834,7 +894,7 @@ index c49df9e5..33e935a6 100644
  	if (reshape.before.data_disks ==
  	    reshape.after.data_disks) {
  		/* Make 'blocks' bigger for better throughput, but
-@@ -3509,7 +3740,7 @@ started:
+@@ -3509,7 +3784,7 @@ started:
  		 */
  		while (blocks * 32 < sra->component_size && blocks < 16*1024*2)
  			blocks *= 2;
@@ -843,7 +903,7 @@ index c49df9e5..33e935a6 100644
  		pr_err("Need to backup %luK of critical section..\n", blocks/2);
  
  	if (blocks >= sra->component_size/2) {
-@@ -3557,9 +3788,10 @@ started:
+@@ -3557,9 +3832,10 @@ started:
  		}
  	}
  
@@ -857,7 +917,16 @@ index c49df9e5..33e935a6 100644
  
  	/* Right, everything seems fine. Let's kick things off.
  	 * If only changing raid_disks, use ioctl, else use
-@@ -3888,6 +4120,15 @@ int reshape_container(char *container, char *devname,
+@@ -3751,6 +4027,8 @@ release:
+ 	free(offsets);
+ 	if (orig_level != UnSet && sra) {
+ 		c = map_num(pers, orig_level);
++		if (orig_level == 0)
++			limit_bios_to_chunk(sra);
+ 		if (c && sysfs_set_str(sra, NULL, "level", c) == 0)
+ 			pr_err("aborting level change\n");
+ 	}
+@@ -3888,6 +4166,15 @@ int reshape_container(char *container, char *devname,
  		if (mdmon_running(container))
  			flush_mdmon(container);
  
@@ -1151,7 +1220,7 @@ index 0cb8ff1b..87b455e5 100644
  get_nvme_opal_encryption_information(int disk_fd, struct encryption_information *information,
  				     const int verbose);
 diff --git a/managemon.c b/managemon.c
-index cdeadf3a..9a70001e 100644
+index cdeadf3a..6ffec8ab 100644
 --- a/managemon.c
 +++ b/managemon.c
 @@ -459,11 +459,14 @@ static mdadm_status_t managemon_disk_remove(struct mdinfo *disk, char *array_dev
@@ -1202,7 +1271,60 @@ index cdeadf3a..9a70001e 100644
  				continue;
  			}
  
-@@ -867,14 +880,20 @@ void manage(struct mdstat_ent *mdstat, struct supertype *container)
+@@ -598,7 +611,7 @@ static void manage_member(struct mdstat_ent *mdstat,
+ 		struct metadata_update *updates = NULL;
+ 		struct mdinfo *newdev = NULL;
+ 		struct active_array *newa;
+-		struct mdinfo *d;
++		struct mdinfo *d, *shared;
+ 
+ 		a->check_degraded = 0;
+ 
+@@ -610,6 +623,8 @@ static void manage_member(struct mdstat_ent *mdstat,
+ 			return;
+ 
+ 		newa = duplicate_aa(a);
++		/* the new devices go in front of these, a's too */
++		shared = newa->info.devs;
+ 		/* prevent the kernel from activating the disk(s) before we
+ 		 * finish adding them
+ 		 */
+@@ -634,11 +649,29 @@ static void manage_member(struct mdstat_ent *mdstat,
+ 			check_update_queue(container);
+ 			sleep_for(0, MSEC_TO_NSEC(15), true);
+ 		}
+-		replace_array(container, a, newa);
+-		if (sysfs_set_str(&a->info, NULL,
+-				  "sync_action", "recover") == 0)
+-			newa->prev_action = recover;
+-		dprintf("recovery started on %s\n", a->info.sys_name);
++		if (!a->container) {
++			/*
++			 * md stopped the array meanwhile: the monitor has let
++			 * go of it, and may have made it discard_this already
++			 * - replace_array() would free it under us and leave
++			 * newa for an array md no longer runs.  Drop newa;
++			 * the descriptors it shares with a are a's to close.
++			 */
++			for (d = newa->info.devs; d != shared; d = d->next) {
++				close(d->recovery_fd);
++				close(d->state_fd);
++				close(d->bb_fd);
++				close(d->ubb_fd);
++			}
++			free_aa(newa);
++			dprintf("%s stopped, no recovery\n", a->info.sys_name);
++		} else {
++			replace_array(container, a, newa);
++			if (sysfs_set_str(&a->info, NULL,
++					  "sync_action", "recover") == 0)
++				newa->prev_action = recover;
++			dprintf("recovery started on %s\n", a->info.sys_name);
++		}
+ 
+ 		while (newdev) {
+ 			d = newdev->next;
+@@ -867,14 +900,20 @@ void manage(struct mdstat_ent *mdstat, struct supertype *container)
  			/* Not for this array */
  			continue;
  		/* Looks like a member of this container */
@@ -1229,7 +1351,7 @@ index cdeadf3a..9a70001e 100644
  			manage_new(mdstat, container, a);
  	}
  }
-@@ -989,6 +1008,7 @@ void do_manager(struct supertype *container)
+@@ -989,6 +1028,7 @@ void do_manager(struct supertype *container)
  		 * update_queue
  		 */
  		if (update_queue == NULL) {
@@ -1237,7 +1359,7 @@ index cdeadf3a..9a70001e 100644
  			mdstat = mdstat_read(1, 0);
  
  			manage(mdstat, container);
-@@ -1006,10 +1026,14 @@ void do_manager(struct supertype *container)
+@@ -1006,10 +1046,14 @@ void do_manager(struct supertype *container)
  		if (sigterm)
  			wakeup_monitor();
  
@@ -1706,7 +1828,7 @@ index 227a68b2..26a93275 100644
  int mddev_busy(char *devnm);
  
 diff --git a/monitor.c b/monitor.c
-index b771707a..3a8dea70 100644
+index b771707a..7527d1bd 100644
 --- a/monitor.c
 +++ b/monitor.c
 @@ -118,6 +118,21 @@ static enum array_state read_state(int fd)
@@ -1759,7 +1881,41 @@ index b771707a..3a8dea70 100644
  	/* Effect state changes in the array */
  	if (a->next_state != bad_word) {
  		dprintf_cont(" state:%s", array_states[a->next_state]);
-@@ -874,7 +901,7 @@ static int wait_and_act(struct supertype *container, int nowait)
+@@ -731,10 +758,12 @@ static int wait_and_act(struct supertype *container, int nowait)
+ 	for (ap = aap ; *ap ;) {
+ 		a = *ap;
+ 		/* once an array has been deactivated we want to
+-		 * ask the manager to discard it.
++		 * ask the manager to discard it - unless the manager
++		 * is replacing it: then it goes as the replaced array,
++		 * below, or the manager frees it twice.
+ 		 */
+ 		if (!a->container || a->to_remove) {
+-			if (discard_this) {
++			if (discard_this || a == pending_discard) {
+ 				ap = &(*ap)->next;
+ 				continue;
+ 			}
+@@ -850,8 +879,17 @@ static int wait_and_act(struct supertype *container, int nowait)
+ 			for (ap = &a->next; *ap && *ap != a->replaces;
+ 			     ap = & (*ap)->next)
+ 				;
+-			if (*ap)
++			if (*ap) {
+ 				*ap = (*ap)->next;
++				if (!a->replaces->container) {
++					/* md stopped it meanwhile: so is the
++					 * copy, which closes the descriptors
++					 * they share (free_aa())
++					 */
++					a->replaces->container = container;
++					a->container = NULL;
++				}
++			}
+ 			discard_this = a->replaces;
+ 			a->replaces = NULL;
+ 			/* FIXME check if device->state_fd need to be cleared?*/
+@@ -874,7 +912,7 @@ static int wait_and_act(struct supertype *container, int nowait)
  	}
  
  	/* propagate failures across container members */
@@ -1839,10 +1995,10 @@ index f92a9a11..af1a26b8 100644
  int devpath_to_char(const char *dev_path, const char *entry, char *buf,
 diff --git a/super-amd.c b/super-amd.c
 new file mode 100644
-index 00000000..1274756e
+index 00000000..32f3f513
 --- /dev/null
 +++ b/super-amd.c
-@@ -0,0 +1,15473 @@
+@@ -0,0 +1,15518 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * mdadm - support for AMD RAIDXpert2 ("RAIDCore") metadata.
@@ -2918,6 +3074,20 @@ index 00000000..1274756e
 +	if (!amd_element_usable(&v->el[i]) || amd_grow_target(v, i))
 +		return 0;
 +	return !other || amd_element_usable(&other[i]);
++}
++
++/*
++ * Slot @i of @v has its member in service in the LD and none in the
++ * second copy: a stale member the AMD BIOS took out of the second copy of
++ * an initialization only (stand snapshots 07, 11: the menu shows the
++ * volume Ready).
++ */
++static int amd_slot_left_out(const struct amd_vol *v, int i)
++{
++	const struct amd_element *other = amd_other_elements(v);
++
++	return other && !v->grow && amd_element_usable(&v->el[i]) &&
++	       !amd_element_usable(&other[i]);
 +}
 +
 +/*
@@ -11349,14 +11519,19 @@ index 00000000..1274756e
 + *    has the spare in the slot (amd_activate_spare, amd_finish_rebuild).
 + * Other volumes are not taken.
 + */
-+static struct amd_vol *amd_active_vol(struct active_array *a)
++static struct amd_vol *amd_vol_of(struct amd_super *super,
++				  struct active_array *a)
 +{
-+	struct amd_super *super = a->container->sb;
 +	int inst = a->info.container_member;
 +
 +	if (inst < 0 || inst >= super->nvol || !super->vol[inst].managed)
 +		return NULL;
 +	return &super->vol[inst];
++}
++
++static struct amd_vol *amd_active_vol(struct active_array *a)
++{
++	return amd_vol_of(a->container->sb, a);
 +}
 +
 +/*
@@ -11501,15 +11676,15 @@ index 00000000..1274756e
 + * The discard_granularity of @a's volume as mdmon capped TRIM, 0 if it did
 + * not (amd_limit_trim): set it to @gran, the old one back.
 + */
-+static unsigned int amd_swap_trim_gran(struct active_array *a,
++static unsigned int amd_swap_trim_gran(struct amd_super *super,
++				       struct active_array *a,
 +				       unsigned int gran)
 +{
-+	struct amd_super *super = a->container->sb;
 +	unsigned int old = 0;
 +	struct amd_vol *v;
 +
 +	amd_lock(super);
-+	v = amd_active_vol(a);
++	v = amd_vol_of(super, a);
 +	if (v) {
 +		old = v->mon.trim_gran;
 +		v->mon.trim_gran = gran;
@@ -11551,7 +11726,8 @@ index 00000000..1274756e
 + * volume's queue, which waits for its writes - they may wait for the
 + * monitor (blk-sysfs queue_attr_store): managemon, with the lock released.
 + */
-+static void amd_limit_trim(struct active_array *a, const struct mdinfo *spare)
++static void amd_limit_trim(struct amd_super *super, struct active_array *a,
++			   const struct mdinfo *spare)
 +{
 +	int level = a->info.array.level;
 +	unsigned long long hw, gran;
@@ -11573,16 +11749,16 @@ index 00000000..1274756e
 +				 a->info.sys_name, why);
 +			return;
 +		}
-+		amd_swap_trim_gran(a, gran);
++		amd_swap_trim_gran(super, a, gran);
 +		amd_kmsg("TRIM off on %s as the AMD driver does: %s",
 +			 a->info.sys_name, why);
 +		return;
 +	}
-+	gran = amd_swap_trim_gran(a, 0);
++	gran = amd_swap_trim_gran(super, a, 0);
 +	if (!gran)
 +		return;		/* not capped by us */
 +	if (amd_trim_veto(a, spare)) {
-+		amd_swap_trim_gran(a, gran);
++		amd_swap_trim_gran(super, a, gran);
 +		return;
 +	}
 +	hw = min(hw, (unsigned long long)UINT_MAX);
@@ -12374,6 +12550,12 @@ index 00000000..1274756e
 + * the volume is the LD it made (rcblob RC_TransformUpdateDriver).  The one
 + * kept has TransformType 0, LastOperation = the transform and
 + * TransformState @tstate.
++ * A stale member only the second copy keeps out (amd_slot_left_out) goes
++ * out of service in the one kept, as a member missing (0x30 with its ID,
++ * amd_mark_missing): else it would be in step there, and so in the LD a
++ * rebuild onto it copies from (amd_rebuild_ld) - stopped midway, rcraid
++ * then "rebuilt" it from itself, RAIDCoreDxe read the volume from it past
++ * the mark, mdadm took it in sync (notes/agent-q26un2.md).
 + */
 +static void amd_end_transform(struct amd_super *super, int vol, __u32 op,
 +			      __u32 tstate)
@@ -12382,7 +12564,14 @@ index 00000000..1274756e
 +	int made = v->grow && tstate == AMD_TRANSFORM_COMPLETED;
 +	struct amd_ld *ld = made ? v->link : v->ld;
 +	struct amd_ld *gone = made ? v->ld : v->link;
++	int i;
 +
++	for (i = 0; i < v->nel; i++)
++		if (amd_slot_left_out(v, i) &&
++		    amd_fail_element(super, v, i, AMD_ELEMENT_OFFLINE))
++			amd_kmsg("subarray-%d: member %d (disk %016llx) is stale, recorded as offline",
++				 vol, i,
++				 (unsigned long long)__le64_to_cpu(v->el[i].id.id));
 +	super->config_dirty = 1;
 +	ld->transform_type = 0;
 +	ld->last_operation = __cpu_to_le32(op);
@@ -16751,10 +16940,10 @@ index 00000000..1274756e
 + * into the list @di (one for each slot of the array), the update in @u.
 + * How many.
 + */
-+static int amd_activate_mirrors(struct active_array *a, struct amd_vol *v,
++static int amd_activate_mirrors(struct amd_super *super,
++				struct active_array *a, struct amd_vol *v,
 +				struct mdinfo *di, struct amd_update_spare *u)
 +{
-+	struct amd_super *super = a->container->sb;
 +	struct mdinfo *dev, *last = NULL;
 +	int slot, n = 0;
 +
@@ -16808,11 +16997,11 @@ index 00000000..1274756e
 + * 1: the spare is in @di, the update for the monitor in @u - zeroed, and
 + * allocated before the lock (amd_mm_activate_spare).
 + */
-+static int amd_activate_spare(struct active_array *a, struct mdinfo *di,
++static int amd_activate_spare(struct amd_super *super,
++			      struct active_array *a, struct mdinfo *di,
 +			      struct amd_update_spare *u, long long bitmap_at)
 +{
-+	struct amd_super *super = a->container->sb;
-+	struct amd_vol *v = amd_active_vol(a);
++	struct amd_vol *v = amd_vol_of(super, a);
 +	struct amd_disk *d = NULL;
 +	struct amd_element el;
 +	struct mdinfo *dev;
@@ -16830,7 +17019,7 @@ index 00000000..1274756e
 +		if (is_fd_valid(dev->state_fd) && (dev->curr_state & DS_FAULTY))
 +			return 0;	/* wait for md to remove it */
 +	if (v->grow == AMD_GROW_MIRRORS)
-+		return amd_activate_mirrors(a, v, di, u);
++		return amd_activate_mirrors(super, a, v, di, u);
 +
 +	/*
 +	 * A slot md runs without: out of service, or its member missing - a
@@ -17042,9 +17231,9 @@ index 00000000..1274756e
 + * monitor leaves them alone meanwhile (md_bitmap 0), and writes them anew
 + * if md keeps its bitmap after all.
 + */
-+static int amd_mdbm_stop(struct active_array *a, struct amd_vol *v)
++static int amd_mdbm_stop(struct amd_super *super, struct active_array *a,
++			 struct amd_vol *v)
 +{
-+	struct amd_super *super = a->container->sb;
 +	unsigned int chunk;
 +	int rv;
 +
@@ -17149,7 +17338,7 @@ index 00000000..1274756e
 +		len = amd_ld_size(super->vol[inst].ld) + sizeof(struct amd_element);
 +	amd_unlock(super);
 +	if (rv == 0)
-+		amd_limit_trim(a, NULL);
++		amd_limit_trim(super, a, NULL);
 +	/* managemon queues the update (manage_new), as imsm_open_new's */
 +	if (!found || !c->update_tail) {
 +		free(u);
@@ -17169,7 +17358,15 @@ index 00000000..1274756e
 +static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
 +					    struct metadata_update **updates)
 +{
-+	struct amd_super *super = a->container->sb;
++	/*
++	 * a->container is read once, and the helpers get the super from here:
++	 * the monitor clears it when md stops the array, and that may be just
++	 * now - mdadm -S of the container stops the volumes one by one, and a
++	 * rebuild that waited for another volume's transform comes here as
++	 * that volume stops (q26san: NULL a->container under ASan).
++	 */
++	struct supertype *c = a->container;
++	struct amd_super *super = c ? c->sb : NULL;
 +	/*
 +	 * Before the lock, as all managemon allocates (amd_mm_room): a spare
 +	 * for each slot of the array (amd_activate_mirrors), freed one by one
@@ -17184,17 +17381,21 @@ index 00000000..1274756e
 +	/* md's sysfs before the lock: the monitor is not to wait on md */
 +	long long bitmap_at = amd_md_bitmap_at(a);
 +
++	if (!super) {
++		free(u);
++		return NULL;
++	}
 +	for (i = 0; i < a->info.array.raid_disks || !di; i++) {
 +		*tail = xcalloc(1, sizeof(**tail));
 +		tail = &(*tail)->next;
 +	}
 +	amd_lock(super);
-+	found = amd_activate_spare(a, di, u, bitmap_at);
-+	v = amd_active_vol(a);
++	found = amd_activate_spare(super, a, di, u, bitmap_at);
++	v = amd_vol_of(super, a);
 +	drop = found && v && v->mon.mdbm_drop;
 +	amd_unlock(super);
 +	if (!found) {
-+		amd_limit_trim(a, NULL);
++		amd_limit_trim(super, a, NULL);
 +		goto none;
 +	}
 +	/* the ones not taken */
@@ -17208,15 +17409,15 @@ index 00000000..1274756e
 +	 * before it takes the disk - without the lock, md waits for the
 +	 * monitor's writes to end (mddev_suspend).
 +	 */
-+	if (drop && amd_mdbm_stop(a, v) != 0)
++	if (drop && amd_mdbm_stop(super, a, v) != 0)
 +		goto none;
 +	fd = amd_dev_open(di->disk.major, di->disk.minor, O_RDONLY);
 +	u->features = amd_pd_features(fd, di->disk.major, di->disk.minor);
 +	close_fd(&fd);
-+	amd_limit_trim(a, di);
++	amd_limit_trim(super, a, di);
 +	/* the LD the rebuild goes into: at most @v's own and an element */
 +	amd_lock(super);
-+	v = amd_active_vol(a);
++	v = amd_vol_of(super, a);
 +	len = v ? amd_ld_size(v->ld) + sizeof(struct amd_element) : 0;
 +	amd_unlock(super);
 +	amd_mm_ldbuf(super, len);

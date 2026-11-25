@@ -1,0 +1,1096 @@
+From c4f79a5b69c19aaeb05d8ba393d8182dd72251b6 Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 23:23:34 +0500
+Subject: [PATCH 54/62] super-amd: a second migration onto more disks, in place
+ through AMD's log of the data
+
+A volume whose data a migration onto more disks moved already sits at
+AllocatedSpace + 0x800: the AMD driver moves it onto more disks again in
+place (rcblob RC_SetupTransformParams: 0x110141), its regions as far as
+the two layouts are apart, a stripe at a time where that is less than a
+region, and below LogDataRange each stripe through a log of its data at
+AllocatedSpace + 0x600 first, the phase in the transform log
+(RC_MoveDataNextRegion, RC_TransformUpdateNextDynamicRegionFromBeginning).
+
+mdadm --grow --raid-devices now records and runs such a migration of a
+RAID0 or a RAID5 (md reshapes without a new data_offset, held a stripe
+at a time, the stripe written to the log of the data before md moves
+it), and assembly takes one stopped below LogDataRange - by the AMD
+driver or by mdadm - there in user space before md runs the volume
+(recover_backup_amd): md does not go on from below it.  Earlier in this
+series such a volume stopped there was not assembled, or ran as it was,
+its migration left recorded, if nothing had moved.  md is let on only
+where the transform log says, what it moved flushed to the disks first.
+Another chunk for such a volume is refused (the next patch): AMD would
+move the data back up.
+
+md held by sync_max at a point across a stripe of the old layout keeps
+a read of that stripe waiting until it moves past it (raid5.c
+stripe_ahead_of_reshape), and a write of suspend_lo/hi then waits in
+mddev_suspend() for that read: mdadm waits for md, md for mdadm, for
+ever.  A migration in place gets there: the AMD driver takes the
+regions of a RAID0 in stripes of the new layout
+(RC_TransformDynamicProtectSize), its log may stand across a stripe of
+the old one (0x29c00 of a RAID0 of 3 given a fourth disk), and a region
+may end across one past the suspend window (0x2580 of a RAID0 4 -> 5) -
+going on with the AMD driver's own second migration of a RAID0 too.
+manage_reshape_amd() ends a region that would take md past the window
+where the window ends, a point where stripes of both layouts end, and
+moves the window only there; the AMD driver works its regions out from
+where it is.  At assembly recover_backup_amd() moves a migration stopped
+across an old stripe on to such a point itself, before md runs, as it
+moves the first stripes through AMD's log of the data.
+
+Tested with the AMD Linux driver (rcraid 9.3.3) in a QEMU guest: mdadm
+finishes the AMD driver's migration stopped midway (a RAID0 in either
+phase of a stripe in the log of the data, a RAID5), rcraid finishes
+ours, the final LDs those of rcraid byte for byte.  The hang, reproduced
+on loop devices from the AMD driver's marks of a RAID0 (3 -> 4, 4 -> 5),
+is gone with this.  Not yet tried on hardware or with the AMD Windows
+driver.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ super-amd.c | 793 ++++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 648 insertions(+), 145 deletions(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index 0ad9c7c4..59a86b88 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -375,12 +375,33 @@ struct amd_tlog {
+ #define AMD_TFLAGS_DATA_HIGH	0x00020000
+ /*
+  * A second such migration, the data at +0x800 already (rcadm -T -r0 again:
+- * q8m-e1cmid, 0x112141): nowhere to move them down, so in place - the
+- * first stripes through a log of the data at AllocatedSpace + 0x600, while
+- * this bit is set (rcblob RC_SetupTransformParams, RC_MoveDataNextRegion
+- * @0018a770); the transform log past them has it no more (0x12141).
++ * q8m-e1cmid, 0x112141 in both LDs): nowhere to move them down, so in place
++ * (RC_SetupTransformParams: 0x110141 | the space bits), its regions as far
++ * as the two layouts are apart (0x100, amd_reshape_region) - the first
++ * stripes through a log of the data at AllocatedSpace + 0x600, while
++ * AMD_TFLAGS_DATA_LOG is set (RC_MoveDataNextRegion @0018a770); the
++ * transform log past them has it no more (0x12141).  The stripe in work
++ * there has a phase in the flags of the LD and of its log
++ * (RC_TransformUpdateNextDynamicRegionFromBeginning @0014e070): first it
++ * goes into the log of the data (AMD_TFLAGS_DATA_LOGGING), then from where
++ * it is to its place (AMD_TFLAGS_DATA_LOGGED) - after a crash then, the AMD
++ * driver takes it from the log of the data (0x800000,
++ * RC_TransformUpdateNextRegion @0014e370).
+  */
++#define AMD_TFLAGS_DISKS_IN_PLACE	0x00112141
++#define AMD_TFLAGS_DYNAMIC	0x00000100
+ #define AMD_TFLAGS_DATA_LOG	0x00100000
++#define AMD_TFLAGS_DATA_LOGGING	0x00200000
++#define AMD_TFLAGS_DATA_LOGGED	0x00400000
++#define AMD_TFLAGS_DATA_PHASES	0x00e00000
++#define AMD_TFLAGS_DATA_PHASES_ALL	0x00700000
++/*
++ * The log of the data: a stripe of the LD made, each element's chunk of it
++ * - parity too - at AllocatedSpace + 0x600 of the element, whatever row it
++ * is (RC_Raid10NLogicalToPhysical @0014ce20, RC_Raid50LogicalToPhysical
++ * @0014c780 with CoreFlags 0x80000), up to the user data at + 0x800.
++ */
++#define AMD_DATA_LOG_OFFSET	0x600
+ /*
+  * An element of a RAID0 a migration starts from that the LD it becomes
+  * takes over (rcblob RC_CheckMatchDevice): the AMD driver writes the flags of
+@@ -593,6 +614,17 @@ struct amd_vol_mon {
+ #define AMD_GROW_RESHAPE	4
+ 
+ /* A logical device exposed as an md array */
++/*
++ * The region a migration copies at a time, volume sectors: @size from
++ * @start, @step a time - a stripe each where the two layouts are less than
++ * a region apart -, each stripe through the log of the data first
++ * (@data_log) at the start of the volume (amd_reshape_region).
++ */
++struct amd_region {
++	unsigned long long start, size, step;
++	int data_log;
++};
++
+ struct amd_vol {
+ 	struct amd_ld *ld;
+ 	struct amd_ld *link;	/* second copy of the LD while a transform runs */
+@@ -618,6 +650,13 @@ struct amd_vol {
+ 	int init_pending;
+ 	struct amd_vol_mon mon;
+ 	const char *blocked;	/* why it cannot be assembled */
++	/*
++	 * A migration onto more disks mdadm moves (manage_reshape_amd,
++	 * recover_backup_amd): the region in work and the phase of its
++	 * stripe in work, for the transform log (amd_tlog_fill).
++	 */
++	struct amd_region region;
++	__u32 log_phase;	/* AMD_TFLAGS_DATA_LOGGING or _LOGGED */
+ };
+ 
+ struct amd_super {
+@@ -3901,31 +3940,81 @@ static unsigned long long amd_protect_size(const struct amd_vol *v)
+ 	return amd_transform_protect_size(v->ld, v->shape);
+ }
+ 
++/* a stripe of @ld's data elements, sectors (RC_InitTransformStruct) */
++static unsigned long long amd_stripe_sectors(const struct amd_ld *ld)
++{
++	return amd_stripe_columns(ld) * (unsigned long long)amd_chunk_sectors(ld);
++}
++
++/*
++ * Where a migration of LD @s into LD @t that leaves the data in place
++ * stops logging them (rcblob RC_InitTransformStruct @00192fd0,
++ * LogDataRange): the stripes of the larger stripe to hold the smaller
++ * one's data elements over, one more.  RAID0 3 -> 4 at 64 KiB: 0x600.
++ * Below it the new layout is written where the old one is still to be
++ * read - md would not go on from there ("reshape_position too early").
++ */
++static unsigned long long amd_log_data_range(const struct amd_ld *s,
++					     const struct amd_ld *t)
++{
++	unsigned long long ss = amd_stripe_sectors(s), ts = amd_stripe_sectors(t);
++
++	if (ss < ts)
++		return ts * (ss * amd_stripe_columns(s) / ts + 1);
++	return ss * (ts * amd_stripe_columns(t) / ss + 1);
++}
++
++/*
++ * The unit of the regions of such a migration (rcblob
++ * RC_TransformDynamicProtectSize @0018c310): a stripe of both if both are
++ * RAID5, else a stripe of the LD made.
++ */
++static unsigned long long amd_dynamic_unit(const struct amd_ld *s,
++					   const struct amd_ld *t)
++{
++	if (__le32_to_cpu(s->device_type) == AMD_LDT_RAID50 &&
++	    __le32_to_cpu(t->device_type) == AMD_LDT_RAID50)
++		return amd_common_stripe(s, t);
++	return amd_stripe_sectors(t);
++}
++
+ /*
+  * The region a migration of @v onto more disks (AMD_GROW_RESHAPE) copies
+- * from volume sector @mark on, as the AMD driver works it out: the protect
+- * size where the data move down - the new layout goes 0x4800 sectors below
+- * the old, it never reaches what is still to be read.  Where they stay
+- * (moved there by an earlier migration) as much of it as the new layout
+- * can take below the row of the old one at @mark, in whole stripes of
+- * both (rcblob RC_TransformUpdateNextDynamicRegionFromBeginning @0014e070):
+- * a copy of the region again after a crash still finds its data.  0 when
+- * not one stripe: there AMD copies stripe by stripe through a log of their
+- * data (AMD_TFLAGS_DATA_LOG), which mdadm does not write.
++ * from volume sector @start on, as the AMD driver works it out, into @r:
++ * the protect size where the data move down - the new layout goes 0x4800
++ * sectors below the old, it never reaches what is still to be read.
++ * Where they stay (moved there by an earlier migration) as much of it as
++ * the new layout can take below the row of the old one at @start, in
++ * whole units (rcblob RC_TransformUpdateNextDynamicRegionFromBeginning
++ * @0014e070): a copy of the region again after a crash still finds its
++ * data.  Less than a unit: a unit, copied and logged a stripe of the new
++ * layout at a time - the one being written is then the only one that may
++ * be half new, half old -, and below LogDataRange, where it is written
++ * over the old layout of its own data, each stripe goes through the log
++ * of the data first (AMD_TFLAGS_DATA_LOG).
+  */
+-static unsigned long long amd_reshape_region(const struct amd_vol *v,
+-					     unsigned long long mark)
++static void amd_reshape_region(const struct amd_vol *v,
++			       unsigned long long start, struct amd_region *r)
+ {
+ 	unsigned long long protect = amd_protect_size(v), unit, room;
+-	unsigned long long chunk = amd_chunk_sectors(v->ld);
+-	unsigned long long ss = amd_stripe_columns(v->ld) * chunk;
+-	unsigned long long ts = amd_stripe_columns(v->shape) * chunk;
++	unsigned long long ss = amd_stripe_sectors(v->ld);
++	unsigned long long ts = amd_stripe_sectors(v->shape);
+ 
+-	if (!amd_data_gap(amd_ld_elements(v->ld), AMD_MIB))
+-		return protect;
+-	unit = amd_common_stripe(v->ld, v->shape);
+-	room = mark / ss > mark / ts ? ts * (mark / ss - mark / ts) : 0;
+-	return room >= protect ? protect : room - room % unit;
++	r->start = start;
++	r->size = protect;
++	r->step = protect;
++	r->data_log = 0;
++	if (amd_data_gap(amd_ld_elements(v->ld), AMD_MIB)) {
++		unit = amd_dynamic_unit(v->ld, v->shape);
++		room = start / ss > start / ts ? ts * (start / ss - start / ts) : 0;
++		if (room < protect)
++			r->size = room >= unit ? room - room % unit : unit;
++		r->step = r->size;
++		if (room < unit) {
++			r->step = ts;
++			r->data_log = start < amd_log_data_range(v->ld, v->shape);
++		}
++	}
+ }
+ 
+ /*
+@@ -4225,20 +4314,19 @@ static unsigned long long amd_volume_to_sync(const struct amd_vol *v,
+ }
+ 
+ /*
+- * TransformFlags of LD @ld a migration into @t starts from, and of its log:
+- * @t's, but for the bit of where the LD's own data are - AMD_TFLAGS_DISKS
+- * has the data of @t at +0x800, those of the LD it starts from are at
+- * +0x5000.  Of data an earlier migration moved there already, @t's - the
+- * log past the stripes logged with their data without AMD_TFLAGS_DATA_LOG
+- * (q8m-e1cmid; mdadm starts no such migration, amd_reshape_disks).
++ * TransformFlags of LD @ld a migration into @t starts from: @t's, but for
++ * the bit of where the LD's own data are - AMD_TFLAGS_DISKS has the data of
++ * @t at +0x800, those of the LD it starts from are at +0x5000.  Of data an
++ * earlier migration moved there already, @t's (q8m-e1cmid: 0x112141 in
++ * both).  Its log has them too, but for the log of the data: only while
++ * the region in work has it (amd_tlog_fill).
+  */
+ static __u32 amd_source_tflags(const struct amd_ld *ld, const struct amd_ld *t)
+ {
+ 	__u32 flags = __le32_to_cpu(t->transform_flags);
+ 
+-	if (amd_data_gap(amd_ld_elements(ld), AMD_MIB))
+-		flags &= ~AMD_TFLAGS_DATA_LOG;
+-	else if (flags & AMD_TFLAGS_DATA_LOW)
++	if (!amd_data_gap(amd_ld_elements(ld), AMD_MIB) &&
++	    (flags & AMD_TFLAGS_DATA_LOW))
+ 		flags = (flags & ~AMD_TFLAGS_DATA_LOW) | AMD_TFLAGS_DATA_HIGH;
+ 	return __cpu_to_le32(flags);
+ }
+@@ -4307,20 +4395,51 @@ static void amd_tlog_fill(const struct amd_vol *v, const struct amd_ld *tl,
+ 		 * IOStart on a region boundary) -, its I/O, so many to the
+ 		 * region, and the flags of the LD it starts from.  Data
+ 		 * moving onto more disks have their regions from the manager
+-		 * (manage_reshape_amd): in place, less than one at first.
++		 * (manage_reshape_amd, amd_reshape_region): in place, less
++		 * than one at first - a unit then, a stripe a time, IOStart
++		 * the one in work (RC_SetTransformSize goes on from there,
++		 * CurrentStripe into the unit), and the phase of the stripe
++		 * where its data are logged.
+ 		 */
+ 		unsigned int protect = amd_transform_protect_size(v->ld, tl);
+ 		unsigned int io = amd_grow_io_size(tl, protect);
++		unsigned long long start;
++		__u32 flags = __le32_to_cpu(amd_source_tflags(v->ld, tl));
++		int stepped = 0;
+ 
+ 		if (v->grow != AMD_GROW_RESHAPE)
+ 			done -= done % protect;
+-		t->protect_start = __cpu_to_le64(done);
++		start = done;
++		flags &= ~(AMD_TFLAGS_DATA_LOG | AMD_TFLAGS_DATA_PHASES);
++		if (v->grow == AMD_GROW_RESHAPE && v->region.size &&
++		    done >= v->region.start &&
++		    done < v->region.start + v->region.size) {
++			start = v->region.start;
++			protect = v->region.size;
++			stepped = v->region.step < protect;
++			io = stepped ? v->region.step :
++			     amd_grow_io_size(tl, protect);
++			t->current_stripe = __cpu_to_le32((done - start) / io);
++			if (v->region.data_log)
++				flags |= AMD_TFLAGS_DATA_LOG | v->log_phase;
++			/*
++			 * A region begun after a stripe was logged keeps that
++			 * bit (rcblob: 0x200000 set over 0x500000), the AMD
++			 * driver's 0x700000: restarted there, it copies the
++			 * stripe from where it is (rcraid 9.3.3-00302: q20m-x1).
++			 */
++			if (v->region.data_log && done == start && done &&
++			    v->log_phase == AMD_TFLAGS_DATA_LOGGING)
++				flags |= AMD_TFLAGS_DATA_LOGGED;
++		}
++		t->protect_start = __cpu_to_le64(start);
+ 		t->protect_size = __cpu_to_le32(protect);
+-		t->flags = amd_source_tflags(v->ld, tl);
+-		t->io_start = t->protect_start;
++		t->flags = __cpu_to_le32(flags);
++		t->io_start = __cpu_to_le64(done);
+ 		t->io_size = __cpu_to_le32(io);
+ 		t->dynamic_protect_stripe = __cpu_to_le32(protect / io);
+-		t->log_update_stripe = t->dynamic_protect_stripe;
++		t->log_update_stripe = stepped ? __cpu_to_le32(1) :
++				       t->dynamic_protect_stripe;
+ 	} else if (raid5 || amd_resync_transform(type)) {
+ 		/*
+ 		 * The I/O at ProtectStart and the protect window in
+@@ -4434,6 +4553,24 @@ static int amd_tlog_write(struct amd_super *super, struct amd_vol *v,
+ 	return n && !failed ? 0 : -1;
+ }
+ 
++/*
++ * Where transform log @t goes on from: ProtectStart, the start of the
++ * region in work - but a migration of dynamic regions a stripe at a time
++ * logs each, IOStart the one in work (rcblob RC_SetTransformSize @0017ef00:
++ * restarted, the AMD driver goes on from IOStart with TransformFlags 0x100).
++ */
++static unsigned long long amd_tlog_mark(const struct amd_tlog *t)
++{
++	unsigned long long start = __le64_to_cpu(t->protect_start);
++	unsigned long long io = __le64_to_cpu(t->io_start);
++
++	if (__le32_to_cpu(t->type) == AMD_TRANSFORM_NORMAL &&
++	    (__le32_to_cpu(t->flags) & AMD_TFLAGS_DYNAMIC) && io > start &&
++	    io - start < __le32_to_cpu(t->protect_size))
++		return io;
++	return start;
++}
++
+ /*
+  * Volume sectors done by transform @type of @v, from its transform log on
+  * the column-0 elements of @tl (written by us or by the AMD driver), or 0
+@@ -4445,11 +4582,13 @@ static int amd_tlog_write(struct amd_super *super, struct amd_vol *v,
+  * writes over a region behind the mark - the furthest copy is the one; one
+  * that lags is on a disk md failed (out of service in the packet), or was
+  * written as the next one was (manage_reshape_amd: either is safe then).
++ * @picked, if given, gets the copy the mark is from - of two at the
++ * furthest, one that has the stripe in the log of the data.
+  */
+-static unsigned long long amd_tlog_scan(struct amd_super *super,
++static unsigned long long amd_tlog_pick(struct amd_super *super,
+ 					struct amd_vol *v,
+ 					const struct amd_ld *tl, __u32 type,
+-					int most)
++					int most, struct amd_tlog *picked)
+ {
+ 	const struct amd_element *el = amd_ld_elements(tl);
+ 	/* managemon reads (activate_spare), the monitor writes iobuf meanwhile */
+@@ -4480,9 +4619,16 @@ static unsigned long long amd_tlog_scan(struct amd_super *super,
+ 		    __le32_to_cpu(t->type) != type ||
+ 		    __le32_to_cpu(t->status) != AMD_TLOG_STARTED)
+ 			continue;
+-		mark = __le64_to_cpu(t->protect_start);
+-		if (most ? !valid || mark > least : mark < least)
++		mark = amd_tlog_mark(t);
++		if (most ? !valid || mark > least : mark < least) {
+ 			least = mark;
++			if (picked)
++				*picked = *t;
++		} else if (most && mark == least && picked &&
++			   (__le32_to_cpu(t->flags) & AMD_TFLAGS_DATA_LOGGED)) {
++			/* written first: the log of the data was whole before */
++			*picked = *t;
++		}
+ 		valid = 1;
+ 	}
+ 	if (!valid)
+@@ -4490,6 +4636,14 @@ static unsigned long long amd_tlog_scan(struct amd_super *super,
+ 	return least < cap ? least : cap;
+ }
+ 
++static unsigned long long amd_tlog_scan(struct amd_super *super,
++					struct amd_vol *v,
++					const struct amd_ld *tl, __u32 type,
++					int most)
++{
++	return amd_tlog_pick(super, v, tl, type, most, NULL);
++}
++
+ static unsigned long long amd_tlog_read(struct amd_super *super,
+ 					struct amd_vol *v,
+ 					const struct amd_ld *tl, __u32 type)
+@@ -5724,56 +5878,6 @@ out:
+ 	return 0;
+ }
+ 
+-/*
+- * The migration of @v onto more disks has moved nothing yet - its log at
+- * 0, or none - and md cannot begin it: the AMD driver moves the first
+- * stripes of data that stay in their extents (a second migration,
+- * q8m-e1cmid) with a log of their data (amd_reshape_region).  The data are
+- * all where they were: md runs @v as it was, its old members and chunk
+- * (@this from amd_volume_devs); mdmon drops the migration
+- * (amd_reshape_dropped).  A crash meanwhile resyncs the whole volume.
+- * A RAID0 runs without mdmon: its migration stays recorded, and the AMD
+- * driver would start it from 0 over the data where md writes them; mdadm
+- * --grow drops it (amd_reshape_disks) and takes its new disks again -
+- * spares to Grow.c.
+- */
+-static void amd_reshape_not_begun(struct amd_vol *v, struct mdinfo *this)
+-{
+-	const struct amd_element *el = amd_ld_elements(v->ld);
+-	int i, n = amd_ld_nel(v->ld);
+-	struct mdinfo **dp = &this->devs, *dev;
+-
+-	this->array.chunk_size = amd_chunk_sectors(v->ld) * 512;
+-	if (amd_ld_raid0(v->ld)) {
+-		this->array.layout = 0;
+-		this->array.spare_disks += v->nel - n;
+-	} else if (__le32_to_cpu(v->ld->device_type) != AMD_LDT_RAID50 &&
+-		   __le32_to_cpu(v->ld->first_count) == 1) {
+-		this->array.level = 1;
+-		this->array.layout = 0;
+-		this->array.chunk_size = 0;
+-	}
+-	this->array.raid_disks = n;
+-	this->component_size = __le64_to_cpu(el[0].user_data.size);
+-	this->array.size = this->component_size / 2;
+-	this->array.working_disks = 0;
+-	for (i = 0; i < n; i++)
+-		this->array.working_disks += amd_element_usable(&el[i]);
+-	while ((dev = *dp)) {
+-		i = dev->disk.raid_disk;
+-		if (i < 0 || i >= n) {
+-			*dp = dev->next;
+-			free(dev);
+-			continue;
+-		}
+-		dev->data_offset = __le64_to_cpu(el[i].user_data.offset);
+-		dev->component_size = this->component_size;
+-		dp = &dev->next;
+-	}
+-	if (!(this->array.state & (1 << MD_SB_CLEAN)))
+-		this->resync_start = 0;
+-}
+-
+ /*
+  * Data moving onto more disks (AMD_GROW_RESHAPE, amd_disks_shape): md
+  * reshapes a RAID5 of the old number of disks - a RAID1 of two is one to
+@@ -5795,8 +5899,8 @@ static void amd_reshape_not_begun(struct amd_vol *v, struct mdinfo *this)
+  * its own RAID0s (Grow.c) and IMSM's: its first new member takes the
+  * parity's place in the old layout - md fills it by the reshape, in sync
+  * up to the mark.  Data an earlier migration moved already stay where they
+- * are (q8m-e1cmid): md goes on only where AMD copies whole regions, past
+- * the first stripes it moves with a log of their data (amd_reshape_region).
++ * are (q8m-e1cmid): below LogDataRange, where md cannot go on, mdadm moves
++ * the stripes left before md runs (recover_backup_amd).
+  */
+ static void amd_reshape_content(struct amd_super *super, struct amd_vol *v,
+ 				struct mdinfo *this)
+@@ -5811,18 +5915,6 @@ static void amd_reshape_content(struct amd_super *super, struct amd_vol *v,
+ 		return;
+ 	this->reshape_progress = amd_tlog_scan(super, v, v->link,
+ 					       AMD_TRANSFORM_NORMAL, 1);
+-	if (!grown && !amd_reshape_region(v, this->reshape_progress)) {
+-		if (this->reshape_progress == 0) {
+-			amd_reshape_not_begun(v, this);
+-			return;
+-		}
+-		v->blocked = "AMD moves its first stripes with a log of their data, md cannot go on with that";
+-		pr_err("subarray-%d: %s\n", (int)(v - super->vol), v->blocked);
+-		this->array.state |= 1 << MD_SB_BLOCK_VOLUME;
+-		amd_free_devs(this->devs);
+-		this->devs = NULL;
+-		return;
+-	}
+ 	this->reshape_active = 1;
+ 	this->delta_disks = v->nel - n;
+ 	this->new_level = v->level;
+@@ -9676,8 +9768,9 @@ static int amd_open_new(struct supertype *c, struct active_array *a, int inst)
+ 	a->info.container_member = inst;
+ 	/*
+ 	 * md runs as it was a volume whose data were to move onto more disks
+-	 * or to another chunk: nothing of it begun (amd_reshape_not_begun) -
+-	 * dropped by the monitor.  Reshaping, md has the new disks and chunk.
++	 * or to another chunk: nothing of it begun (mdadm --grow stopped
++	 * before md started) - dropped by the monitor.  Reshaping, md has
++	 * the new disks and chunk.
+ 	 */
+ 	v->mon.reshape_done = v->grow == AMD_GROW_RESHAPE &&
+ 			      a->info.array.raid_disks == amd_ld_nel(v->ld) &&
+@@ -10778,10 +10871,11 @@ static struct amd_ld *amd_mirrors_ld(struct amd_super *super,
+  * becomes, as -T -r0 (q8m-e1mid): its members where they are, the new ones
+  * on spares of the container laid out as they are (amd_free_spare),
+  * distinct disks; the data of each at AllocatedSpace + 0x800 - they move
+- * down -, every element as large as the members (md keeps their size: the
+- * capacity grows by them).  A RAID0 has the flags of its elements as the
+- * AMD driver leaves them (AMD_ELEMENT_IN_SOURCE), and no write-intent
+- * bitmap.  Allocated; NULL if the spares are short.
++ * down, or stay there (q8m-e1cmid) -, every element as large as the
++ * members (md keeps their size: the capacity grows by them).  A RAID0
++ * has the flags of its elements as the AMD driver leaves them
++ * (AMD_ELEMENT_IN_SOURCE), and no write-intent bitmap.  Allocated; NULL
++ * if the spares are short.
+  */
+ static struct amd_ld *amd_disks_ld(struct amd_super *super, struct amd_vol *v,
+ 				   int n, int chunk, unsigned int *size)
+@@ -10821,7 +10915,8 @@ static struct amd_ld *amd_disks_ld(struct amd_super *super, struct amd_vol *v,
+ 	if (v->level != 10)
+ 		t->capacity = __cpu_to_le64(v->component_size *
+ 					    (raid0 ? n : n - 1));
+-	amd_grow_fields(super, t, AMD_TFLAGS_DISKS);
++	amd_grow_fields(super, t, amd_data_gap(&v->el[0], AMD_MIB) ?
++				  AMD_TFLAGS_DISKS_IN_PLACE : AMD_TFLAGS_DISKS);
+ 	if (raid0)
+ 		t->attribute = v->ld->attribute;
+ 	return t;
+@@ -11050,13 +11145,16 @@ static int amd_md_clean(struct supertype *st)
+  * As the AMD driver checks (rcblob RC_TransformCheck,
+  * RC_CreateTransformRaidArray): the whole volume, no other transform, the
+  * chunk of a RAID0 or a RAID1 the same - and, as rcadm, RAID5's layout;
+- * 8 disks at most, as -C (--force: more).  Not of data an earlier
+- * migration moved already: AMD moves them on with a log of the data
+- * (q8m-e1cmid, TransformFlags 0x100000), which mdadm does not write; nor
+- * with a backup file - nothing is backed up.
++ * 8 disks at most, as -C (--force: more).  Data an earlier migration
++ * moved already stay where they are, as the AMD driver moves them on
++ * (q8m-e1cmid, AMD_TFLAGS_DISKS_IN_PLACE): md without a new data_offset,
++ * the first stripes through AMD's log of the data (manage_reshape_amd) -
++ * but not to another chunk: AMD would move them back up from the end
++ * (rcblob RC_SetupTransformParams: 0x20222), which mdadm does not.  No
++ * backup file: what is backed up goes into AMD's log of the data.
+  * A RAID0's migration recorded and not begun goes first: md runs the RAID0
+- * as it was (mdadm --grow stopped before md started, or
+- * amd_reshape_not_begun), and no mdmon dropped it.
++ * as it was (mdadm --grow stopped before md started), and no mdmon
++ * dropped it.
+  */
+ static int amd_reshape_disks(struct supertype *st, int vol,
+ 			     struct shape *shape, struct context *c)
+@@ -11066,6 +11164,7 @@ static int amd_reshape_disks(struct supertype *st, int vol,
+ 	int delta = shape->delta_disks == UnSet ? 0 : shape->delta_disks;
+ 	int n, chunk = v->chunk_sectors * 512;
+ 	int new_chunk = shape->chunk ? shape->chunk : chunk;
++	int in_place = amd_data_gap(&v->el[0], AMD_MIB);
+ 	unsigned int size;
+ 	struct amd_ld *t;
+ 	int i, fd;
+@@ -11132,7 +11231,7 @@ static int amd_reshape_disks(struct supertype *st, int vol,
+ 		return 1;
+ 	}
+ 	if (c->backup_file) {
+-		pr_err("%s: AMD moves the data down within their extents: no backup file\n",
++		pr_err("%s: AMD keeps what it backs up in its own log of the data: no backup file\n",
+ 		       shape->dev);
+ 		return 1;
+ 	}
+@@ -11173,11 +11272,16 @@ static int amd_reshape_disks(struct supertype *st, int vol,
+ 		}
+ 	}
+ 	for (i = 0; i < v->nel; i++)
+-		if (!amd_data_gap(&v->el[i], AMD_SERVICE)) {
+-			pr_err("%s: an AMD migration moved its data already: AMD moves them on with a log of the data, which mdadm does not write\n",
++		if (!amd_data_gap(&v->el[i], in_place ? AMD_MIB : AMD_SERVICE)) {
++			pr_err("%s: its members do not have their data where AMD puts them\n",
+ 			       shape->dev);
+ 			return 1;
+ 		}
++	if (in_place && new_chunk != chunk) {
++		pr_err("%s: an AMD migration moved its data already: AMD would move them back up for another chunk, which mdadm does not\n",
++		       shape->dev);
++		return 1;
++	}
+ 	/* a RAID0 has nothing to resync */
+ 	if (v->level != 0 && !amd_md_clean(st)) {
+ 		pr_err("%s: md is to resync it first\n", shape->dev);
+@@ -11248,8 +11352,10 @@ static int amd_reshape_disks(struct supertype *st, int vol,
+ 			snprintf(chunks, sizeof(chunks), "%schunk %d -> %d KiB",
+ 				 delta ? ", " : "", chunk / 1024,
+ 				 new_chunk / 1024);
+-		pr_err("%s: %s%s; mdmon records it as an AMD migration, md reshapes it, the data moving 9 MiB down on each disk\n",
+-		       shape->dev, disks, chunks);
++		pr_err("%s: %s%s; mdmon records it as an AMD migration, md reshapes it, %s\n",
++		       shape->dev, disks, chunks,
++		       in_place ? "the data where they are, the first stripes through AMD's log of the data" :
++				  "the data moving 9 MiB down on each disk");
+ 	}
+ 	return 0;
+ }
+@@ -11598,6 +11704,254 @@ static int amd_fail_log_members(struct supertype *st, struct mdinfo *sra,
+ 	return rv;
+ }
+ 
++/*
++ * The disks of the elements of @ld, by element, for the data of a
++ * migration (amd_disk_wfd: past the page cache, md writes them below it);
++ * -1 for one out of service or not here.  amd_put_fds closes them.
++ */
++static void amd_get_fds(struct amd_super *super, const struct amd_ld *ld,
++			int *fds)
++{
++	const struct amd_element *el = amd_ld_elements(ld);
++	int i;
++
++	for (i = 0; i < amd_ld_nel(ld); i++) {
++		struct amd_disk *d = amd_find_disk(super,
++						   __le64_to_cpu(el[i].id.id));
++
++		fds[i] = d && amd_element_usable(&el[i]) ? amd_disk_wfd(d) : -1;
++	}
++}
++
++static void amd_put_fds(struct amd_super *super, const struct amd_ld *ld,
++			int *fds)
++{
++	const struct amd_element *el = amd_ld_elements(ld);
++	int i;
++
++	for (i = 0; i < amd_ld_nel(ld); i++) {
++		struct amd_disk *d = amd_find_disk(super,
++						   __le64_to_cpu(el[i].id.id));
++
++		if (is_fd_valid(fds[i]) && (!d || fds[i] != d->fd))
++			close(fds[i]);
++		fds[i] = -1;
++	}
++}
++
++/* what was written to them is on the disks: their caches flushed */
++static int amd_sync_fds(const struct amd_ld *ld, const int *fds)
++{
++	int i, rv = 0;
++
++	for (i = 0; i < amd_ld_nel(ld); i++)
++		if (is_fd_valid(fds[i]) && fsync(fds[i]) != 0)
++			rv = -1;
++	return rv;
++}
++
++/* md's level of an AMD RAID0 or RAID5 LD, for restripe.c */
++static int amd_restripe_level(const struct amd_ld *ld)
++{
++	return amd_ld_raid0(ld) ? 0 : 5;
++}
++
++/*
++ * One stripe of @ld at volume sector @start - the data in @buf - written
++ * to its elements (@fds), or read from them into @buf (@get: @buf has room
++ * for a chunk on each element, the parity read with the data), by
++ * restripe.c as md lays RAID0 and RAID5 out: as AMD does, right-asymmetric
++ * (amd_classify).  Where the user data are or, @data_log, in the log of
++ * the data (AMD_DATA_LOG_OFFSET: the row dropped).  A RAID5 element
++ * missing is made up from the others.  0, or -1.
++ */
++static int amd_stripe_io(const struct amd_ld *ld, const int *fds,
++			 unsigned long long start, char *buf, int data_log,
++			 int get)
++{
++	const struct amd_element *el = amd_ld_elements(ld);
++	unsigned long long offs[AMD_MAX_PD];
++	int chunk = amd_chunk_sectors(ld) * AMD_SECTOR;
++	unsigned long long len = amd_stripe_sectors(ld) * AMD_SECTOR;
++	unsigned long long row = start * AMD_SECTOR / len;
++	int i, n = amd_ld_nel(ld);
++
++	for (i = 0; i < n; i++) {
++		offs[i] = __le64_to_cpu(el[i].user_data.offset) * AMD_SECTOR;
++		if (data_log)
++			offs[i] = (__le64_to_cpu(el[i].allocated.offset) +
++				   AMD_DATA_LOG_OFFSET) * AMD_SECTOR -
++				  row * chunk;
++	}
++	if (get)
++		return save_stripes((int *)fds, offs, n, chunk,
++				    amd_restripe_level(ld),
++				    ALGORITHM_RIGHT_ASYMMETRIC, 0, NULL,
++				    start * AMD_SECTOR, len, buf);
++	return restore_stripes((int *)fds, offs, n, chunk,
++			       amd_restripe_level(ld),
++			       ALGORITHM_RIGHT_ASYMMETRIC, -1, 0,
++			       start * AMD_SECTOR, len, buf) == 0 ? 0 : -1;
++}
++
++/*
++ * The data of the stripe of the LD made at volume sector @start, where
++ * the LD the migration of @v starts from still has them - in place, on
++ * the same disks (amd_disks_shape) -, into @buf: the stripes of the old
++ * layout over it read whole.  0, or -1.
++ */
++static int amd_old_stripe_get(const struct amd_vol *v, const int *fds,
++			      unsigned long long start, char *buf)
++{
++	const struct amd_ld *s = v->ld;
++	unsigned long long ss = amd_stripe_sectors(s);
++	unsigned long long ts = amd_stripe_sectors(v->link);
++	unsigned long long from = start / ss * ss;
++	unsigned long long to = (start + ts + ss - 1) / ss * ss, at;
++	char *tmp = amd_alloc((to - from) * AMD_SECTOR +
++			      amd_ld_nel(s) * amd_chunk_sectors(s) * AMD_SECTOR);
++	int rv = -1;
++
++	if (!tmp)
++		return -1;
++	for (at = from; at < to; at += ss)
++		if (amd_stripe_io(s, fds, at, tmp + (at - from) * AMD_SECTOR,
++				  0, 1) != 0)
++			goto out;
++	memcpy(buf, tmp + (start - from) * AMD_SECTOR, ts * AMD_SECTOR);
++	rv = 0;
++out:
++	free(tmp);
++	return rv;
++}
++
++/*
++ * The region of @v at @mark, if it is past the one in work; the stripe
++ * there goes into the log of the data first.
++ */
++static void amd_reshape_at(struct amd_vol *v, unsigned long long mark)
++{
++	if (!v->region.size || mark < v->region.start ||
++	    mark >= v->region.start + v->region.size)
++		amd_reshape_region(v, mark, &v->region);
++	v->log_phase = AMD_TFLAGS_DATA_LOGGING;
++}
++
++/*
++ * recover_backup_amd: the stripes of @v from volume sector @mark to @end,
++ * where md does not go on (amd_log_data_range) or is not to be held
++ * (recover_backup_amd), moved here as the AMD driver moves them (rcblob
++ * RC_MoveDataNextRegion), md not running yet - each the way
++ * manage_reshape_amd has md move it: below LogDataRange the transform log
++ * (AMD_TFLAGS_DATA_LOGGING), the stripe from where it is into the log of
++ * the data, the transform log (AMD_TFLAGS_DATA_LOGGED), the stripe into
++ * its place; past it the transform log at each step of a region (its
++ * start, or each stripe where it goes a stripe at a time), the stripes into
++ * their places.  @logged: the log of the data has the stripe
++ * at @mark whole - it goes from there; where it is is half overwritten.
++ * The log at @end then, a region from there.  0, 1 if an element is
++ * missing (nothing moved), or -1 with what is done logged.
++ */
++static int amd_move_logged(struct amd_super *super, struct amd_vol *v,
++			   unsigned long long mark, int logged,
++			   unsigned long long end)
++{
++	unsigned long long ts = amd_stripe_sectors(v->link);
++	int fds[AMD_MAX_PD], i, rv = -1;
++	char *buf = amd_alloc(amd_ld_nel(v->link) *
++			      amd_chunk_sectors(v->link) * AMD_SECTOR);
++
++	if (!buf)
++		return -1;
++	amd_get_fds(super, v->link, fds);
++	/* the AMD driver logs no parity of a RAID5 there (zeros): every element */
++	for (i = 0; i < amd_ld_nel(v->link); i++)
++		if (!is_fd_valid(fds[i])) {
++			rv = 1;
++			goto out;
++		}
++	for (; mark < end; mark += ts) {
++		amd_reshape_at(v, mark);
++		if (logged) {
++			if (amd_stripe_io(v->link, fds, mark, buf, 1, 1) != 0)
++				goto out;
++			logged = 0;
++		} else if (v->region.data_log) {
++			if (amd_tlog_write(super, v, v->link, 0, mark,
++					   AMD_TRANSFORM_NORMAL) != 0 ||
++			    amd_old_stripe_get(v, fds, mark, buf) != 0 ||
++			    amd_stripe_io(v->link, fds, mark, buf, 1, 0) != 0 ||
++			    amd_sync_fds(v->link, fds) != 0)
++				goto out;
++			v->log_phase = AMD_TFLAGS_DATA_LOGGED;
++			if (amd_tlog_write(super, v, v->link, 0, mark,
++					   AMD_TRANSFORM_NORMAL) != 0)
++				goto out;
++		} else if (((mark - v->region.start) % v->region.step == 0 &&
++			    amd_tlog_write(super, v, v->link, 0, mark,
++					   AMD_TRANSFORM_NORMAL) != 0) ||
++			   amd_old_stripe_get(v, fds, mark, buf) != 0) {
++			goto out;
++		}
++		if (amd_stripe_io(v->link, fds, mark, buf, 0, 0) != 0 ||
++		    amd_sync_fds(v->link, fds) != 0)
++			goto out;
++	}
++	if (mark > v->region.start && mark < v->region.start + v->region.size)
++		v->region.size = mark - v->region.start;
++	amd_reshape_at(v, mark);
++	rv = amd_tlog_write(super, v, v->link, 0, mark, AMD_TRANSFORM_NORMAL);
++out:
++	amd_put_fds(super, v->link, fds);
++	free(buf);
++	return rv;
++}
++
++/*
++ * manage_reshape_amd: the stripe md moves next, at @mark, into the log of
++ * the data, as the AMD driver writes it there (amd_reshape_region): read
++ * from the members where it was - md has written what it was given there,
++ * the stripe's writes wait; through md the read would wait for md to move
++ * past the old stripe it shares with the one before (raid5.c
++ * stripe_ahead_of_reshape), which md held at @mark does not -, written to
++ * the elements of the LD made, flushed.  0, or -1.
++ */
++static int amd_data_log_put(struct supertype *st, struct amd_vol *v,
++			    unsigned long long mark)
++{
++	int fds[AMD_MAX_PD], rv = -1;
++	char *buf = amd_alloc(amd_ld_nel(v->link) *
++			      amd_chunk_sectors(v->link) * AMD_SECTOR);
++
++	if (!buf)
++		return -1;
++	amd_get_fds(st->sb, v->link, fds);
++	if (amd_old_stripe_get(v, fds, mark, buf) == 0 &&
++	    amd_stripe_io(v->link, fds, mark, buf, 1, 0) == 0 &&
++	    amd_sync_fds(v->link, fds) == 0)
++		rv = 0;
++	amd_put_fds(st->sb, v->link, fds);
++	free(buf);
++	return rv;
++}
++
++/*
++ * manage_reshape_amd: what md has moved is on the disks of the LD made
++ * (md's writes flushed from their caches) before the transform log says
++ * it is moved - else after a power cut the log would be past what the
++ * disks have, and the region copied again from where its data were
++ * overwritten.  0, or -1.
++ */
++static int amd_reshape_flush(struct supertype *st, struct amd_vol *v)
++{
++	int fds[AMD_MAX_PD], rv;
++
++	amd_get_fds(st->sb, v->link, fds);
++	rv = amd_sync_fds(v->link, fds);
++	amd_put_fds(st->sb, v->link, fds);
++	return rv;
++}
++
+ /*
+  * manage_reshape_amd: the transform log at @mark, before md is let into
+  * the region from there - or at its end, as the reshape stops.  A disk that
+@@ -11639,6 +11993,23 @@ static int amd_reshape_log(struct supertype *st, struct mdinfo *sra,
+ 	return 0;
+ }
+ 
++/*
++ * manage_reshape_amd: where the window of the writes held (suspend_lo/hi)
++ * md has over @mark ends - set by an mdadm that managed the reshape
++ * before -, or 0.
++ */
++static unsigned long long amd_reshape_window(struct mdinfo *sra,
++					     unsigned long long mark)
++{
++	unsigned long long lo, hi;
++
++	if (sysfs_get_ll(sra, NULL, "suspend_lo", &lo) != 0 ||
++	    sysfs_get_ll(sra, NULL, "suspend_hi", &hi) != 0 ||
++	    lo > mark || mark >= hi)
++		return 0;
++	return hi;
++}
++
+ /*
+  * Grow.c hands a reshape onto more disks or to another chunk over
+  * (amd_reshape_disks, or going on after assembly; a RAID10 one too, as
+@@ -11653,7 +12024,13 @@ static int amd_reshape_log(struct supertype *st, struct mdinfo *sra,
+  * writes at most 0x4800 sectors below the old place of the data at the
+  * mark - those it has moved already (amd_disks_shape) -, what the copy
+  * reads stays; data that stay where they are, below the old layout's row
+- * at the mark (amd_reshape_region).  At the end md gets the new LD's
++ * at the mark (amd_reshape_region) - a stripe at a time where the two are
++ * less than a region apart, and at the start of the volume, where md
++ * writes each over its own old place, the stripe into AMD's log of the
++ * data first (AMD_TFLAGS_DATA_LOGGING), then the log that it is there
++ * (AMD_TFLAGS_DATA_LOGGED): copied from there after a crash, by the AMD
++ * driver or at assembly (recover_backup_amd).  What md has moved is
++ * flushed to the disks before each log.  At the end md gets the new LD's
+  * capacity, and its member size if it ran larger members for the data it
+  * moved (amd_classify); mdmon writes "100 %" and the final packet as md
+  * ends (amd_md_reshaped).  Stopped (SIGTERM), md finishes the region in
+@@ -11669,7 +12046,7 @@ static int manage_reshape_amd(int afd, struct mdinfo *sra,
+ 	struct amd_super *super = st->sb;
+ 	int vol = super ? amd_devnm_volume(super, sra->sys_name) : -1;
+ 	unsigned long long data = reshape->after.data_disks, unit = data;
+-	unsigned long long region, end, mark, next;
++	unsigned long long end, mark, next, held = 0, common;
+ 	struct amd_vol *v;
+ 	int fd, i, ok = 1;
+ 	__u64 id;
+@@ -11705,29 +12082,69 @@ static int manage_reshape_amd(int afd, struct mdinfo *sra,
+ 	fd = sysfs_get_fd(sra, NULL, "sync_completed");
+ 	if (!is_fd_valid(fd))
+ 		return 0;
++	/* data moving down: regions in whole stripes of both already */
++	common = amd_data_gap(amd_ld_elements(v->ld), AMD_MIB) ?
++		 amd_common_stripe(v->ld, v->link) : 1;
++	held = amd_reshape_window(sra, mark);
+ 	while (ok && mark < end) {
+-		region = amd_reshape_region(v, mark);
+-		if (!region) {
+-			pr_err("%s: AMD moves the first stripes with a log of their data: the reshape waits at %llu\n",
+-			       sra->sys_name, mark);
+-			ok = 0;
+-			break;
++		amd_reshape_at(v, mark);
++		next = min(mark + v->region.step,
++			   v->region.start + v->region.size);
++		next = min(next, end);
++		/*
++		 * The region's writes wait (below); md held elsewhere than
++		 * where stripes of both layouts end leaves a read of the old
++		 * stripe across the mark waiting for md (raid5.c
++		 * stripe_ahead_of_reshape), and setting the window then
++		 * (mddev_suspend) would wait for the read - and md for the
++		 * window - for ever (q21lock).  The window moves on only
++		 * there: a region that would take md past it ends there.
++		 * The AMD driver works the next one out from where it is
++		 * (rcblob RC_TransformUpdateNextDynamicRegionFromBeginning
++		 * @0014e070), as it does on a restart.
++		 */
++		if (mark < held && next > held) {
++			next = held;
++			v->region.size = held - v->region.start;
++			v->region.step = min(v->region.step, v->region.size);
+ 		}
+-		next = mark + region < end ? mark + region : end;
+-		ok = amd_reshape_log(st, sra, v, mark) == 0;
++		ok = amd_reshape_flush(st, v) == 0 &&
++		     amd_reshape_log(st, sra, v, mark) == 0;
+ 		if (!ok)
+ 			break;
+-		/* the region's writes wait; those below go to the new layout */
+-		ok = sysfs_set_num(sra, NULL, "suspend_hi", next) == 0 &&
+-		     sysfs_set_num(sra, NULL, "suspend_lo", mark) == 0 &&
++		/*
++		 * Those below go to the new layout.  Held across an old
++		 * stripe with no window yet - degraded, or assembled by an
++		 * mdadm before this one (recover_backup_amd) -, md waits for
++		 * this one if a read is across it: let on without it, the
++		 * writes there would be lost to a copy of the region again.
++		 */
++		if (next > held) {
++			held = min((next + common - 1) / common * common, end);
++			ok = sysfs_set_num(sra, NULL, "suspend_hi", held) == 0 &&
++			     sysfs_set_num(sra, NULL, "suspend_lo", mark) == 0;
++		}
++		/* a stripe written over its own old place: logged first */
++		if (ok && v->region.data_log) {
++			ok = amd_data_log_put(st, v, mark) == 0;
++			if (!ok)
++				pr_err("%s: cannot write the AMD log of the data: the reshape waits at %llu\n",
++				       sra->sys_name, mark);
++			v->log_phase = AMD_TFLAGS_DATA_LOGGED;
++			ok = ok && amd_reshape_log(st, sra, v, mark) == 0;
++		}
++		ok = ok &&
+ 		     sysfs_set_num(sra, NULL, "sync_max", next / unit) == 0 &&
+ 		     amd_reshape_wait(sra, fd, next / unit, unit == 1) == 0;
+ 		if (ok)
+ 			mark = next;
+ 		if (sigterm && mark < end) {
+ 			/* held where the log says it is */
+-			if (ok)
++			if (ok) {
++				amd_reshape_at(v, mark);
++				amd_reshape_flush(st, v);
+ 				amd_reshape_log(st, sra, v, mark);
++			}
+ 			ok = 0;
+ 		}
+ 	}
+@@ -11765,12 +12182,98 @@ static int manage_reshape_amd(int afd, struct mdinfo *sra,
+ 
+ /*
+  * Assembly of a volume md reshapes onto more disks (Assemble.c
+- * restore_backup): nothing to restore - md moves the data out of its own
+- * way (data_offset), the transform log says how far (amd_reshape_content).
++ * restore_backup), before md runs it: data moving down, nothing to
++ * restore - md moves them out of its own way (data_offset), the transform
++ * log says how far (amd_reshape_content).  Data that stay where they are
++ * (an earlier migration moved them): md goes on only past LogDataRange
++ * (amd_log_data_range); a migration stopped before it, by the AMD driver
++ * or by mdadm, is taken there first as the AMD driver would take it
++ * (amd_move_logged) - the stripe in the log of the data, if the log says
++ * it has it whole, into its place, the others through it -, and on to
++ * where stripes of both layouts end; so is one stopped across a stripe of
++ * the old layout (copied as md would).  md is set to go on from there (the
++ * reshape position and the geometry again, as sysfs_set_array() has them;
++ * a RAID0's first new member in sync up to it, as amd_reshape_content has
++ * it).  The stripes are written while the volume is assembled, before md
++ * runs it.  1 if that cannot be done: the volume is not started.
+  */
+ static int recover_backup_amd(struct supertype *st, struct mdinfo *info)
+ {
+-	return 0;
++	struct amd_super *super = st->sb;
++	int vol = info->container_member;
++	struct amd_tlog log = { 0 };
++	unsigned long long mark, end, to, common, ts;
++	struct mdinfo *dev;
++	struct amd_vol *v;
++	int logged, rv;
++
++	if (!super || vol < 0 || vol >= super->nvol)
++		return 0;
++	v = &super->vol[vol];
++	if (v->grow != AMD_GROW_RESHAPE || amd_transform_copied(v) ||
++	    !amd_data_gap(amd_ld_elements(v->ld), AMD_MIB))
++		return 0;
++	end = amd_log_data_range(v->ld, v->link);
++	mark = amd_tlog_pick(super, v, v->link, AMD_TRANSFORM_NORMAL, 1, &log);
++	/*
++	 * md goes on from where stripes of both layouts end: held across a
++	 * stripe of the old one, it would leave a read of that stripe
++	 * waiting, and setting the window of the writes held then
++	 * (manage_reshape_amd) would wait for the read for ever (q21lock).
++	 * The AMD driver's regions of a RAID0 are in stripes of the new
++	 * layout (rcblob RC_TransformDynamicProtectSize @0018c310; q8m-e1cmid:
++	 * 0x29c00 of RAID0 3 -> 4).
++	 */
++	common = amd_common_stripe(v->ld, v->link);
++	ts = amd_stripe_sectors(v->link);
++	to = (max(mark, end) + common - 1) / common * common;
++	if (to == mark || to > __le64_to_cpu(v->ld->capacity) ||
++	    (mark >= end && mark % ts))
++		return 0;
++	/*
++	 * Whole in the log of the data: 0x500000 - the AMD driver logs a
++	 * stripe 0x300000 or 0x700000 before it goes there (amd_tlog_fill).
++	 */
++	logged = log.checksum && amd_tlog_mark(&log) == mark &&
++		 (__le32_to_cpu(log.flags) & AMD_TFLAGS_DATA_PHASES_ALL) ==
++		 (AMD_TFLAGS_DATA_LOG | AMD_TFLAGS_DATA_LOGGED);
++	rv = mark % ts ? -1 : amd_move_logged(super, v, mark, logged, to);
++	if (rv == 1 && mark >= end) {
++		/* where they were, copied again from there */
++		pr_err("subarray-%d: degraded, not moved on to %llu: md goes on from %llu, across a stripe of the old layout\n",
++		       vol, to, mark);
++		return 0;
++	}
++	if (rv != 0) {
++		pr_err("subarray-%d: cannot move its first stripes through the AMD log of the data, as the AMD driver does\n",
++		       vol);
++		return 1;
++	}
++	if (mark < end)
++		pr_err("subarray-%d: its first stripes moved through the AMD log of the data, as the AMD driver does: md goes on from %llu\n",
++		       vol, to);
++	else
++		pr_err("subarray-%d: stripes from %llu moved as the AMD driver moves them: md goes on from %llu, where stripes of both layouts end\n",
++		       vol, mark, to);
++	info->reshape_progress = to;
++	for (dev = info->devs; dev; dev = dev->next)
++		if (v->level == 0 && dev->disk.raid_disk == amd_ld_nel(v->ld)) {
++			dev->recovery_start = to / v->nel;
++			if (sysfs_set_num(info, dev, "recovery_start",
++					  dev->recovery_start) != 0)
++				return 1;
++		}
++	/*
++	 * As sysfs_set_array() sets a reshape up: md takes the old number
++	 * of disks before the position - which resets the new geometry -,
++	 * the new one after it (md.c raid_disks_store: delta_disks).
++	 */
++	return sysfs_set_num(info, NULL, "raid_disks",
++			     info->array.raid_disks - info->delta_disks) ||
++	       sysfs_set_num(info, NULL, "reshape_position", to) ||
++	       sysfs_set_num(info, NULL, "chunk_size", info->new_chunk) ||
++	       sysfs_set_num(info, NULL, "layout", info->new_layout) ||
++	       sysfs_set_num(info, NULL, "raid_disks", info->array.raid_disks);
+ }
+ 
+ /*
+@@ -12196,11 +12699,11 @@ static void amd_end_grow(struct amd_super *super, int vol)
+ 
+ /*
+  * md runs volume @vol as it was, its migration onto more disks not begun
+- * (amd_reshape_not_begun): the migration goes, as the AMD driver drops one
+- * the user cancels (rcblob RC_RemoveTransformUpdateDriver; amd_migrate_update
+- * for more capacity) - its log, the LD it was to make; the volume as it was,
+- * LastOperation NORMAL, FAILED.  Its bitmap is written anew, as large as the
+- * volume is.
++ * (mdadm --grow stopped before md started): the migration goes, as the AMD
++ * driver drops one the user cancels (rcblob RC_RemoveTransformUpdateDriver;
++ * amd_migrate_update for more capacity) - its log, the LD it was to make;
++ * the volume as it was, LastOperation NORMAL, FAILED.  Its bitmap is
++ * written anew, as large as the volume is.
+  */
+ static void amd_reshape_dropped(struct amd_super *super, int vol)
+ {
+-- 
+2.47.3
+

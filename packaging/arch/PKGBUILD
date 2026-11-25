@@ -4,7 +4,7 @@
 # mdadm-amd.patch applies to.  Two packages from one build:
 #   mdadm-amd          - mdadm, mkinitcpio hooks, udev rule; replaces mdadm;
 #   md-bitmap-ext-dkms - optional: md_mod with the md fix for the write-intent bitmap of external
-#                        metadata (kernel/), for Linux 6.18.57-6.18.64 and 7.3.0-7.3.5, until it is upstream.
+#                        metadata (kernel/), for Linux 6.18.57-6.18.65 and 7.3.0-7.3.6, until it is upstream.
 # Build: cp ../../mdadm/mdadm-amd.patch ../dkms/* . && makepkg -s   (see docs/install.md)
 # (after changing a file here: updpkgsums)
 
@@ -13,7 +13,7 @@ pkgname=('mdadm-amd' 'md-bitmap-ext-dkms')
 _commit=4cd7d33c1d2672c40ee3653006c36fe84cd1a545   # mdadm-4.6-132-g4cd7d33c, 2026-11-20 (GitHub main)
 _mdadmver=4.6.r132.g4cd7d33c   # the mdadm it is built from (provides)
 # the mdadm-amd release; a build between releases: <last release>.r<n>
-pkgver=1.6.3
+pkgver=1.6.4
 pkgrel=1
 arch=('x86_64')
 license=('GPL-2.0-or-later')
@@ -23,8 +23,8 @@ makedepends=('git' 'man-db')
 # md-bitmap-ext-dkms: drivers/md of these stable tags (the bases), and for each the kernel releases whose
 # drivers/md files are the same (checked on a clone of stable: packaging/dkms/md-bases.sh); a kernel of any
 # other release keeps its own md_mod.  packaging/dkms/install.sh takes this table too.
-_mdbases=(6.18.57 6.18.61 6.18.63 7.3.1 7.3.4)
-_mdkvers=('6\.18\.(5[7-9]|60)' '6\.18\.6[12]' '6\.18\.6[34]' '7\.3\.[0-3]' '7\.3\.[45]')	# per base: regex of the kernel version up to its first "-"
+_mdbases=(6.18.57 6.18.61 6.18.63 6.18.65 7.3.1 7.3.4 7.3.6)
+_mdkvers=('6\.18\.(5[7-9]|60)' '6\.18\.6[12]' '6\.18\.6[34]' '6\.18\.65' '7\.3\.[0-3]' '7\.3\.[45]' '7\.3\.6')	# per base: regex of the kernel version up to its first "-"
 _md="https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/md"
 _mdfiles=(md.c md.h md-bitmap.c md-bitmap.h md-llbitmap.c md-cluster.h)
 
@@ -49,7 +49,7 @@ for _b in "${_mdbases[@]}"; do
 	done
 done
 sha256sums=('523685bd7cb3d574ff829f78c3bd74aa533b6d716472be470e029c21aa3881c9'
-            'd40d47bb69b9dc7beeb0d18e4cac3abeee0a0d1cddc61932379588d877395fe5'
+            '204a316e66691dc1213efad37fd7fb91ac4f3bb77881933608a69833d7687363'
             '52b7a3e7f6d4785234c79fd394f2009a9aa389230fa742250058bd1f310330d1'
             'c1472503c7f6e4ece43dc139b6ab80a1b564631de96490b253e9f60e2dc6fb7b'
             '1dfff7905e6db439a38f19deede2535e405387bda6d6d7e8ef5e71661ada019f'
@@ -81,6 +81,12 @@ sha256sums=('523685bd7cb3d574ff829f78c3bd74aa533b6d716472be470e029c21aa3881c9'
             '34027aede9ab068f3d08bd2c17a77b80d3506a468e81a7e5afd502e8c5a0b7a2'
             '54e5ebce1be053bfa7575094f7b6efb5c85debcc752b348af73dba377bb3712d'
             '1120a275736ab1d91931323e8a170380172bb71a98de48b998b36380edb1426a'
+            '685d001f561fde86ea372ae7eb82e3dd221a9b10bca0825062573d035975b677'
+            '83efe5217555cd94878e2e8222e0f90f67b509a8590943d493fc78d758ddc7e5'
+            '91c180da1681dc014b368d37867653a92ecf3e8236df3ee8914684cd46cf1155'
+            '34027aede9ab068f3d08bd2c17a77b80d3506a468e81a7e5afd502e8c5a0b7a2'
+            '54e5ebce1be053bfa7575094f7b6efb5c85debcc752b348af73dba377bb3712d'
+            '1120a275736ab1d91931323e8a170380172bb71a98de48b998b36380edb1426a'
             '5e9439bd8b4c42a721c992956b7c58cfbf13abf3414e5ac4cceb0c76a32f021a'
             'be037a9c3f0b063c731436507993680a5c77153c6bfb327a31f6a2e08d7e501e'
             'c732141180be5336afecd60e36290db60d2f4f1baf2395c7c4d9bcbb45ae0a23'
@@ -88,6 +94,12 @@ sha256sums=('523685bd7cb3d574ff829f78c3bd74aa533b6d716472be470e029c21aa3881c9'
             '023674e6282abaa6fde3b56738186f0e3c07f5ad09b531f0ec47ab12724bb3ad'
             '1120a275736ab1d91931323e8a170380172bb71a98de48b998b36380edb1426a'
             '337a633d8d77f959adcdea14d39bd9ec5be70a129a3f9e605a5decd45e762ab9'
+            'be037a9c3f0b063c731436507993680a5c77153c6bfb327a31f6a2e08d7e501e'
+            'c732141180be5336afecd60e36290db60d2f4f1baf2395c7c4d9bcbb45ae0a23'
+            'c18843c92a4973c45d608985fb793b62dba2c1621125e35043c01fca288d73ec'
+            '023674e6282abaa6fde3b56738186f0e3c07f5ad09b531f0ec47ab12724bb3ad'
+            '1120a275736ab1d91931323e8a170380172bb71a98de48b998b36380edb1426a'
+            'b061c77ae5b1d53a2cf10fb945ba31089f3d9e0d091ec1f18ca63d86578704f6'
             'be037a9c3f0b063c731436507993680a5c77153c6bfb327a31f6a2e08d7e501e'
             'c732141180be5336afecd60e36290db60d2f4f1baf2395c7c4d9bcbb45ae0a23'
             'c18843c92a4973c45d608985fb793b62dba2c1621125e35043c01fca288d73ec'
@@ -129,7 +141,7 @@ package_mdadm-amd() {
 	pkgdesc='mdadm with AMD RAIDXpert2 (RAIDCore) metadata support, plus the amdraid mkinitcpio hook'
 	depends=('glibc' 'systemd')
 	optdepends=('bash: mdcheck'
-	            'md-bitmap-ext-dkms: md write-intent bitmap of AMD volumes on Linux 6.18.57-6.18.64 and 7.3.0-7.3.5 (resync after a crash only where md was writing)')
+	            'md-bitmap-ext-dkms: md write-intent bitmap of AMD volumes on Linux 6.18.57-6.18.65 and 7.3.0-7.3.6 (resync after a crash only where md was writing)')
 	provides=("mdadm=${_mdadmver}")
 	# mkinitcpio 40: HOOKS of the shutdown ramfs come from /run/initramfs/mkinitcpio-shutdown.conf
 	# (tmpfiles 20-mkinitcpio.conf), which 60-amdraid-shutdown.conf appends to
@@ -161,7 +173,7 @@ package_mdadm-amd() {
 }
 
 package_md-bitmap-ext-dkms() {
-	pkgdesc='md_mod with the write-intent bitmap fix for external metadata (DKMS, Linux 6.18.57-6.18.64, 7.3.0-7.3.5), until it is upstream'
+	pkgdesc='md_mod with the write-intent bitmap fix for external metadata (DKMS, Linux 6.18.57-6.18.65, 7.3.0-7.3.6), until it is upstream'
 	arch=('any')
 	license=('GPL-2.0-only')
 	depends=('dkms')

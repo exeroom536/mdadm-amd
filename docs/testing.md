@@ -129,6 +129,9 @@ started. No SELinux denials. The tree the script lays out is the same, file for 
   three, every sector of the old part right. With 1.6 the RAID5 so finished had 7680 sectors of wrong parity:
   the Windows driver goes on from the region after the log's mark, see the changelog. A RAID10 and a RAID5 grown
   so by Linux to the end: the BIOS menu shows each Normal with 4.2 GB, and writes nothing to the disks.
+- 1.6.4, kernels 7.3.6 and 6.18.65 LTS: `md-bitmap-ext-dkms` built from its new bases, its `md_mod` loaded; a
+  RAID10 of the four disks runs with the md bitmap, `md` check clean; the volumes made earlier assembled, their
+  data as written.
 
 ## Emulation
 
@@ -141,7 +144,14 @@ The board's RAIDCoreDxe in QEMU with emulated AMD SATA and NVMe controllers:
   volumes Normal; spare roles set by this mdadm are shown by the menu as such;
 - volumes of up to 12 disks on two controllers accepted by the menu and the Windows driver;
 - with the root on a RAID1, the shutdown hook unmounted the root and stopped the volume 8 times of 8, also after an
-  update had replaced the running `mdmon`; a reboot in the middle of the root's rebuild went on from its mark.
+  update had replaced the running `mdmon`; a reboot in the middle of the root's rebuild went on from its mark;
+- a stale member of an uninitialized RAID1 (NVMe) or RAID10 that the menu took out of one LD copy only (1.6.4):
+  its rebuild cut short midway, the menu shows the volume Critical and mdadm finishes the rebuild (the RAID1 from
+  its mark), the data as written (1.6.1 assembled such a RAID1 in sync, the menu showed it Normal, the mirrors
+  apart past the cut).
+- `mdadm --stop` of a RAID10 midway through its resync while the rebuild of a RAID5 on the same disks waited
+  (1.6.4): `mdmon` lives, the RAID5 is rebuilt, `md` check 0 for both (1.6.1 to 1.6.3, the same code: `mdmon`
+  crashed with a double free and left the RAID5 write-pending).
 
 ## AMD drivers
 
@@ -192,7 +202,10 @@ The board's RAIDCoreDxe in QEMU with emulated AMD SATA and NVMe controllers:
   driver again. 1.6.3: the driver's own migrations onto more disks (a RAID0 of 2 → 3, a RAID5 of 3 → 4) cut
   short in their last milliseconds, after its log went "completed" and before its final record, go on from
   the log's mark or run as they are, the data the same; 1.6.1 reshaped them from the start and lost the data (1.5 to
-  1.6.2 have the same code).
+  1.6.2 have the same code). 1.6.4: an uninitialized RAID10 whose stale member the BIOS menu had taken out of one
+  LD copy only, its rebuild cut short midway: after 1.6.4 the driver goes on from the mark and the volume reads
+  back as written; after 1.6.1 it took the member for in service and "rebuilt" it from itself, the data past the
+  cut stale.
 
 ## Metadata only
 
@@ -201,15 +214,16 @@ An ASRock X670E RAID0 of two NVMe drives (our dump) and an ASUS X399 RAID10 (pub
 ## Test suites
 
 - The test suite in [tests/](../tests/README.md), on loop devices with metadata of real disks and of the emulated
-  board: 850 checks, all pass on a VM with the emulated AMD controllers (1.6.3; 845 for 1.6.1, 842 for 1.6, 797 for 1.5.1, 791 for 1.5, 639 for 1.4, 586 for 1.3, 573 for 1.2, 545 for
+  board: 856 checks, all pass on a VM with the emulated AMD controllers (1.6.4; 850 for 1.6.3, 845 for 1.6.1, 842 for 1.6, 797 for 1.5.1, 791 for 1.5, 639 for 1.4, 586 for 1.3, 573 for 1.2, 545 for
   1.1; for 1.0: 530 checks, 504 of them also on a plain VM without the controllers).
 - The same suite with mdadm and mdmon built with AddressSanitizer and UBSan: no reports. A fuzzer on the metadata
   parser: no crashes. (Both for 1.0.)
-- The upstream mdadm test suite: no regressions (1.6 and 1.6.1: 69 pass, 0 fail, 1 skipped on upstream `4cd7d33c`; 1.5 and
-  1.1: 67 pass, 0 fail, 1 skipped, the same as upstream `5542bf40` alone; not run again for 1.6.3, whose fix is in `super-amd.c`
-  alone). The upstream CI build matrix; no new
-  compiler warnings on the distributions above and on i686, s390x, powerpc and musl (for 1.0; for 1.1 to 1.6.3 each
-  patch of the series builds with gcc and clang without new warnings).
+- The upstream mdadm test suite: no regressions (1.6 and 1.6.1: 69 pass, 0 fail, 1 skipped on upstream `4cd7d33c`;
+  1.5 and 1.1: 67 pass, 0 fail, 1 skipped, the same as upstream `5542bf40` alone; not run again for 1.6.3, whose fix
+  is in `super-amd.c` alone; 1.6.4, whose changes to `--grow` and `mdmon` are common code: 69 pass, 0 fail, 1
+  skipped, as for 1.6.1). The upstream CI build matrix; no new compiler warnings on the distributions above and on
+  i686, s390x, powerpc and musl (for 1.0; for 1.1 to 1.6.4 each patch of the series builds with gcc and clang
+  without new warnings).
 
 ## Not tested
 
@@ -230,6 +244,10 @@ hardware (it needs a disk unplugged; SATA hot plug was tried with an earlier rel
 the BIOS menu with the second migration of a volume whose data a migration moved already and with the stripe size
 change of such a volume (1.6; on real hardware the Windows driver finished both, see Hardware);
 how the Windows driver ends its own migrations onto more disks (1.6.3 takes them as rcraid ends them);
+a stale member of an uninitialized volume, recorded offline by 1.6.4, with the Windows driver and on real
+hardware, and a RAID1 on NVMe in that state with AMD's Linux driver (it does not run NVMe in emulation); the
+workaround of the md raid0 bug (1.6.4) on real hardware, for raid10 → raid0 and the size change of an external
+RAID0 (the same path by the code), and for buffered writes (writeback);
 other boards and BIOS versions.
 
 ## Not supported

@@ -1,0 +1,103 @@
+From 9e35f6c9e9de40f06134f787419063dbccd004be Mon Sep 17 00:00:00 2001
+From: exeroom536 <352890649+exeroom536@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 17:53:42 +0500
+Subject: [PATCH 61/62] super-amd: amd_limit_trim gets the super from managemon
+ too
+
+amd_mm_activate_spare() reads a->container once, as the monitor clears
+it when md stops the array ("super-amd: managemon reads a->container once
+in activate_spare"), but amd_limit_trim() - called there out of the lock,
+with no spare and with the spare taken - read it again in
+amd_swap_trim_gran(): mdadm -S of the container as a rebuild that waited
+is offered, mdmon "segfault at 30" in amd_swap_trim_gran() in 3 of 20
+runs, and the container is left without a monitor.  Hand the super down
+to it, as to the other helpers.
+
+Written by Claude Opus 5.5, an AI model by Anthropic.
+---
+ super-amd.c | 21 +++++++++++----------
+ 1 file changed, 11 insertions(+), 10 deletions(-)
+
+diff --git a/super-amd.c b/super-amd.c
+index 9a657c75..32f3f513 100644
+--- a/super-amd.c
++++ b/super-amd.c
+@@ -9675,15 +9675,15 @@ static int amd_set_trim(struct active_array *a, unsigned long long bytes)
+  * The discard_granularity of @a's volume as mdmon capped TRIM, 0 if it did
+  * not (amd_limit_trim): set it to @gran, the old one back.
+  */
+-static unsigned int amd_swap_trim_gran(struct active_array *a,
++static unsigned int amd_swap_trim_gran(struct amd_super *super,
++				       struct active_array *a,
+ 				       unsigned int gran)
+ {
+-	struct amd_super *super = a->container->sb;
+ 	unsigned int old = 0;
+ 	struct amd_vol *v;
+ 
+ 	amd_lock(super);
+-	v = amd_active_vol(a);
++	v = amd_vol_of(super, a);
+ 	if (v) {
+ 		old = v->mon.trim_gran;
+ 		v->mon.trim_gran = gran;
+@@ -9725,7 +9725,8 @@ static unsigned int amd_swap_trim_gran(struct active_array *a,
+  * volume's queue, which waits for its writes - they may wait for the
+  * monitor (blk-sysfs queue_attr_store): managemon, with the lock released.
+  */
+-static void amd_limit_trim(struct active_array *a, const struct mdinfo *spare)
++static void amd_limit_trim(struct amd_super *super, struct active_array *a,
++			   const struct mdinfo *spare)
+ {
+ 	int level = a->info.array.level;
+ 	unsigned long long hw, gran;
+@@ -9747,16 +9748,16 @@ static void amd_limit_trim(struct active_array *a, const struct mdinfo *spare)
+ 				 a->info.sys_name, why);
+ 			return;
+ 		}
+-		amd_swap_trim_gran(a, gran);
++		amd_swap_trim_gran(super, a, gran);
+ 		amd_kmsg("TRIM off on %s as the AMD driver does: %s",
+ 			 a->info.sys_name, why);
+ 		return;
+ 	}
+-	gran = amd_swap_trim_gran(a, 0);
++	gran = amd_swap_trim_gran(super, a, 0);
+ 	if (!gran)
+ 		return;		/* not capped by us */
+ 	if (amd_trim_veto(a, spare)) {
+-		amd_swap_trim_gran(a, gran);
++		amd_swap_trim_gran(super, a, gran);
+ 		return;
+ 	}
+ 	hw = min(hw, (unsigned long long)UINT_MAX);
+@@ -15336,7 +15337,7 @@ static int amd_mm_open_new(struct supertype *c, struct active_array *a,
+ 		len = amd_ld_size(super->vol[inst].ld) + sizeof(struct amd_element);
+ 	amd_unlock(super);
+ 	if (rv == 0)
+-		amd_limit_trim(a, NULL);
++		amd_limit_trim(super, a, NULL);
+ 	/* managemon queues the update (manage_new), as imsm_open_new's */
+ 	if (!found || !c->update_tail) {
+ 		free(u);
+@@ -15393,7 +15394,7 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
+ 	drop = found && v && v->mon.mdbm_drop;
+ 	amd_unlock(super);
+ 	if (!found) {
+-		amd_limit_trim(a, NULL);
++		amd_limit_trim(super, a, NULL);
+ 		goto none;
+ 	}
+ 	/* the ones not taken */
+@@ -15412,7 +15413,7 @@ static struct mdinfo *amd_mm_activate_spare(struct active_array *a,
+ 	fd = amd_dev_open(di->disk.major, di->disk.minor, O_RDONLY);
+ 	u->features = amd_pd_features(fd, di->disk.major, di->disk.minor);
+ 	close_fd(&fd);
+-	amd_limit_trim(a, di);
++	amd_limit_trim(super, a, di);
+ 	/* the LD the rebuild goes into: at most @v's own and an element */
+ 	amd_lock(super);
+ 	v = amd_vol_of(super, a);
+-- 
+2.47.3
+

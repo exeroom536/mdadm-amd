@@ -1,5 +1,77 @@
 # Changes
 
+## 1.6.4 — 2026-11-26
+
+**Fixed.**
+- The rebuild of a stale disk in an uninitialized RAID1 or RAID10 (made in the BIOS menu or by Windows, never
+  started in Linux) could be lost without a trace. In such a volume the BIOS menu takes a disk that missed a
+  configuration out of the second copy of the volume's record only, the one that tracks the initialization, and
+  leaves it in service in the first; md then rebuilds that disk. When md began the rebuild before the
+  initialization ended - a RAID1 of NVMe disks that come before the SATA disks of the container, as udev usually
+  brings them, or a RAID10 with a disk of another volume coming late - `mdmon` ended the initialization by
+  dropping the second copy, and the rebuild was recorded from a record with its target in service. Cut short
+  midway (a power cut, a reboot), the rebuild was lost: mdadm assembled the volume in sync, the BIOS menu showed
+  it Normal, AMD's Linux driver "rebuilt" it from the stale disk, and the part past the cut stayed stale on that
+  disk, read back whenever a read went to it. Now `mdmon` records such a disk offline as the initialization ends:
+  the menu shows the volume Critical, and mdadm (an older one too) and AMD's Linux driver go on with the rebuild.
+- Who is hit, all at once: an uninitialized volume; one of its disks missed a configuration while the volume was
+  not running (mdadm writes one then only for a reason, such as a failure in another volume on the same disks);
+  the BIOS menu wrote a configuration before Linux saw that disk again (Initialize Disk of a new disk, say); the
+  order of disks above; a rebuild cut short. Rare, and silent. Seen in emulation with 1.6.1 for a RAID1 and a
+  RAID10; 1.6.2 and 1.6.3 have the same code; earlier releases were not checked. On a volume already hit, `md`
+  check (`echo check > /sys/block/mdX/md/sync_action`, then `mismatch_cnt`) finds the mirrors apart.
+- The known issue of 1.6.3, a bug of md in the kernel (`raid0`, kernels 6.6 to 6.17 and the stable 5.15.y,
+  6.1.y, 6.6.y and 6.12.y), is worked around: right before md turns a RAID0 grown onto more disks from raid4 back
+  into raid0, `mdadm --grow` limits the I/O md accepts to one chunk (`queue/max_sectors_kb`), so that I/O in that
+  moment reads and writes the right places. A RAID0 may stay in use while it grows. The change is in the common
+  code of `--grow`, for any metadata (md 1.2, IMSM, AMD); on 6.18 and later the kernel needs none of it.
+- `mdmon` could crash with a double free, or free the live array of another volume, when md stopped a volume
+  while `mdmon` was adding a spare to it: `mdadm --stop` of a RAID10 midway through its resync while the
+  rebuild of a RAID5 on the same disks waited for it (AMD runs one transform at a time in a container, so a
+  rebuild that waited is offered just as the other volume stops), or `mdadm --stop` of the container in that
+  state. The container was left without `mdmon`, the RAID5 write-pending. Seen in emulation with 1.6.1 and
+  1.6.3 (the RAID10 case in 5 of 5 tries with 1.6.3; the stop of the container in 3 of 20 runs, quietly). The
+  fix is in the common code of `mdmon` (`managemon.c`, `monitor.c`; Intel IMSM takes the same path, seen there
+  only with a debug hook that forces the moment) and in `super-amd.c`.
+
+**Packaging.** `md-bitmap-ext-dkms` covers Linux 6.18.65 and 7.3.6 too, whose `drivers/md` changed: for them the
+package of 1.6.3 built nothing, and volumes ran without the md bitmap. Its bases now cover 6.18.57 to 6.18.65 and
+7.3.0 to 7.3.6.
+
+**Known issues.** As in 1.6.1.
+
+**Tests.** Stage 72: the stale member of an uninitialized RAID1 that the menu took out of the second copy, the
+disks from the BIOS menu's own records, the NVMe disks coming first: md rebuilds it, and `mdmon` records it
+offline as the initialization ends (1.6.3 fails). Stage 73: a RAID0 of 2 → 3 grown under O_DIRECT reads, AMD
+and md 1.2: no wrong read, also across the level change (1.6.3 fails on a kernel with the bug). 856 checks in
+86 stages, all pass in a VM with the emulated AMD controllers (kernel 6.12).
+
+**Checked.** In emulation (the board's firmware in QEMU, AMD's Linux driver rcraid 9.3.3-00302 in a guest): a
+RAID1 on NVMe and a RAID10 in that state, their rebuild cut short midway. With 1.6.1 the RAID1 was assembled in
+sync with the mirrors apart past the cut (`md` check 273920) and the menu showed it Normal; rcraid "rebuilt" the
+RAID10 from its stale disk and read stale data back. With 1.6.4 the menu shows them Critical, mdadm finishes the
+rebuild (the RAID1 from its mark), rcraid finishes the RAID10, and the volumes read back as written (SHA-256),
+`md` check 0; the menu then shows the RAID1 Normal. rcraid with the RAID1 on NVMe was not tried (it does not run NVMe
+in emulation). In a VM on kernel 6.12.116: without the workaround every grow of a RAID0 of 2 → 3 disks gave
+wrong reads to O_DIRECT readers in the moment of the level change (AMD 24 of 24, md 1.2 8 of 8, IMSM 7 of 7),
+and a write landed on other data; with it, no wrong read or write in 15 grows (AMD, md 1.2 and IMSM, 6 of them
+under writes); on 7.2.12 the bug does not show. Not tried: Windows and real hardware (the md bug does not
+involve the BIOS or Windows), raid10 → raid0 and the size change of an external RAID0 (the same path by the
+code), buffered writes.
+In emulation, `mdadm --stop` of a RAID10 midway through its resync with the rebuild of a RAID5 waiting:
+`mdmon` alive in 5 of 5 tries, the RAID5 rebuilt, `md` check 0 for both; `mdadm --stop` of a container with a
+rebuild waiting, 20 of 20 runs without a crash (1.6.3: 3 of 20; the last of the four changes, in `super-amd.c`,
+was checked by this one only); with a debug hook that stops the volume at the worst moment, on loop devices, 12
+of 12 without a crash or a descriptor closed twice, AMD and IMSM (without the change to `monitor.c`: AMD crashed
+3 of 3, IMSM freed a live array 6 of 6).
+Each of the 62 patches of the series builds with gcc and clang without new warnings, and
+together they give the tree of the patch; the Arch packages build with the PKGBUILD of `packaging/arch/`;
+`md-bitmap-ext.patch` and the two md patches of `kernel/` apply to 6.18.65 and 7.3.6. On the test machine, kernels
+7.3.6 and 6.18.65 LTS of CachyOS: the packages installed over 1.6.3, `md_mod` built by DKMS from the new bases and
+loaded, a RAID10 of two HDDs and two SATA SSDs ran with the md bitmap, `md` check clean; the volumes made earlier
+assembled and read back as written. mdadm's own test suite: 69 pass, 0 fail, 1 skipped on upstream `4cd7d33c`, as
+for 1.6.1.
+
 ## 1.6.3 — 2026-11-23
 
 **Fixed.**
